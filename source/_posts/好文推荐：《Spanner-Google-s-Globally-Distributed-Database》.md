@@ -1,5 +1,5 @@
 ---
-title: '好文推荐：《Spanner: Google's Globally-Distributed Database》'
+title: '好文推荐：《Spanner: Google''s Globally-Distributed Database》'
 comments: true
 date: 2016-10-05 11:23:57
 tags: ["读书","数据库"]

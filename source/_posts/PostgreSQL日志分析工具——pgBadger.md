@@ -1,10 +1,15 @@
 ---
 title: PostgreSQL日志分析工具——pgBadger
 comments: true
-date: 2016-10-13 06:54:51
-tags: PostgreSQL 数据库
+date: 2016-10-13 07:29:26
+tags: ["PostgreSQL","database","数据库"]
 ---
 
+# PostgreSQL日志分析工具——pgBadger
+
+标签（空格分隔）： PostgreSQL
+
+---
 
 > 面对客户抱怨诸如“很慢”、“卡顿”等问题的时候，常用的办法就是查看服务器的日志。但是一头扎进几百M甚至几个G的日志里查看并不现实。那么如何快速回答：最慢的查询有哪些？查询相应时间分布？等等问题，并对最突出的问题着手优化呢？显然我们需要借助自动化工具来完成这个任务。
 

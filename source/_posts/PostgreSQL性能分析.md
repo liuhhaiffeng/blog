@@ -5,7 +5,6 @@ date: 2016-10-13 12:49:37
 tags: ["PostgreSQL","database","c"]
 ---
 
-
 > 面对客户抱怨诸如“很慢”、“卡顿”等问题的时候，我们该如何找出性能瓶颈？从研发角度来说，做一下性能分析(profiling)可能有所帮助。性能分析能找出来最慢的函数，从而发现性能问题的瓶颈。再从瓶颈入手，优化代码从而解决性能问题。
 
 常用的方法是gdb或pstack堆栈跟踪，比如postgreSQL经常卡在一个特定的地方很长时间，往往都有相同的堆栈跟踪信息。我们要做的就是用gdb附加到进程，将所有进程堆栈打出来，然后利用一些简单的脚本将信息做汇总，再利用sort|uniq|sort的方法排序统计出最多的堆栈信息，或最多的函数调用信息。
@@ -89,7 +88,7 @@ PS: 在有些环境下，需要用root用户。
 ```
 分析第一个堆栈，出现了45次，堆栈的内容是CommitTransaction提交事务带来的刷盘持久化操作，可见很耗时啊，因为带来了IO。同样的，如果发现什么异常行为也可以在这里发现。
 
-## 源码
+## 源码1 ——只分析用户进程
 源码如下：
 如果去掉
 ```
@@ -136,6 +135,45 @@ uniq -c | \
 sort -r -n -k 1,1
 
 ```
+
+## 源码2 ——分析所有postgreSQL进程
+以下源码能分析所有PostgreSQL进程，比如vacuum、log、stat、checkpoint进程。
+```
+#!/bin/bash
+
+if [ $# != 2 ] ; then                                                                                                                                  
+    echo "usage: promansprofile samples sleeptime"
+    exit 1
+fi
+
+nsamples=$1
+sleeptime=$2
+
+
+for x in $(seq 1 $nsamples)
+  do  
+    ps_info=$(ps aux)
+    ps_cnt=$(echo $ps_info | wc -l)
+    for p in $(seq 1 $ps_cnt) ; do
+        pid=$(echo $ps_info | sed -n "$p, 1p" | awk '{print $2}')
+        gdb -ex "set pagination 0" -ex "thread apply all bt" -batch -p $pid  2>/dev/null 
+    done
+    sleep $sleeptime
+    echo "$x/$nsamples completed." >&2
+  done | \ 
+awk '
+  BEGIN { s = ""; } 
+  /^Thread/ { print s; s = ""; } 
+  /^\#/ { if (s != "" ) { s = s "," $4} else { s = $4 } } 
+  END { print s }' | \ 
+sed 's/,/\n/g' | \ 
+uniq  |\  
+sort |\
+uniq -c |\
+sort -r -n -k 1,1 
+
+```
+
 
 ## 其他
 

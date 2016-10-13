@@ -5,15 +5,11 @@ date: 2016-10-13 07:29:26
 tags: ["PostgreSQL","database","数据库"]
 ---
 
-# PostgreSQL日志分析工具——pgBadger
-
-标签（空格分隔）： PostgreSQL
-
----
 
 > 面对客户抱怨诸如“很慢”、“卡顿”等问题的时候，常用的办法就是查看服务器的日志。但是一头扎进几百M甚至几个G的日志里查看并不现实。那么如何快速回答：最慢的查询有哪些？查询相应时间分布？等等问题，并对最突出的问题着手优化呢？显然我们需要借助自动化工具来完成这个任务。
 
 pgBadger就是为分析`PostgreSQL全日志`为目的诞生的一个工具，能够分析日志并生成分析报告，[这里](/uploads/out.html)给出了一个报告样本。怎么样，报告是不是很详细？
+
 
 ## pdBadger安装
 pgBadger代码托管在github上，可以到[这里](https://github.com/dalibo/pgbadger/releases)进行下载，最新的版本是[v9.0](https://github.com/dalibo/pgbadger/archive/v9.0.tar.gz)

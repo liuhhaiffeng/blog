@@ -11,6 +11,13 @@ comments: false
 
 ![me](/uploads/me.png)
 
+
+## 开源项目
+
+### yap -- yet another poor man's profiler
+Help to print stack ranking or function ranking to find out the slow part of your running program.
+[view source on github](https://github.com/shenyuflying/yap)
+
 ## 履历
 2015-今天　人大金仓信息技术股份有限公司　数据库内核研发工程师
 2012-2015　大连理工大学　　　　　　　　　攻读硕士学位

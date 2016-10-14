@@ -50,16 +50,17 @@ HOW TO USE
 -----------
 
 You need at least specify a progname or a pid to let yap attach to your program.
---progname=name to specify a progname
---pid=pid   to specify a pid of a progname
-after you have choosen a program to profile, you will be run with the default configurations, and `yap` is start working.
+```
+# ./yap  --progname=postgres
+```
+will be enough for the yap to run. after you have choosen a program to profile, you will be run with the default configurations, and `yap` is start working.
 the default configurations are
 ```
 samples=100   # take 100 samples of your program
 sleeptime=0   # no sleep during each iteration
 stackframe=5  # the stack frame depth is 5
 ```
-it will take a while for the `yac` to run, there will be a progress indicator on the screen, so take your time.
+it will take a while and there will be a progress indicator on the screen, so take your time.
 ```
 # ./yap  --progname=postgres
 1/100 completed.
@@ -69,13 +70,15 @@ it will take a while for the `yac` to run, there will be a progress indicator on
 5/100 completed.
 ...
 100/100 complete.
+```
+when done, the stack ranking is printed.
+```
 40 __epoll_wait_nocancel	WaitEventSetWaitBlock	WaitEventSetWait	WaitLatchOrSocket	WaitLatch
 10 __select_nocancel	ServerLoop	PostmasterMain	main
 10 __epoll_wait_nocancel	WaitEventSetWaitBlock	WaitEventSetWait	WaitLatchOrSocket	SysLoggerMain
 10 __epoll_wait_nocancel	WaitEventSetWaitBlock	WaitEventSetWait	WaitLatchOrSocket	PgstatCollectorMain
 1 
 ```
-when done, the stack ranking is printed.
 if you want to seek the function ranking rather than stack ranking, use `--stackframe=1` and re-run yap
 
 ```

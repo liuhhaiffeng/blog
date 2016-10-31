@@ -11,8 +11,58 @@ comments: false
 
 ![me](/uploads/me.png)
 
+如下是我的一些基本信息，有些直接是从简历上复制的，不知道放在这里合适不合适。希望对想了解我的人能够有所帮助。
 
-## 开源项目
+
+## 工作经历
+- 2015-今天　人大金仓信息技术股份有限公司　数据库内核研发工程师
+
+## 学习经历
+- 2012-2015　大连理工大学(985\211重点大学)　攻读硕士学位
+- 2008-2012　郑州大学(211重点大学)　　　　　攻读学士学位
+在校期间获得奖励
+- 2013年获得研究生国家奖学金（2万元）
+- 攻读学士学位期间连续3年获得一等奖学金，攻读硕士学位期间连续3年获得一等奖学金。- 2015年辽宁省优秀毕业生、2012年河南省优秀毕业生 
+- “华为杯”全国大学生数学建模竞赛优秀奖
+- ACM程序设计大赛二等奖
+
+## 计算机语言
+- ASM　之前搞嵌入式，现在在工作中调试一些困难的问题都是直接看汇编。
+- C　主力开发语言，之前开发嵌入式，现在开发数据库内核是用的Ｃ语言。
+- C++　基本的都了解，书也看了不少，但是还没有在实际的大型项目里面用过。
+- C#　研究生时期的《温度监控系统》客户端就是用它写的。
+- Go　新兴语言，很多思想和自己不谋而合，正在努力学习中。
+- Shell　能称作一个语言么？但是在日常运维和自动化方面非常有用。
+
+## 技能水平 
+### 英语
+- 大学生英语等级考试四级（CET4）617分/总分710
+- 大学生英语等级考试六级（CET6）554分/总分710
+- 大学生英语口语等级考试（B级）
+- NECCS 全国大学生英语竞赛二等奖
+- EFSET Quick English Check - Score: Intermediate / Upper Intermediate (CEFR B1/B2
+- 2010年\2011年全国大学生英语竞赛二等奖
+- 2010年郑州大学英语辩论赛最佳辩手
+### 日语
+- 自学了《新版中日交流标准日本语》
+### 计算机等级考试
+- 全国计算机等级考试（NCRE）四级 网络工程师
+- 全国计算机等级考试（NCRE）三级 网络技术
+- 全国计算机等级考试（NCRE）二级 C语言
+PS:这么鸡肋的考试不知道该不该放这里，权当做自己追求技术道路上的证明吧。
+
+
+## 参与项目
+### 国产数据库Kingbase研发
+2015年至今参与国产数据库Kingbase研发
+
+### 硕士课题——超大规模无线温度监测系统
+该项目是湖南岳阳洞庭湖大桥（总投资36亿）的关键课题（150万元），系统负责采集施工期间混凝土内部温度变化。骨干负责整个系统软硬设计、开发和应用。涉及到了DS18B20数字温度传感器、光纤光栅温度传感器、Zigbee无线通信以及硬件设计，windows应用程序开发（C# .NET），服务器端开发（Linux），网站开发（LAMP架构）和组网技术。
+
+### 国家自然科学基金——PVDF无线智能疲劳监测系统
+负责算法设计（matlab）、PVDF放大电路设计、DSP算法实现（C语言）。
+
+## 开源社区
 [Github](https://github.com/shenyuflying): https://github.com/shenyuflying
 ### yap -- yet another poor man's profiler
 Help to print stack ranking or function ranking to find out the slow part of your running program.
@@ -21,11 +71,6 @@ Help to print stack ranking or function ranking to find out the slow part of you
 ### indent -- an interactive C code formatter
 Help to check your code against C coding standered and to correct your code in an interactive way.
 [view source on github](https://github.com/shenyuflying/indent)
-
-## 履历
-2015-今天　人大金仓信息技术股份有限公司　数据库内核研发工程师
-2012-2015　大连理工大学　　　　　　　　　攻读硕士学位
-2008-2012　郑州大学　　　　　　　　　　　攻读学士学位
 
 ## 攻读硕士学位期间发表论文
 
@@ -50,4 +95,6 @@ Help to check your code against C coding standered and to correct your code in a
 ## 联系方式
 Email: shenyufly@163.com
 QQ   : 316472763
+
+![link](/uploads/link.png)
 

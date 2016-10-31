@@ -20,7 +20,7 @@ comments: false
 ## 学习经历
 - 2012-2015　大连理工大学(985\211重点大学)　攻读硕士学位
 - 2008-2012　郑州大学(211重点大学)　　　　　攻读学士学位
-在校期间获得奖励
+### 在校期间获得奖励
 - 2013年获得研究生国家奖学金（2万元）
 - 攻读学士学位期间连续3年获得一等奖学金，攻读硕士学位期间连续3年获得一等奖学金。- 2015年辽宁省优秀毕业生、2012年河南省优秀毕业生 
 - “华为杯”全国大学生数学建模竞赛优秀奖
@@ -35,6 +35,7 @@ comments: false
 - Shell　能称作一个语言么？但是在日常运维和自动化方面非常有用。
 
 ## 技能水平 
+
 ### 英语
 - 大学生英语等级考试四级（CET4）617分/总分710
 - 大学生英语等级考试六级（CET6）554分/总分710
@@ -53,12 +54,11 @@ PS:这么鸡肋的考试不知道该不该放这里，权当做自己追求技�
 
 
 ## 参与项目
+
 ### 国产数据库Kingbase研发
 2015年至今参与国产数据库Kingbase研发
-
 ### 硕士课题——超大规模无线温度监测系统
 该项目是湖南岳阳洞庭湖大桥（总投资36亿）的关键课题（150万元），系统负责采集施工期间混凝土内部温度变化。骨干负责整个系统软硬设计、开发和应用。涉及到了DS18B20数字温度传感器、光纤光栅温度传感器、Zigbee无线通信以及硬件设计，windows应用程序开发（C# .NET），服务器端开发（Linux），网站开发（LAMP架构）和组网技术。
-
 ### 国家自然科学基金——PVDF无线智能疲劳监测系统
 负责算法设计（matlab）、PVDF放大电路设计、DSP算法实现（C语言）。
 
@@ -67,7 +67,6 @@ PS:这么鸡肋的考试不知道该不该放这里，权当做自己追求技�
 ### yap -- yet another poor man's profiler
 Help to print stack ranking or function ranking to find out the slow part of your running program.
 [view source on github](https://github.com/shenyuflying/yap)
-
 ### indent -- an interactive C code formatter
 Help to check your code against C coding standered and to correct your code in an interactive way.
 [view source on github](https://github.com/shenyuflying/indent)

@@ -99,3 +99,4 @@ QQ   : 316472763
 
 ![link](/uploads/link.png)
 
+[pdf版本](/uploads/申宇的简历.pdf)

@@ -2,7 +2,7 @@
 title: pgNodeGraph -- a postgreSQL node tree print tool
 comments: true
 date: 2016-11-04 05:43:06
-tags: [postgreSQL, c, Linux, database]
+tags: [PostgreSQL, c, Linux, database]
 ---
 
 > The output of postgreSQL node tree can be very long for the developer to investigate. pgNodeGraph tool can covert the output of the node tree into jpg formatted pictiure which is quite convenient for developing or debugging purposess.

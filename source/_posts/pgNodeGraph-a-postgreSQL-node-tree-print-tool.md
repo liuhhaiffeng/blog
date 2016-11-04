@@ -8,6 +8,8 @@ tags: [postgreSQL, c, Linux, database]
 > The output of postgreSQL node tree can be very long for the developer to investigate. pgNodeGraph tool can covert the output of the node tree into jpg formatted pictiure which is quite convenient for developing or debugging purposess.
 
 
+[view source on github](https://github.com/shenyuflying/pgNodeGraph)
+
 ## short tour
 
 suppose we have a table like this
@@ -52,6 +54,8 @@ QueryNodeTree：
 PlanNodeTree：
 ![image_1at0639g0ftv1fulrt1ojs105am.png-404.8kB][3]
 
+
+<!--more-->
 
 ## A complex example
 Now, let's try a much more complex query to see whether pgNodeGraph will work well.

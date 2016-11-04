@@ -66,6 +66,9 @@ PS:这么鸡肋的考试不知道该不该放这里，权当做自己追求技�
 
 ## 开源社区
 [Github](https://github.com/shenyuflying): https://github.com/shenyuflying
+### pgNodeGraph -- a postgreSQL node tree print tool
+The output of postgreSQL node tree can be very long for the developer to investigate. pgNodeGraph tool can covert the output of the node tree into jpg formatted pictiure which is quite convenient for developing or debugging purposess.
+[view source on github](https://github.com/shenyuflying/pgNodeGraph)
 ### yap -- yet another poor man's profiler
 Help to print stack ranking or function ranking to find out the slow part of your running program.
 [view source on github](https://github.com/shenyuflying/yap)

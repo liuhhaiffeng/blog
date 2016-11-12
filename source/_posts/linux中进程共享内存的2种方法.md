@@ -16,7 +16,7 @@ tags: [c,linux,PostgreSQL]
 shmat
 ------
 
-```
+```c
 #include<unistd.h>
 #include<stdio.h>
 #include<stdlib.h>

@@ -5,12 +5,6 @@ date: 2016-11-21 05:57:19
 tags: [数据库,database,PostgreSQL]
 categories: [slides]
 ---
-# 深入理解PostgreSQL查询优化引擎
-
-标签（空格分隔）： PostgreSQL
-
----
-
 
 ![幻灯片1.png-34.1kB][1]
 ![幻灯片2.png-52.9kB][3]

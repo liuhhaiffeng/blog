@@ -2,8 +2,8 @@
 title: 【小宇带你学PostgreSQL内核】第二课：开发环境
 comments: true
 date: 2016-12-11 10:23:14
-tags:
-categories:
+tags: PostgreSQL
+categories: 小宇带你学PostgreSQL内核
 ---
 
 <center><iframe height=498 width=510 src='http://player.youku.com/embed/XMTg1OTI5NTQ4NA==' frameborder=0 'allowfullscreen'></iframe></center>

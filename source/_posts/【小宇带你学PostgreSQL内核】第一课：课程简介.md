@@ -7,7 +7,7 @@ categories: 小宇带你学PostgreSQL内核
 ---
 
 
-<iframe height=498 width=510 src='http://player.youku.com/embed/XMTg1NzAxNjM4NA==' frameborder=0 'allowfullscreen'></iframe>
+<center><iframe height=498 width=510 src='http://player.youku.com/embed/XMTg1NzAxNjM4NA==' frameborder=0 'allowfullscreen'></iframe></center>
 
 <!--more-->
 

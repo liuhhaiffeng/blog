@@ -6,7 +6,7 @@ tags: PostgreSQL
 categories: 小宇带你学PostgreSQL内核
 ---
 
-<iframe height=498 width=510 src='http://player.youku.com/embed/XMTg3MDUzODQwMA==' frameborder=0 'allowfullscreen'></iframe>
+<center><iframe height=498 width=510 src='http://player.youku.com/embed/XMTg3MDUzODQwMA==' frameborder=0 'allowfullscreen'></iframe></center>
 
 
 如果还想看到更多此类文章，请移步到[小宇的博客](http://shenyu.wiki)。

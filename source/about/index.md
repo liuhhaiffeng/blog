@@ -7,11 +7,9 @@ comments: false
 ## 你好！
 
 
-欢迎来我的博客。**爱生活、爱探索**。
+欢迎来我的博客。
 
 <center> ![me](http://static.zybuluo.com/shenyuflying/r0zt7gogesjj2k9khf90r2p2/image_1b5pg6c8rv8ia70e8n1n906f19.png) </center>
-
-如下是我的一些基本信息，有些直接是从简历上复制的，不知道放在这里合适不合适。希望对想了解我的人能够有所帮助。
 
 
 ## 工作经历

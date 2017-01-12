@@ -25,6 +25,8 @@ tags: PostgreSQL
 10. 思考
 11. FAQ
 
+<!--more-->
+
 什么是逻辑(Logical)备份还原
 ===========
 

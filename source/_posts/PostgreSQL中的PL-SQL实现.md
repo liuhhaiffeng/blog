@@ -19,15 +19,15 @@ tags: PostgreSQL
 
 ### create function的语法解析
 创建plsql存储过程的基本语法：
-```c
+```
 	create [or replace] function <fname>
 			[(<type-1> { , <type-n>})]
 			returns <type-r>
 			as <filename or code in language as appropriate>
 			language <lang> [with parameters]
-```c
+```
 对应到实现gram.y:6770 中有
-```c
+```
 CreateFunctionStmt:
 			CREATE opt_or_replace FUNCTION func_name func_args_with_defaults
 			RETURNS func_return createfunc_opt_list opt_definition
@@ -40,7 +40,7 @@ CreateFunctionStmt:
 					n->options = $8;
 					n->withClause = $9;
 					$$ = (Node *)n;
-```c
+```
 可以看到是主要解析如下内容：
 1. func_name 函数名
 2. fuc_args 参数
@@ -49,7 +49,7 @@ CreateFunctionStmt:
 
 ### 插入系统表
 解析完了之后调用CreateFunction函数来实现实际的创建，然后调用ProcedureCreate来插入系统表pg_proc中
-```c
+```
 ObjectAddress
 CreateFunction(CreateFunctionStmt *stmt,  //入参就是语法解析返回的结构体
                 const char *queryString)
@@ -57,15 +57,15 @@ CreateFunction(CreateFunctionStmt *stmt,  //入参就是语法解析返回的结
 ...做一些检查和转换
 ProcedureCreate() //来完成实际的创建工作，其实就是插入到了系统表pg_proc
 }
-```c
+```
 注意：此时只是把plsql的文本存下来了，并没有编译。编译会在后续进行
 
 
 ## 调用plsql函数
 plpgsql语言对应的处理函数，已经在系统初始化时通过脚本加载。
-```c
+```
 ./backend/catalog/postgres.bki:insert ( "plpgsql" t t "plpgsql_call_handler" "plpgsql_inline_handler" "plpgsql_validator" "$libdir/plpgsql" _null_ )
-```c
+```
 所以，当调用plsql函数就会调用相应的处理程序。相关函数在pl_handler.c文件中。
 在该文件中我们看到如下函数：
 
@@ -76,7 +76,7 @@ plpgsql_validator 在Create Function时检验函数的有效性
 
 可以看到，当用户调用plsql函数时就会进入plpgsql_call_handler函数中,经过精简的函数如下：
 
-```c
+```
 
 Datum
 plpgsql_call_handler(PG_FUNCTION_ARGS)
@@ -90,12 +90,12 @@ plpgsql_call_handler(PG_FUNCTION_ARGS)
 ...
 	SPI_finish() // 断开SPI
 	return retval;
-```c
+```
 
 ## 编译
 
 
-```c
+```
 PLpgSQL_function *
 plpgsql_compile(FunctionCallInfo fcinfo, bool forValidator)
 {
@@ -103,9 +103,9 @@ plpgsql_compile(FunctionCallInfo fcinfo, bool forValidator)
 先看hash表里面有没缓存，以及缓存是否失效，如果有效则直接返回，不用再编译啦。
 否则需要编译，调用do_compile()
 }
-```c
+```
 
-```c
+```
 static PLpgSQL_function *
 do_compile(FunctionCallInfo fcinfo,
 		   HeapTuple procTup,
@@ -127,19 +127,19 @@ do_compile(FunctionCallInfo fcinfo,
 	plpgsql_HashTableInsert(function, hashkey); // 加到编译缓存里面
 
 }
-```c
+```
 ps：调试模式很有用，可以通过下面方式打开：
 
-```c
+```
 CREATE FUNCTION less_than(a text, b text) RETURNS boolean AS $$
 # option dump
 BEGIN
 RETURN a < b;
 END;
 $$ LANGUAGE plpgsql;
-```c
+```
 在函数体里面加上# option dump即可。执行会显示出来
-```c
+```
 STATEMENT:  select less_than (1 ,2);
 
 Execution tree of successfully compiled PL/pgSQL function less_than(text,text):
@@ -156,22 +156,22 @@ Function's statements:
 
 End of execution tree of function less_than(text,text)
 
-```c
+```
 ### 语法解析
 postgreSQL 9.5的用户文档
 https://www.postgresql.org/docs/9.5/static/plpgsql.html
 可以对照用法来看实现
 一个plsql形如
-```c
+```
 [ <<label>> ]         -- [标签，可选]
 [ DECLARE             -- [DELARE开头
     declarations ]    -- 中间是变量的声明，这部分是可选的]
 BEGIN                 -- BEGIN
     statements        -- 各语句
 END [ label ];        -- END [标签，可选]
-```c
+```
 对应到实现
-```c
+```
 pl_block		: decl_sect K_BEGIN proc_sect exception_sect K_END opt_label
 					{
 						PLpgSQL_stmt_block *new;
@@ -184,7 +184,7 @@ pl_block		: decl_sect K_BEGIN proc_sect exception_sect K_END opt_label
 						$$ = (PLpgSQL_stmt *)new;
 					}
 				;
-```c
+```
 可以看到是按如下顺序解析的
 1. decl_sec 声明部分   --重点
 2. prc_sec  语句部分   --重点
@@ -194,23 +194,23 @@ pl_block		: decl_sect K_BEGIN proc_sect exception_sect K_END opt_label
 
 ### 声明部分解析
 用户声明一个变量语法：
-```c
+```
 name [ CONSTANT ] type [ COLLATE collation_name ] [ NOT NULL ] [ { DEFAULT | := | = } expression ];
-```c
+```
 例子：
-```c
+```
 quantity integer DEFAULT 32;
 url varchar := 'http://mysite.com';
 user_id CONSTANT integer := 10;
-```c
+```
 
 先介绍下面两个全局变量用来存放plsql中的变量
-```c
+```
 PLpgSQL_datum **plpgsql_Datums;  //变量数组
 int			plpgsql_nDatums;     //数组长度
-```c
+```
 在pl_gram.y：478解析变量，并加入全局变量数组
-```c
+```
 
 decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull decl_defval
 		{
@@ -219,10 +219,10 @@ decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull
 			var = plpgsql_build_variable($1.name, $1.lineno,
 													 $3, true);
 ...
-```c
+```
 
 对于解析的变量，加到变量数组里面
-```c
+```
 PLpgSQL_variable *
 plpgsql_build_variable(const char *refname, int lineno, PLpgSQL_type *dtype,
 					   bool add2namespace)
@@ -243,7 +243,7 @@ plpgsql_build_variable(const char *refname, int lineno, PLpgSQL_type *dtype,
 									   refname);
 				result = (PLpgSQL_variable *) var;
 ...
-```c
+```
 变量解析重点关注
 decl_varname    -- 变量名解析
 decl_datatype   -- 变量类型解析
@@ -253,7 +253,7 @@ decl_datatype   -- 变量类型解析
 ### 语句部分解析
 可以看到如下，是按每个语句规则匹配，不再详细展开了。
 
-```c
+```
 proc_stmt		: pl_block ';'
 						{ $$ = $1; }
 				| stmt_assign
@@ -297,13 +297,13 @@ proc_stmt		: pl_block ';'
 				| stmt_null
 						{ $$ = $1; }
 				;
-```c
+```
 
 ## 执行
 
 编译完了之后我们回到plpgsql_call_handler看到接下来要进入这个函数 plpgsql_exec_function来实际执行编译好的语句。
 
-```c
+```
 Datum
 plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
 					  EState *simple_eval_estate)
@@ -319,11 +319,11 @@ plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
     
     // 对返回值进行处理
 
-```c
+```
 
 接下来看看 exec_stmt_block 这个函数
 
-```c
+```
 static int
 exec_stmt_block(PLpgSQL_execstate *estate, PLpgSQL_stmt_block *block)
 {
@@ -332,10 +332,10 @@ exec_stmt_block(PLpgSQL_execstate *estate, PLpgSQL_stmt_block *block)
     rc = exec_stmts(estate, block->body); //执行语句
 }
 
-```c
+```
 
 
-```c
+```
 static int
 exec_stmts(PLpgSQL_execstate *estate, List *stmts)
 {
@@ -353,10 +353,10 @@ exec_stmts(PLpgSQL_execstate *estate, List *stmts)
 	return PLPGSQL_RC_OK;
 }
 
-```c
+```
 exec_stmt 针对每种类型的语句来实际执行，可以看下列函数的源码，不再赘述。
 
-```c
+```
 
 static int
 exec_stmt(PLpgSQL_execstate *estate, PLpgSQL_stmt *stmt)
@@ -484,7 +484,7 @@ exec_stmt(PLpgSQL_execstate *estate, PLpgSQL_stmt *stmt)
 
 	return rc;
 }
-```c
+```
 
 
 如果还想看到更多此类文章，请移步到[小宇的博客](http://shenyu.wiki)。

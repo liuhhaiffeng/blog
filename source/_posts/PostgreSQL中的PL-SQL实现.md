@@ -5,13 +5,6 @@ date: 2017-01-13 01:15:30
 tags: PostgreSQL
 ---
 
-# PostgreSQL中的PL/SQL实现
-
-标签（空格分隔）： 数据库 public
-
----
-
-[TOC]
 
 ## 基本流程
 1. 函数创建

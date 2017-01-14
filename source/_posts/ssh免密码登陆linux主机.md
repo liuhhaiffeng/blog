@@ -2,7 +2,8 @@
 title: ssh免密码登陆linux主机
 comments: true
 date: 2016-10-05 10:07:14
-tags: linux
+tags: [操作系统, Linux, Linux使用]
+categories: 技术分享
 ---
 
 > 比如想登陆一台服务器但是每次都需要输密码，这时候我们可以用ssh的authorized_keys文件来记录允许登陆的主机。

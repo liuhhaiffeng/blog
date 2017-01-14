@@ -2,7 +2,8 @@
 title: 交互式代码格式化工具——indent
 comments: true
 date: 2016-10-21 09:20:49
-tags: [c,linux]
+tags: [编程语言,"Shell"]
+categories: [技术分享,开源社区]
 ---
 
 

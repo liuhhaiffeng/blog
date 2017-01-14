@@ -2,7 +2,8 @@
 title: git统计代码贡献
 comments: true
 date: 2017-01-05 09:09:02
-tags: git
+tags: [工具,git]
+categories: 技术分享
 ---
 
 

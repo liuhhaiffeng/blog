@@ -2,8 +2,8 @@
 title: c和汇编混合编程
 comments: true
 date: 2016-11-14 12:42:51
-tags: [linux,c,assembly,PostgreSQL]
-categories:
+tags: [编程,c,assembly]
+categories: 技术分享
 ---
 
 > 在各种高级语言大行其道的今天为什么要用汇编呢？其实主要的原因有：第一，在C语言在关键地方嵌入汇编可以获得最大的性能提升，比如说一些关键算法；第二，实现硬件相关的功能（这点嵌入式开发经常用到）。第三，不能用C语言实现的特性可以用汇编实现，比如说可以利用lock指令来实现原子操作。

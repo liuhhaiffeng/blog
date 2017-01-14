@@ -2,7 +2,7 @@
 title: 深入理解PostgreSQL查询优化引擎
 comments: true
 date: 2016-11-21 05:57:19
-tags: [数据库,database,PostgreSQL]
+tags: [database,PostgreSQL]
 categories: [slides]
 ---
 

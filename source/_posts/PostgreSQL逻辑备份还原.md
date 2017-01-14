@@ -2,7 +2,8 @@
 title: PostgreSQL逻辑备份还原
 comments: true
 date: 2017-01-12 09:27:58
-tags: PostgreSQL
+tags: [数据库, PostgreSQL, PostgreSQL内核, 备份还原]
+categories: 技术分享
 ---
 
 主要内容

@@ -2,7 +2,8 @@
 title: 利用sed生成规范的c代码
 comments: true
 date: 2016-10-20 10:15:38
-tags: [sed,c]
+tags: [工具, sed ]
+categories: 技术分享
 ---
 
 

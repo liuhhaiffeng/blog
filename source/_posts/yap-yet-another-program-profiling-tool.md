@@ -2,7 +2,8 @@
 title: yap--yet another program profiling tool
 comments: true
 date: 2016-10-14 07:59:13
-tags: linux
+tags: [编程语言, Shell]
+categories: [开源社区, 技术分享]
 ---
 
 

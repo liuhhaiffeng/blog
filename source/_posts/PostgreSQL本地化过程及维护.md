@@ -2,7 +2,8 @@
 title: PostgreSQL本地化过程及维护
 comments: true
 date: 2016-11-03 07:47:59
-tags: [PostgreSQL,NLS,l10n]
+tags: [数据库, PostgreSQL, PostgreSQL内核, 本地化]
+categories: 技术分享
 ---
 
 

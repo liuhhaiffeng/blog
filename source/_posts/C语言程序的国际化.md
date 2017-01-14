@@ -2,7 +2,8 @@
 title: C语言程序的国际化
 comments: true
 date: 2016-11-02 11:37:12
-tags: [c,国际化,linux]
+tags: [编程, c]
+categories: 技术分享
 ---
 
 

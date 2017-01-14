@@ -2,7 +2,8 @@
 title: linux中的本地化
 comments: true
 date: 2016-10-27 10:03:21
-tags: linux
+tags: ["操作系统",Linux,Linux编程, c]
+categories: 技术分享
 ---
 
 

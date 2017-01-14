@@ -2,7 +2,8 @@
 title: PostgreSQL日志分析工具——pgBadger
 comments: true
 date: 2016-10-13 07:29:26
-tags: ["PostgreSQL","database","数据库"]
+tags: [数据库, "PostgreSQL", PostgreSQL使用, 调优]
+categories: 技术分享
 ---
 
 

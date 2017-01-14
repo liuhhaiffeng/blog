@@ -2,7 +2,8 @@
 title: yshen's vim settings
 comments: true
 date: 2016-12-14 01:59:33
-tags: vim
+tags: [工具, vim]
+categories: 技术分享
 ---
 
 

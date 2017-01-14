@@ -2,7 +2,8 @@
 title: PostgreSQL内存盘性能测试
 comments: true
 date: 2016-11-29 12:53:53
-tags: [PostgreSQL]
+tags: [数据库,PostgreSQL, PostgreSQL使用, 调优]
+categories: 技术分享
 ---
 
 > 磁盘IO是数据库性能的瓶颈。如果把数据放在内存盘上性能能提升多少呢？我也很好奇，于是用pg自带的pgbench测试了一下，结果表明在SSD硬盘上性能为207tps；在内存盘上性能为1897tps；性能提升了9倍。

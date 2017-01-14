@@ -2,7 +2,8 @@
 title: PostgreSQL中的PL/SQL实现
 comments: true
 date: 2017-01-13 01:15:30
-tags: PostgreSQL
+tags: [数据库, PostgreSQL, PLSQL]
+categories: 技术分享
 ---
 
 

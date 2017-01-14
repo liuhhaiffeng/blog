@@ -2,8 +2,9 @@
 title: linux中的硬链接和软链接
 comments: true
 date: 2016-10-10 06:03:07
-tags: linux
----
+tags: ["操作系统",Linux,Linux编程]
+categories: 技术分享
+--
 
 
 ## 建立硬链接和软链接

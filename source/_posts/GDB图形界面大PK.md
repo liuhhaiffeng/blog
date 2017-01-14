@@ -2,7 +2,8 @@
 title: GDB图形界面大PK
 comments: true
 date: 2016-12-29 12:07:25
-tags: [gdb,linux,c]
+tags: [工具, gdb]
+categories: 技术分享 
 ---
 
 > gdb虽然很强大，但是却略显单调。其实gdb有很多前端图形界面。那么选哪个呢？请看GDB图形界面大PK。

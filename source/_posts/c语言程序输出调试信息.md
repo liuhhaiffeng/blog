@@ -2,8 +2,8 @@
 title: c语言程序输出调试信息
 comments: true
 date: 2016-11-17 13:51:58
-tags: [linux,c,PostgreSQL,debug]
-categories:
+tags: [编程语言,c]
+categories: 技术分享
 ---
 
 > 随着服务器的内存逐渐增大，从16GB、32GB逐步拓展到64GB、128GB甚至256GB或更多。大型程序在遇到一些致命错误（比如SIGSEGV段错误、stack overflow）时，受限于磁盘空间大小、IO速度、恢复时间等限制，往往不具备条件把内存映像（coredump）转储到磁盘上，这为后续排查出错原因带来了很大困难。这时候就需要程序在遇到致命错误时，能够及时输出诊断信息。一些语言的运行时，比如java、golang等内建了错误堆栈输出的功能。那么c语言程序如何实现错误堆栈输出的功能呢？

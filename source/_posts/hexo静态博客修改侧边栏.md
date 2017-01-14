@@ -2,7 +2,8 @@
 title: hexo静态博客修改侧边栏
 comments: true
 date: 2016-10-04 11:53:33
-tags: ["hexo","博客"]
+tags: [网站, "hexo"]
+categories: 技术分享
 ---
 
 

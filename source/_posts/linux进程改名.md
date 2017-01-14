@@ -2,7 +2,8 @@
 title: linux进程改名
 comments: true
 date: 2016-11-10 08:16:26
-tags: [linux,c]
+tags: ["操作系统",Linux,Linux编程]
+categories: 技术分享
 ---
 
 > 在多进程程序中，用ps命令能看到进程的名字。这样能够方便管理，不会因为看到好多同样的进程而不知道他们在干什么而茫然，同时也能避免管理员kill掉错误的进程。

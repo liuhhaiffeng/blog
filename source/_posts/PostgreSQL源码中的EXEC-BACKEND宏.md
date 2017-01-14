@@ -2,7 +2,8 @@
 title: PostgreSQL源码中的EXEC_BACKEND宏
 comments: true
 date: 2016-11-09 08:04:10
-tags: PostgreSQL
+tags: [数据库, PostgreSQL, PostgreSQL内核]
+categories: 技术分享
 ---
 
 看pg源码的时候经常会见到一个EXEC_BACKEND宏，在源码中并没有给出解释，那么它是什么意思呢？从http://postgresql.nabble.com/EXEC-BACKEND-td1991462.html这里找到了解释：

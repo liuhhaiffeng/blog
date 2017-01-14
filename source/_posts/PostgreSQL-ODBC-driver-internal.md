@@ -2,8 +2,8 @@
 title: PostgreSQL ODBC driver internal
 comments: true
 date: 2016-11-09 03:04:32
-tags: [PostgreSQL, ODBC]
-categories: slides
+tags: [技术分享, 数据库, PostgreSQL内核, 接口]
+categories: [技术分享, Presentations]
 ---
 
 

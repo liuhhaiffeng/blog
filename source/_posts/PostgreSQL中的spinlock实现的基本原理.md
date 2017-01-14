@@ -2,8 +2,8 @@
 title: PostgreSQL中的spinlock实现的基本原理
 comments: true
 date: 2016-11-13 02:48:32
-tags: [linux,c,PostgreSQL]
-categories:
+tags: [数据库, PostgreSQL, PostgreSQL内核]
+categories: 技术分享
 ---
 
 > linux中锁实现方法有文件锁、mutex、semaphore等。在PostgreSQL设计过程中，考虑到mutex、semaphore具有一定的限制，为了性能和可移植性考虑，对于比较短时间的等待，spinlock性能更好。那么spinlock是怎么实现的呢？

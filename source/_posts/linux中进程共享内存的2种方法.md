@@ -2,7 +2,8 @@
 title: linux中进程共享内存的2种方法
 comments: true
 date: 2016-11-12 11:27:10
-tags: [c,linux,PostgreSQL]
+tags: ["操作系统",Linux,Linux编程,编程语言,c]
+categories: 技术分享
 ---
 
 > 共享内存可以在两个或多个进程间共享一个给定的内存区域，因为数据不需要在进程之间复制，相比于pipe、socket、file等共享通信方式，共享内存是最快的一种共享机制。linux中共享内存一般有2种方法即:shared memory和mmap。

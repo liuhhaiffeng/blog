@@ -2,7 +2,8 @@
 title: golang web编程之——读取csdn最新文章
 comments: true
 date: 2016-10-29 06:35:08
-tags: golang
+tags: [编程语言,golang]
+categories: 技术分享
 ---
 
 

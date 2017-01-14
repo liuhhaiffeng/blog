@@ -1,7 +1,8 @@
 ---
 title: c语言转汇编语言shell脚本
 date: 2016-09-17 17:58:57
-tags: ["c","shell","linux"]
+tags: [编程语言,"c","shell"]
+categories: 技术分享
 ---
 
 

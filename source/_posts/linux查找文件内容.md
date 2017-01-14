@@ -2,7 +2,8 @@
 title: linux查找文件内容
 comments: true
 date: 2016-10-04 18:55:36
-tags: linux shell
+tags: ["操作系统",Linux,Linux使用]
+categories: 技术分享
 ---
 
 > 有时候我们需要在一堆文件中查找包含`某单词`的文件。比如在一堆源码文件中找出来调用一个函数的地方。

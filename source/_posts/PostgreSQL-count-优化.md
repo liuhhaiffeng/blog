@@ -1,7 +1,8 @@
 ---
 title: PostgreSQL count(*) 优化
 date: 2016-10-02 12:50:10
-tags: ["PostgreSQL","count","数据库","优化"]
+tags: [数据库, "PostgreSQL","PostgreSQL使用"]
+categories: 技术分享
 ---
 
 在PostgreSQL数据库中，count(*)默认是全表扫描，那么对于数据量很大的表，因为需要把表的所有页面读入到内存，需要较多IO，耗费的时间很长。在很多应用中，需要频繁的count(*)来统计行数，那么在此类应用中如何优化count(*)的效率呢？

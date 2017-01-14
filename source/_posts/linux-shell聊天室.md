@@ -1,7 +1,8 @@
 ---
 title: linux shell聊天室
 date: 2016-09-17 17:38:43
-tags: ["c","linux","网络编程"]
+tags: ["操作系统", Linux, Linux编程, 编程语言, "c"]
+categories: 技术分享
 ---
 
 

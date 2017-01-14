@@ -2,7 +2,8 @@
 title: linux性能曲线工具
 comments: true
 date: 2016-10-11 13:36:18
-tags: linux
+tags: ["操作系统",Linux,Linux使用]
+categories: 技术分享
 ---
 
 > linux下有很多监控工具，如top，free，vmstat等。有一大痛点就是各种工具生成的结果格式不一致，较长一段时间内监控数据量大，人工阅读非常困难。所以写了一个脚本，把各种监控参数输出为一个表格，最后再画出图形。

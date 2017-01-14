@@ -2,7 +2,8 @@
 title: linux下配置IP地址子网掩码和网关
 comments: true
 date: 2016-10-05 11:09:42
-tags: linux
+tags: [操作系统,Linux,Linux使用]
+categories: 技术分享
 ---
 
 ## 命令配置

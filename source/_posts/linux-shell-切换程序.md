@@ -1,7 +1,8 @@
 ---
 title: 在linux shell 下切换程序
 date: 2016-09-17 17:14:37
-tags: ["linux","shell"]
+tags: [操作系统, Linux, Linux使用]
+categories: 技术分享
 ---
 
 

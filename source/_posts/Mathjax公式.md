@@ -1,7 +1,8 @@
 ---
 title: Mathjax公式
 date: 2016-09-17 13:39:40
-tags: "test"
+tags: [网站,"mathjax"]
+categories: 技术分享
 ---
 
 利用mathjax可以方便的输入latex格式的公式，例如输入如下文本

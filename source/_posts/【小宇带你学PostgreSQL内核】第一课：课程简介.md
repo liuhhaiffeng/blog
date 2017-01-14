@@ -2,8 +2,8 @@
 title: 【小宇带你学PostgreSQL内核】第一课：课程简介
 comments: true
 date: 2016-12-11 09:53:45
-tags: PostgreSQL
-categories: 小宇带你学PostgreSQL内核
+tags: [小宇带你学PostgreSQL内核, 数据库, PostgreSQL, PostgreSQL内核, 架构]
+categories: 视频
 ---
 
 

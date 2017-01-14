@@ -1,7 +1,8 @@
 ---
 title: Here Document
 date: 2016-10-02 11:49:52
-tags: ["linux","shell"]
+tags: [编程语言,"shell"]
+categories: 技术分享
 ---
 
 我们经常需要在shell中新建文件并输入内容，通常的做法有2种。

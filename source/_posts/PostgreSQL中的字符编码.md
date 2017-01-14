@@ -2,7 +2,8 @@
 title: PostgreSQL中的字符编码
 comments: true
 date: 2016-10-27 12:02:21
-tags: ["PostgreSQL","数据库"]
+tags: [数据库,PostgreSQL, PostgreSQL使用]
+categories: 技术分享
 ---
 
 

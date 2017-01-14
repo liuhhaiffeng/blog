@@ -2,7 +2,8 @@
 title: PostgresSQL-internal-roadmap
 comments: true
 date: 2016-12-18 04:27:18
-tags: PostgreSQL
+tags: [数据库, "PostgreSQL","PostgreSQL内核", 架构]
+categories: 技术分享
 ---
 
 [postgres internal roadmap](/uploads/internal.pdf)

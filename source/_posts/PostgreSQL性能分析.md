@@ -2,7 +2,8 @@
 title: PostgreSQL性能分析
 comments: true
 date: 2016-10-13 12:49:37
-tags: ["PostgreSQL","database","c"]
+tags: [数据库, "PostgreSQL", PostgreSQL使用, 调优]
+categories: 技术分享
 ---
 
 > 面对客户抱怨诸如“很慢”、“卡顿”等问题的时候，我们该如何找出性能瓶颈？从研发角度来说，做一下性能分析(profiling)可能有所帮助。性能分析能找出来最慢的函数，从而发现性能问题的瓶颈。再从瓶颈入手，优化代码从而解决性能问题。

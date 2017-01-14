@@ -1,7 +1,8 @@
 ---
 title: wget下载网站供离线浏览
 date: 2016-10-02 16:44:45
-tags: linux
+tags: [工具, wget]
+categories: 技术分享
 ---
 
 

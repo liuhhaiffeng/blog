@@ -1,7 +1,8 @@
 ---
-title: mysql大数据处理
+title: mysql数据处理
 date: 2015-02-17 18:10:00
-tags: ["c","mysql"]
+tags: [数据库, "MySQL"]
+categories: 技术分享
 ---
 
 ## 任务

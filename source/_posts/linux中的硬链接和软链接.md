@@ -3,7 +3,7 @@ title: linux中的硬链接和软链接
 comments: true
 date: 2016-10-10 06:03:07
 tags: ["操作系统",Linux,Linux编程]
-categories: 技术分享
+categories: [技术分享]
 --
 
 

@@ -2,8 +2,8 @@
 title: 深入理解PostgreSQL查询优化引擎
 comments: true
 date: 2016-11-21 05:57:19
-tags: [database,PostgreSQL]
-categories: [slides]
+tags: [数据库,PostgreSQL,PostgreSQL内核, 查询优化]
+categories: 技术分享
 ---
 
 ![幻灯片1.png-34.1kB][1]

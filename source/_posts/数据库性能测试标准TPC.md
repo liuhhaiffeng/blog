@@ -2,7 +2,8 @@
 title: 数据库性能测试标准TPC
 comments: true
 date: 2016-10-11 07:31:30
-tags: database
+tags: [数据库，PostgreSQL,PostgreSQL使用, 调优]
+categories: 技术分享
 ---
 
 

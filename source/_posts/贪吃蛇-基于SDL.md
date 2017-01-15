@@ -1,7 +1,8 @@
 ---
 title: 贪吃蛇-基于SDL
 date: 2016-09-17 18:15:58
-tags: ["c","linux","SDL"]
+tags: [编程语言,"c"]
+categories: 技术分享
 ---
 
 ## 题目

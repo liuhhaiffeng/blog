@@ -2,7 +2,7 @@
 title: 【小宇带你学PostgreSQL内核】第四课：parser语法分析
 comments: true
 date: 2017-1-1 10:23:14
-tags: [小宇带你学PostgreSQL内核, 数据库, PostgreSQL, PostgreSQL内核, 架构]
+tags: [小宇带你学PostgreSQL内核, 数据库, PostgreSQL, PostgreSQL内核, 语言层]
 categories: 视频
 ---
 

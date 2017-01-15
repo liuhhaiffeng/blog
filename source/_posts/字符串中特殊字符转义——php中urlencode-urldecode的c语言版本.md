@@ -2,7 +2,8 @@
 title: 字符串中特殊字符转义——php中urlencode urldecode的c语言版本
 comments: true
 date: 2016-10-09 05:54:58
-tags: c
+tags: [编程语言,c]
+categories: 技术分享
 ---
 
 

@@ -2,8 +2,8 @@
 title: 好书推荐：《Debug hacks——深入调试的技术和工具》
 comments: true
 date: 2016-11-27 09:58:06
-tags: [linux,c,PostgreSQL]
-categories: 读书
+tags: [读书, Linux, Linux编程]
+categories: 爱好
 ---
 
 >最近偶然发现了这本书，翻看过后很多之前疑惑的问题豁然开朗。这本书虽然是以内核研发作为探讨对象，但是对PostgreSQL发生的coredump分析非常有用。一些引发coredump的问题比如内存非法访问的排查和分析这本书里面都有着深入的讲解。另外这本书也介绍了汇编语言如何在调试过程中发挥重要作用，同时介绍了很多调试工具如gdb、objdump、nm、strace、valgrind等等，而且讲解比较贴近于实战。

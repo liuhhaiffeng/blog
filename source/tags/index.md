@@ -58,7 +58,8 @@ comments: false
 
 视频
 -----------
-- [小宇带你学PostgreSQL内核](http://shenyu.wiki/categories/%E5%B0%8F%E5%AE%87%E5%B8%A6%E4%BD%A0%E5%AD%A6PostgreSQL%E5%86%85%E6%A0%B8/)
+- [小宇带你学PostgreSQL内核](http://shenyu.wiki/tags/%E5%B0%8F%E5%AE%87%E5%B8%A6%E4%BD%A0%E5%AD%A6PostgreSQL%E5%86%85%E6%A0%B8/)
+- [汇编调试方法]()
 
 
 Presentations

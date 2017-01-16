@@ -1,5 +1,5 @@
 ---
-title: message
+title: 留言
 date: 2016-09-17 15:23:04
 ---
 

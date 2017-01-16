@@ -1,13 +1,10 @@
 ---
-title: map
+title: 导航
 comments: false
 date: 2017-01-16 01:33:22
 tags:
 ---
 
-
-导航
-==========
 
 技术分享
 ----------
@@ -15,27 +12,27 @@ tags:
 - [基础知识](http://shenyu.wiki/tags/%E6%95%B0%E6%8D%AE%E5%BA%93/)
 - [PostgreSQL](http://shenyu.wiki/tags/PostgreSQL/)
     - [PostgreSQL使用](http://shenyu.wiki/tags/PostgreSQL/)
-        - [使用]
-        - [调优]
+        - [运维]()
+        - [调优](http://shenyu.wiki/tags/调优/)
     - [PostgreSQL内核](http://shenyu.wiki/tags/PostgreSQL/)
-        - [架构]
-        - [语言层]
-        - [优化层]
-        - [执行层]
-        - [存取层]
-        - [存储层]
-        - [备份还原]
-        - [PLSQL]
-        - [接口]
-        - [本地化]
-- [MySQL](http://shenyu.wiki/tags/mysql/)
+        - [架构](http://shenyu.wiki/tags/架构/)
+        - [语言层](http://shenyu.wiki/tags/语言层/)
+        - [优化层]()
+        - [执行层]()
+        - [存取层]()
+        - [存储层]()
+        - [备份还原](http://shenyu.wiki/tags/备份还原/)
+        - [PLSQL](http://shenyu.wiki/tags/PLSQL/)
+        - [接口](http://shenyu.wiki/tags/接口/)
+        - [本地化](http://shenyu.wiki/tags/本地化/)
+- [MySQL](http://shenyu.wiki/tags/MySQL/)
 
 ### 操作系统
 - 基础知识
 - [Linux](http://shenyu.wiki/tags/Linux/)
-    - [Linux使用]()
-    - [Linux编程]()
-    - [Linux内核]()
+    - [Linux使用](http://shenyu.wiki/tags/Linux使用/)
+    - [Linux编程](http://shenyu.wiki/tags/Linux编程/)
+    - [Linux内核](http://shenyu.wiki/tags/Linux内核/)
 - Minix
 
 ### 编程语言

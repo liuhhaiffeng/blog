@@ -23,9 +23,15 @@ tags:
         - [存储层]()
         - [备份还原](http://shenyu.wiki/tags/备份还原/)
         - [PLSQL](http://shenyu.wiki/tags/PLSQL/)
-        - [接口](http://shenyu.wiki/tags/接口/)
         - [本地化](http://shenyu.wiki/tags/本地化/)
+	- [PostgreSQL接口](http://shenyu.wiki/tags/接口/)
+		- [ODBC]
+		- [libpq]
+	- [新特性开发]
 - [MySQL](http://shenyu.wiki/tags/MySQL/)
+- [Oracle]()
+	- [Oracle使用]()
+		- [对象类型]()
 
 ### 操作系统
 - 基础知识
@@ -48,12 +54,12 @@ tags:
 - [sed](http://shenyu.wiki/tags/sed/)
 - [wget]()
 ### 网站
-- hexo
+- [hexo](http://shenyu.wiki/tags/hexo/)
 - mathjax
 
 视频
 -----------
-- [小宇带你学PostgreSQL内核](http://shenyu.wiki/categories/%E5%B0%8F%E5%AE%87%E5%B8%A6%E4%BD%A0%E5%AD%A6PostgreSQL%E5%86%85%E6%A0%B8/)
+- [小宇带你学PostgreSQL内核](http://shenyu.wiki/tags/%E5%B0%8F%E5%AE%87%E5%B8%A6%E4%BD%A0%E5%AD%A6PostgreSQL%E5%86%85%E6%A0%B8/)
 - [汇编调试方法]()
 - [PostgreSQL逻辑备份还原设计与实现]()
 

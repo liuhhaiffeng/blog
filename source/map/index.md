@@ -17,10 +17,10 @@ tags:
     - [PostgreSQL内核](http://shenyu.wiki/tags/PostgreSQL/)
         - [架构](http://shenyu.wiki/tags/架构/)
         - [语言层](http://shenyu.wiki/tags/语言层/)
-        - [优化层]()
-        - [执行层]()
-        - [存取层]()
-        - [存储层]()
+        - [优化层]
+        - [执行层]
+        - [存取层]
+        - [存储层]
         - [备份还原](http://shenyu.wiki/tags/备份还原/)
         - [PLSQL](http://shenyu.wiki/tags/PLSQL/)
         - [本地化](http://shenyu.wiki/tags/本地化/)
@@ -40,6 +40,11 @@ tags:
     - [Linux编程](http://shenyu.wiki/tags/Linux编程/)
     - [Linux内核](http://shenyu.wiki/tags/Linux内核/)
 - Minix
+
+### 存储
+- 基础知识
+- [ceph]
+- [freenas]
 
 ### 编程语言
 - [c](http://shenyu.wiki/tags/c/)
@@ -82,6 +87,7 @@ Presentations
 -----------
 - [旅行](http://shenyu.wiki/tags/%E6%97%85%E8%A1%8C/)
 - [读书](http://shenyu.wiki/tags/%E8%AF%BB%E4%B9%A6/)
+- [文章](http://shenyu.wiki/tags/文章/)
 - 音乐
 - 电影
 - 电视剧

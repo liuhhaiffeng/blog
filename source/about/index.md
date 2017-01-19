@@ -1,5 +1,5 @@
 ---
-title: about
+title: coding for fun
 date: 2016-09-17 13:21:20
 comments: false
 ---

@@ -25,6 +25,16 @@ tags:
 - [yap](https://github.com/shenyuflying/yap)
 - [indent](https://github.com/shenyuflying/indent)
 
+<i class="icon-file-text"></i> 技术分享
+----------
+- [数据库](/map/database.html)
+- [操作系统](/map/os.html)
+- [存储](/map/storage.html)
+- [编程](/map/programming.html)
+- [工具](/map/tools.html)
+- [web](/map/web.html)
+
+
 
 <i class="icon-heart"></i> 爱好
 -----------
@@ -37,15 +47,6 @@ tags:
 - 名言
 - 数码
 
-
-<i class="icon-file-text"></i> 技术分享
-----------
-- [数据库](/map/database.html)
-- [操作系统](/map/os.html)
-- [存储](/map/storage.html)
-- [编程](/map/programming.html)
-- [工具](/map/tools.html)
-- [web](/map/web.html)
 
 <i class="icon-plus-sign"></i> 其他
 -----------

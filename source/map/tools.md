@@ -9,6 +9,7 @@ tags:
 ----------
 - [gdb](/tags/gdb/)
 - [git](/tags/git/)
+- [svn](/tags/svn/)
 - [vim](/tags/vim/)
 - [sed](/tags/sed/)
 - [wget]()

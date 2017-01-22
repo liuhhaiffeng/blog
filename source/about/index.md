@@ -53,7 +53,7 @@ EFSET Quick English Check - Score: Intermediate / Upper Intermediate (CEFR B1/B2
 ## 参与项目
 ### 国产数据库Kingbase研发
 
-**负责数据库产品的需求分析、系统设计、编码、单元测试**
+**负责数据库产品的需求分析、系统设计、编码、单元测试、bug修复**
 
 - PLSQL语言编译、执行和调试器
 - 并行备份还原
@@ -61,10 +61,7 @@ EFSET Quick English Check - Score: Intermediate / Upper Intermediate (CEFR B1/B2
 - 堆栈输出
 - `sys_analyze_datafile` 数据文件修复工具
 - `KingbaseLogAnalyzer` 日志分析工具
-
-**负责数据库内核、工具的代码维护**
-
-- 定位并且修复了数据库内核，备份还原工具，Database Link，接口，同步工具的若干bug
+- 定位并且修复了数据库内核，备份还原工具，Database Link，接口，同步工具，回归测试的若干bug
 
 **负责为技术支持人员提供答疑和研发级的技术支持**
 

@@ -7,7 +7,7 @@ categories: [爱好]
 ---
 
 
-#The best career advice I’ve received
+# The best career advice I’ve received
 
 Posted at October 15, 2013 by Nicholas C. Zakas
 
@@ -23,7 +23,7 @@ The truth is that I have been incredibly blessed in my career because of the peo
 
 I also find their advice to be universally applicable, so I’d like to share the things I was told that helped me along the way. Of course, some of these are paraphrased since my memory for exact phrases isn’t all that great, but I believe I’ve captured the important parts correctly.
 
-##Don’t be a short-order cook
+## Don’t be a short-order cook
 
 My very first job lasted 8 months because the company shut down. As I was talking with my manager about what I would do next, he gave me this advice:
 
@@ -31,7 +31,7 @@ My very first job lasted 8 months because the company shut down. As I was talkin
 
 This is something I’ve kept in mind throughout my career. Simply being an implementer isn’t good enough – you need to be involved in the process that leads up to implementation. Good engineers don’t just follow orders, they give feedback to and work with product owners to make the product better. Fortunately, I’ve chosen my jobs wisely and never ended up in a situation where people didn’t respect or value my insights.
 
-##Self-promote
+## Self-promote
 
 My second manager at Yahoo pulled me aside one day to give me some advice. He had been watching my work and felt like I was hiding a bit:
 
@@ -41,7 +41,7 @@ It took me a little while to digest what he was saying, but I finally figured it
 
 This is advice I give to many of my colleagues now. Self-promoting doesn’t mean, “look at me, I’m awesome.” It means letting people know when you’ve hit major milestones, or when you’ve learned something new. It means showing people the work that you’re proud of. It means celebrating your accomplishments and the accomplishments of others. It means being visible within the organization. The engineer who sits quietly in a corner and just codes away is always a bit mysterious – don’t be like that. A quick email to say, “hey, I finished the new email layout. Let me know what you think” goes a long way.
 
-##It’s about people
+## It’s about people
 
 I was very title-driven earlier in my career. I always wanted to know what I had to do to be promoted. During my first one-on-one with my new manager on the Yahoo homepage, I asked what it would take for me to get promoted. His words still ring in my ears:
 
@@ -51,7 +51,7 @@ I’m not sure I’ve ever received a better insight into the software engineeri
 
 Since that time, I’ve seen countless engineers get stuck at one level in their career. Smart people, good code, but the inability to work effectively with others keeps them where they are. Anytime someone feels stuck in their software engineering career, I recount this advice and it has always been right on the money.
 
-##None of this matters
+## None of this matters
 
 I went through a period at Yahoo where I was frustrated. Maybe frustrated isn’t the right word, more like angry. I had angry outbursts and was arguing with people constantly. Things were going wrong and I didn’t like that. During one particularly rough day, I asked one of my mentors how he managed to stay calm when so many things were going wrong. His response:
 
@@ -61,7 +61,7 @@ I had moved to California from Massachusetts and had a hard time making friends.
 
 He was right, once I shifted my mindset and recategorized the annoying things at work as “work things,” I was able to think more clearly. I was able to calm down at work and have much more pleasant interactions with people.
 
-##Authority, your way
+## Authority, your way
 
 When I was first promoted to principal engineer at Yahoo, I sat down with my director to better understand what the role entailed. I knew I had to be more of a leader, but I was having trouble being authoritative. I asked for help. Here’s what he said:
 
@@ -69,7 +69,7 @@ When I was first promoted to principal engineer at Yahoo, I sat down with my dir
 
 I spent a lot of time that year observing people of authority and how they interacted with others. I took note as to how they walked, how they talked, how they dealt with problem situations. I tried different styles before I finally came across one that worked for me. My style is uniquely me and anyone learning to be in a position of authority has to go through the same growing pains. My advantage was that my mentor clued me about the process up front.
 
-##Moving from “how?” to “what?”
+## Moving from “how?” to “what?”
 
 During a conversation with my manager at Yahoo, I asked what the expectations were with my new position. He answered:
 
@@ -79,7 +79,7 @@ This is the part where I see a lot of engineers get tripped up, and I would have
 
 At Box, we call this “running open loop,” meaning that you do your job with minimal oversight and yet still are making a significant positive impact on the engineering organization and the company as a whole. This is the step where many engineers fail to make the leap, and I still give this advice to anyone who is trying to get to the next level.
 
-##Act like you’re in charge
+## Act like you’re in charge
 
 I had just sat through a meeting where I had nothing to say. During my one-on-one with my director, I mentioned that I was just in a meeting where I had no idea why I was there and had nothing to contribute. He said:
 
@@ -87,7 +87,7 @@ I had just sat through a meeting where I had nothing to say. During my one-on-on
 
 In that piece of advice, my mentor had reminded me of a lesson I learned while acting in high school: no one knows when you’re acting. If you’re nervous but act like you’re not, then people won’t know that you’re nervous. The same with leadership. The old phrase fake it til you make it comes to mind. From that point on, I never sat quietly in a meeting. I made sure I only went to meetings that needed me to participate and then I would participate.
 
-##Let them win
+## Let them win
 
 I went through a particular period where there were a lot of arguments on the team. I prided myself on ending those arguments with authority. I had a “my ruling is final” mentality, and my manager noticed that and gave me this piece of advice:
 
@@ -95,7 +95,7 @@ I went through a particular period where there were a lot of arguments on the te
 
 This was one piece of advice I resisted initially. I was right nearly all of the time, why would I ever let someone else win? However, as I had grown to trust his instincts, I gave it a shot. The result: there were less arguments. People didn’t feel like they had to get one over on me, and in turn, I became better at identifying things I really didn’t care that much about. I stuck to my guns on important issues and let the others ones get resolved by the other party. The intensity of all conversations dropped considerably.
 
-##Conclusion
+## Conclusion
 
 Looking back at the brash guy I was when I graduated college, my career could have ended up very different. I was seen as a malcontent, a smart but hard-to-deal-with guy who people dealt with because they had to. If it weren’t for the mentors I had along the way, as well as some humbling failures early in my career, my interpersonal skills (or lack thereof) could have very well done me in. These days, I regularly seek out those who are more experienced than me and ask for advice. I may no longer make big, glaring mistakes, but I also don’t want to wait for one to happen to seek out the experienced insights of someone I trust.
 

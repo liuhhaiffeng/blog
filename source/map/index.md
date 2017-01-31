@@ -21,9 +21,10 @@ tags:
 
 <i class="icon-github"></i> 开源社区
 -----------
-- [pgNodeGraph](https://github.com/shenyuflying/pgNodeGraph)
-- [yap](https://github.com/shenyuflying/yap)
-- [indent](https://github.com/shenyuflying/indent)
+- [pgNodeGraph](https://github.com/shenyuflying/pgNodeGraph): PostgreSQL abstract syntax tree drawing tool
+- [yap](https://github.com/shenyuflying/yap): yet another poor man's profiler
+- [indent](https://github.com/shenyuflying/indent): inter-active c code formatting tool
+- [codeRunner](https://github.com/shenyuflying/codeRunner): run c code as an interpreted language
 
 <i class="icon-file-text"></i> 技术分享
 ----------

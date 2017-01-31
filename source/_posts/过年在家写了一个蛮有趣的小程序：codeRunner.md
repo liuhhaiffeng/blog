@@ -12,14 +12,27 @@ categories: 技术分享
 
 ```
 git clone https://github.com/shenyuflying/codeRunner
+cd codeRunner
 make
 make install
 ```
 
 默认是安装在了`/usr/local/bin/codeRunner`这里。
 
-![](/uploads/codeRunner-eg1.gif)
+一个小例子：
+<center>![](/uploads/codeRunner-eg1.gif)</center>
 
+另外，codeRunner还支持循环等等各种C语言的数据类型、流程控制等等。
 
+<center>![](/uploads/codeRunner-eg2.gif)</center>
 
-如果还想看到更多此类文章，请移步到[小宇的博客](http://shenyu.wiki)。
+下面一个例子输出乘法口诀表：
+
+<center>![](/uploads/codeRunner-eg3.gif)</center>
+
+如果有错误，会马上提示，纠正错误之后，可以再次运行：
+
+<center>![](/uploads/codeRunner-eg4.gif)</center>
+
+还有更复杂的用法，比如通过`程序模板`来支持`函数`等等。详细的用法可以看README哦。
+

@@ -8,6 +8,7 @@ tags:
 <i class="icon-cogs"></i> 工具
 ----------
 - [gdb](/tags/gdb/)
+- [make](/tags/make/)
 - [git](/tags/git/)
 - [svn](/tags/svn/)
 - [vim](/tags/vim/)

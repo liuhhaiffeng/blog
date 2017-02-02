@@ -42,7 +42,7 @@ tags:
 - [旅行](/tags/%E6%97%85%E8%A1%8C/)
 - [读书](/tags/%E8%AF%BB%E4%B9%A6/)
 - [文章](/tags/文章/)
-- 音乐
+- [音乐](/music/index.html)
 - 电影
 - 电视剧
 - 名言

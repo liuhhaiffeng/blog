@@ -23,7 +23,7 @@ tags:
         - [PLSQL](/tags/PLSQL/)
         - [本地化](/tags/本地化/)
 	- [PostgreSQL接口](/tags/接口/)
-		- [ODBC]
+		- [ODBC](/tags/ODBC/)
 		- [libpq]
 	- [新特性开发]
 - [MySQL](/tags/MySQL/)

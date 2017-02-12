@@ -7,7 +7,7 @@ categories: Presentations
 ---
 
 <center>
-<iframe src=" http://shenyu.wiki/uploads/odbc-programming.html"  scrolling="no" frameborder="0" width="640" height="480"> </iframe>
+<iframe src=" http://shenyu.wiki/uploads/odbc-programming.html"  scrolling="no" frameborder="0" width="800" height="600"> </iframe>
 </center>
 
 

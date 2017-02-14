@@ -17,7 +17,7 @@ categories: 技术分享
 动态方法就是在程序执行过程中，把函数的调用情况记录下来，一些程序性能分析工具常常都有这个功能，比如`gprof`。相对于静态方法来说，动态方法准确的反映了程序执行的过程。但是一些没有实际执行到的分支没有显示出来。
 常用的工具有：
 1. [gprof](https://sourceware.org/binutils/docs/gprof/)：可以输出每个函数的调用次数，每个函数消耗的处理器时间，函数之间的调用关系。通过在编译和链接程序的时候（使用 -pg 编译和链接选项），gcc 在你应用程序的每个函数中都加入了一个名为mcount函数，也就是说你的应用程序里的每一个函数都会调用mcount，而mcount会在内存中保存一张函数调用图，并通过函数调用堆栈的形式查找子函数和父函数的地址。这张调用图也保存了所有与函数相关的调用时间，调用次数等等的所有信息。在程序结束后会生成gmon.out文件，然后再用gprof来分析gmon.out文件。但是gprof不支持多线程应用，多线程下只能采集主线程性能数据。原因是gprof采用ITIMER_PROF信号，在多线程内只有主线程才能响应该信号。如果需要支持多线程程序那么需要程序员自己处理线程信号。另外gprof只能输出文本形式的调用关系。
-2. KCachegrind：利用calgrind生成的结果，绘制调用关系图形。使用也非常简单,首先用valgrind来执行程序`valgrind --tools=callgrind ./prog`，程序结束后在目录下生成`callgrind.out.pid`文件，然后用kcachegrind打开这个文件即可。
+2. [KCachegrind](http://kcachegrind.sourceforge.net/html/Home.html)：利用calgrind生成的结果，绘制调用关系图形。使用也非常简单,首先用valgrind来执行程序`valgrind --tools=callgrind ./prog`，程序结束后在目录下生成`callgrind.out.pid`文件，然后用kcachegrind打开这个文件即可。
 
 静态方法
 ----------------------

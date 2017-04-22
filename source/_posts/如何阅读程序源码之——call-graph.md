@@ -33,6 +33,7 @@ categories: 技术分享
  
 
 1. gprof
+
 ```
 $ gprof -b ./node2dot ./gmon.out 
 Flat profile:
@@ -106,11 +107,11 @@ Index by function name
 
 ```
 2. kcachegrind
-![image_1b8t50qjn1p7f9i0bjs1qud1cqc9.png-253.8kB][2]
+<center>![image_1b8t50qjn1p7f9i0bjs1qud1cqc9.png-253.8kB][2]</center>
 3. egypt 
-![image_1b8renepf1ckbd1d1qjk1ikv4a0m.png-42.6kB][3]
+<center>![image_1b8renepf1ckbd1d1qjk1ikv4a0m.png-42.6kB][3]</center>
 4. CCTree
-![image_1b8rei332c4v1ppefci182muf49.png-128.3kB][4]
+<center>![image_1b8rei332c4v1ppefci182muf49.png-128.3kB][4]</center>
 
 PS:以上分析的源码来自我的两个开源项目：
 pgNodeGraph: http://github.com/shenyuflying/pgNodeGraph

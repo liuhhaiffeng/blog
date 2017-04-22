@@ -33,11 +33,11 @@ comments: false
 - 数据库coredump handler（C语言3k行）
   - 使用汇编、backtrace、gdb实现产品堆栈自诊断
   - 用gcore实现数据库内核进程镜像转储
--PLSQL语言debug模块设计和实现（C语言代码20k行）
+- PLSQL语言debug模块设计和实现（C语言代码20k行）
   - 使用socket网络编程实现了C/S架构的PLSQL debugger
   - 使用wxWigets跨平台GUI库（C++）开发了linux和windows的调试终端
   - 兼容Oracle复合类型调试，比如关联数组、嵌套表的调试
-- 实现条件断点、表达式赋值等高级调试特性
+  - 实现条件断点、表达式赋值等高级调试特性
 - 备份还原工具
   - 熟悉libpq接口编程
   - 实现了多进程框架、快照管理器

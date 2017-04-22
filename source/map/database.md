@@ -15,7 +15,7 @@ tags:
     - [PostgreSQL内核](/tags/PostgreSQL/)
         - [架构](/tags/架构/)
         - [语言层](/tags/语言层/)
-        - [优化层]
+        - [优化层](/tags/优化层)
         - [执行层]
         - [存取层]
         - [存储层]
@@ -25,6 +25,19 @@ tags:
 	- [PostgreSQL接口](/tags/接口/)
 		- [ODBC](/tags/ODBC/)
 		- [libpq]
+	- [新特性开发]
+        - [pgdoc](/uploads/pgdoc/index.html)
+- [Greenplum](/tags/Greenplum/)
+    - [Greenplum使用](/tags/Greenplum/)
+        - [运维]
+        - [调优]
+    - [Greenplum内核](/tags/Greenplum/)
+        - [架构]
+        - [语言层]
+        - [优化层]
+        - [执行层]
+        - [存取层]
+        - [存储层]
 	- [新特性开发]
 - [MySQL](/tags/MySQL/)
 - [Oracle]()

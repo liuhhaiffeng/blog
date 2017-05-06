@@ -8,6 +8,14 @@ tags:
 <i class="icon-copy"></i> 数据库
 ----------
 - [基础知识](/tags/%E6%95%B0%E6%8D%AE%E5%BA%93/)
+    - [SQL 标准]
+        - [1992]
+        - [1999]
+        - [2003]
+    - [示例库]
+        - [NorthWind]
+        - [EMP]
+        - [Course]
 - [PostgreSQL](/tags/PostgreSQL/)
     - [PostgreSQL使用](/tags/PostgreSQL/)
         - [运维]()
@@ -26,7 +34,12 @@ tags:
 		- [ODBC](/tags/ODBC/)
 		- [libpq]
 	- [新特性开发]
-        - [pgdoc](/uploads/pgdoc/index.html)
+        - [开发文档](/uploads/pgdoc/index.html)
+    - [兼容性]
+        - [oracle to postgres conversion](https://wiki.postgresql.org/wiki/Oracle_to_Postgres_Conversion)
+        - [case compatible]
+        - [rownum]
+        - [dual table]
 - [Greenplum](/tags/Greenplum/)
     - [Greenplum使用](/tags/Greenplum/)
         - [运维]

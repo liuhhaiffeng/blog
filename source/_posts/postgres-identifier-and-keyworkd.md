@@ -1,5 +1,5 @@
 ---
-title: postgres identifier and keyworkd
+title: postgres identifier and keyword
 comments: true
 date: 2017-05-10 10:17:58
 tags: [数据库, PostgreSQL, PostgreSQL内核, 语言层]

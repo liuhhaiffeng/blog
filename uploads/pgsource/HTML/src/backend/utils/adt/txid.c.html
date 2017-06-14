@@ -1,0 +1,819 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\utils\adt\txid.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\utils\adt\txid.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:54 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * txid.c 
+ * 
+ *  Export internal transaction IDs to user level. 
+ * 
+ * Note that only top-level transaction IDs are ever converted to TXID. 
+ * This is important because TXIDs frequently persist beyond the global 
+ * xmin horizon, or may even be shipped to other machines, so we cannot 
+ * rely on being able to correlate subtransaction IDs with their parents 
+ * via functions such as SubTransGetTopmostTransaction(). 
+ * 
+ * 
+ *  Copyright (c) 2003-2017, PostgreSQL Global Development Group 
+ *  Author: Jan Wieck, Afilias USA INC. 
+ *  64-bit txids: Marko Kreen, Skype Technologies 
+ * 
+ *  src/backend/utils/adt/txid.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/clog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/transam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"funcapi.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"libpq/pqformat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/postmaster.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/builtins.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/snapmgr.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* txid will be signed int8 in database, so must limit to 63 bits */ 
+</span><a name="LN38"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MAX_TXID</span>   <span class='Parentheses'>((</span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a><span class='Parentheses'>) </span><a href="../../../include/c.h.html#LN342"><span class='Ref_to_Const'>PG_INT64_MAX</span></a><span class='Parentheses'>)</span> 
+ 
+<span class='Comment_Multi_Line'>/* Use unsigned variant internally */ 
+</span><a name="LN41"></a><span class='Control'>typedef</span> <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a> <span class='Declare_Typedef'>txid</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* sprintf format code for uint64 */ 
+</span><a name="LN44"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>TXID_FMT</span> <a href="../../../include/c.h.html#LN315"><span class='Ref_to_Const'>UINT64_FORMAT</span></a> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * If defined, use bsearch() function for searching for txids in snapshots 
+ * that have more than the specified number of values. 
+ */ 
+</span><a name="LN50"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>USE_BSEARCH_IF_NXIP_GREATER</span> <span class='Number'>30</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Snapshot containing 8byte txids. 
+ */ 
+</span><span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * 4-byte length hdr, should not be touched directly. 
+     * 
+     * Explicit embedding is ok as we want always correct alignment anyway. 
+     */ 
+</span><a name="LN63"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Member'>__varsz</span><span class='Delimiter'>; 
+</span> 
+<a name="LN65"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>nxip</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* number of txids in xip array */ 
+</span><a name="LN66"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Member'>xmin</span><span class='Delimiter'>; 
+</span><a name="LN67"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Member'>xmax</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* in-progress txids, xmin &LT;= xip[i] &LT; xmax: */ 
+</span><a name="LN69"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Member'>xip</span><span class='Delimiter'>[</span>FLEXIBLE_ARRAY_MEMBER<span class='Delimiter'>]; 
+</span><a name="LN70"></a>} <span class='Declare_Typedef'>TxidSnapshot</span><span class='Delimiter'>; 
+</span> 
+<a name="LN72"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>TXID_SNAPSHOT_SIZE</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>nxip</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a><span class='Delimiter'>, </span>xip<span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Parentheses'>(</span><a href="txid.c.html#LN72"><span class='Ref_to_Parameter'>nxip</span></a><span class='Parentheses'>))</span> 
+<a name="LN74"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>TXID_SNAPSHOT_MAX_NXIP</span> <span class='Operator'>\ 
+</span>    <span class='Parentheses'>((</span><a href="../../../common/psprintf.c.html#LN27"><span class='Ref_to_Const'>MaxAllocSize</span></a> <span class='Operator'>- </span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a><span class='Delimiter'>, </span>xip<span class='Parentheses'>))</span> <span class='Operator'>/ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a><span class='Parentheses'>))</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Epoch values from xact.c 
+ */ 
+</span><span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN82"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Member'>last_xid</span><span class='Delimiter'>; 
+</span><a name="LN83"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>epoch</span><span class='Delimiter'>; 
+</span><a name="LN84"></a>} <span class='Declare_Typedef'>TxidEpoch</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Fetch epoch data from xact.c. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN91"></a><span class='Declare_Function'>load_xid_epoch</span><span class='Parentheses'>(</span><a href="txid.c.html#LN80"><span class='Ref_to_Typedef'>TxidEpoch</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/access/xlog.h.html#LN277"><span class='Ref_to_Proto'>GetNextXidAndEpoch</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN91"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN82"><span class='Ref_to_Member'>last_xid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN91"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN83"><span class='Ref_to_Member'>epoch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Helper to get a TransactionId from a 64-bit xid with wraparound detection. 
+ * 
+ * It is an ERROR if the xid is in the future.  Otherwise, returns true if 
+ * the transaction is still new enough that we can determine whether it 
+ * committed and false otherwise.  If *extracted_xid is not NULL, it is set 
+ * to the low 32 bits of the transaction ID (i.e. the actual XID, without the 
+ * epoch). 
+ * 
+ * The caller must hold CLogTruncationLock since it's dealing with arbitrary 
+ * XIDs, and must continue to hold it until it's done with any clog lookups 
+ * relating to those XIDs. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN110"></a><span class='Declare_Function'>TransactionIdInRecentPast</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a> <span class='Declare_Parameter'>xid_with_epoch</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>extracted_xid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN112"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>xid_epoch</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="txid.c.html#LN110"><span class='Ref_to_Parameter'>xid_with_epoch</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN113"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="txid.c.html#LN110"><span class='Ref_to_Parameter'>xid_with_epoch</span></a><span class='Delimiter'>; 
+</span><a name="LN114"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>now_epoch</span><span class='Delimiter'>; 
+</span><a name="LN115"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>now_epoch_last_xid</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xlog.h.html#LN277"><span class='Ref_to_Proto'>GetNextXidAndEpoch</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN115"><span class='Ref_To_Local'>now_epoch_last_xid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN114"><span class='Ref_To_Local'>now_epoch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN110"><span class='Ref_to_Parameter'>extracted_xid</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="txid.c.html#LN110"><span class='Ref_to_Parameter'>extracted_xid</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN113"><span class='Ref_To_Local'>xid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN113"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* For non-normal transaction IDs, we can ignore the epoch. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN41"><span class='Ref_to_Macro'>TransactionIdIsNormal</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN113"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If the transaction ID is in the future, throw an error. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN112"><span class='Ref_To_Local'>xid_epoch</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN114"><span class='Ref_To_Local'>now_epoch</span></a> 
+        <span class='Operator'>|| </span><span class='Parentheses'>(</span><a href="txid.c.html#LN112"><span class='Ref_To_Local'>xid_epoch</span></a> <span class='Operator'>== </span><a href="txid.c.html#LN114"><span class='Ref_To_Local'>now_epoch</span></a> <span class='Operator'>&& </span><a href="txid.c.html#LN113"><span class='Ref_To_Local'>xid</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN115"><span class='Ref_To_Local'>now_epoch_last_xid</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INVALID_PARAMETER_VALUE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"transaction ID "</span> <a href="../../../include/c.h.html#LN315"><span class='Ref_to_Const'>UINT64_FORMAT</span></a> <span class='String'>" is in the future"</span><span class='Delimiter'>, 
+</span>                        <a href="txid.c.html#LN110"><span class='Ref_to_Parameter'>xid_with_epoch</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * ShmemVariableCache-&GT;oldestClogXid is protected by CLogTruncationLock, 
+     * but we don't acquire that lock here.  Instead, we require the caller to 
+     * acquire it, because the caller is presumably going to look up the 
+     * returned XID.  If we took and released the lock within this function, a 
+     * CLOG truncation could occur before the caller finished with the XID. 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/lwlock.h.html#LN151"><span class='Ref_to_Proto'>LWLockHeldByMe</span></a><span class='Parentheses'>(</span>CLogTruncationLock<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the transaction ID has wrapped around, it's definitely too old to 
+     * determine the commit status.  Otherwise, we can compare it to 
+     * ShmemVariableCache-&GT;oldestClogXid to determine whether the relevant 
+     * CLOG entry is guaranteed to still exist. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN112"><span class='Ref_To_Local'>xid_epoch</span></a> <span class='Operator'>+ </span><span class='Number'>1</span> <span class='Operator'>&LT; </span><a href="txid.c.html#LN114"><span class='Ref_To_Local'>now_epoch</span></a> 
+        <span class='Operator'>|| </span><span class='Parentheses'>(</span><a href="txid.c.html#LN112"><span class='Ref_To_Local'>xid_epoch</span></a> <span class='Operator'>+ </span><span class='Number'>1</span> <span class='Operator'>== </span><a href="txid.c.html#LN114"><span class='Ref_To_Local'>now_epoch</span></a> <span class='Operator'>&& </span><a href="txid.c.html#LN113"><span class='Ref_To_Local'>xid</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN115"><span class='Ref_To_Local'>now_epoch_last_xid</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>|| </span><a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN113"><span class='Ref_To_Local'>xid</span></a><span class='Delimiter'>, </span><a href="../../access/transam/varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN140"><span class='Ref_to_Member'>oldestClogXid</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TransactionIdInRecentPast &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * do a TransactionId -&GT; txid conversion for an XID near the given epoch 
+ */ 
+</span><span class='Keyword'>static </span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a> 
+<a name="LN164"></a><span class='Declare_Function'>convert_xid</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><span class='Keyword'>const </span><a href="txid.c.html#LN80"><span class='Ref_to_Typedef'>TxidEpoch</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN166"></a>    <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>epoch</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* return special xid's as-is */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN41"><span class='Ref_to_Macro'>TransactionIdIsNormal</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a><span class='Parentheses'>) </span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* xid can be on either side when near wrap-around */ 
+</span>    <a href="txid.c.html#LN166"><span class='Ref_To_Local'>epoch</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a><span class='Parentheses'>) </span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN83"><span class='Ref_to_Member'>epoch</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>xid</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN82"><span class='Ref_to_Member'>last_xid</span></a> <span class='Operator'>&& 
+</span>        <a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN82"><span class='Ref_to_Member'>last_xid</span></a><span class='Parentheses'>))</span> 
+        <a href="txid.c.html#LN166"><span class='Ref_To_Local'>epoch</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>xid</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN82"><span class='Ref_to_Member'>last_xid</span></a> <span class='Operator'>&& 
+</span>             <a href="../../../include/access/transam.h.html#LN170"><span class='Ref_to_Proto'>TransactionIdFollows</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN82"><span class='Ref_to_Member'>last_xid</span></a><span class='Parentheses'>))</span> 
+        <a href="txid.c.html#LN166"><span class='Ref_To_Local'>epoch</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN166"><span class='Ref_To_Local'>epoch</span></a> <span class='Operator'>&LT;&LT; </span><span class='Number'>32</span><span class='Parentheses'>) </span><span class='Operator'>| </span><a href="txid.c.html#LN164"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end convert_xid &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * txid comparator for qsort/bsearch 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN188"></a><span class='Declare_Function'>cmp_txid</span><span class='Parentheses'>(</span><span class='Keyword'>const void </span><span class='Operator'>*</span><span class='Declare_Parameter'>aa</span><span class='Delimiter'>, </span><span class='Keyword'>const void </span><span class='Operator'>*</span><span class='Declare_Parameter'>bb</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN190"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>a</span> <span class='Operator'>= *</span><span class='Parentheses'>(</span><span class='Keyword'>const </span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="txid.c.html#LN188"><span class='Ref_to_Parameter'>aa</span></a><span class='Delimiter'>; 
+</span><a name="LN191"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>b</span> <span class='Operator'>= *</span><span class='Parentheses'>(</span><span class='Keyword'>const </span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="txid.c.html#LN188"><span class='Ref_to_Parameter'>bb</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN190"><span class='Ref_To_Local'>a</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN191"><span class='Ref_To_Local'>b</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN190"><span class='Ref_To_Local'>a</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN191"><span class='Ref_To_Local'>b</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Sort a snapshot's txids, so we can use bsearch() later.  Also remove 
+ * any duplicates. 
+ * 
+ * For consistency of on-disk representation, we always sort even if bsearch 
+ * will not be used. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN208"></a><span class='Declare_Function'>sort_snapshot</span><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>snap</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN210"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>last</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN211"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nxip</span><span class='Delimiter'>, 
+</span><a name="LN212"></a>                <span class='Declare_Local'>idx1</span><span class='Delimiter'>, 
+</span><a name="LN213"></a>                <span class='Declare_Local'>idx2</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN208"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a> <span class='Operator'>&GT; </span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/port.h.html#LN439"><span class='Ref_to_Macro'>qsort</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN208"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN208"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="txid.c.html#LN187"><span class='Ref_to_Func'>cmp_txid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* remove duplicates */ 
+</span>        <a href="txid.c.html#LN211"><span class='Ref_To_Local'>nxip</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN208"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Delimiter'>; 
+</span>        <a href="txid.c.html#LN212"><span class='Ref_To_Local'>idx1</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN213"><span class='Ref_To_Local'>idx2</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN212"><span class='Ref_To_Local'>idx1</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN211"><span class='Ref_To_Local'>nxip</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN208"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN212"><span class='Ref_To_Local'>idx1</span></a><span class='Delimiter'>] </span><span class='Operator'>!= </span><a href="txid.c.html#LN210"><span class='Ref_To_Local'>last</span></a><span class='Parentheses'>) 
+</span>                <a href="txid.c.html#LN210"><span class='Ref_To_Local'>last</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN208"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN213"><span class='Ref_To_Local'>idx2</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="txid.c.html#LN208"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN212"><span class='Ref_To_Local'>idx1</span></a><span class='Delimiter'>]; 
+</span>            <span class='Control'>else</span> 
+                <a href="txid.c.html#LN208"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>            <a href="txid.c.html#LN212"><span class='Ref_To_Local'>idx1</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end sort_snapshot &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * check txid visibility. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN237"></a><span class='Declare_Function'>is_visible_txid</span><span class='Parentheses'>(</span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a> <span class='Declare_Parameter'>value</span><span class='Delimiter'>, </span><span class='Keyword'>const </span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>snap</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Keyword'>value </span><span class='Operator'>&LT; </span><a href="txid.c.html#LN237"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN66"><span class='Ref_to_Member'>xmin</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Keyword'>value </span><span class='Operator'>&GT;= </span><a href="txid.c.html#LN237"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN67"><span class='Ref_to_Member'>xmax</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><span class='Directive'>#ifdef</span> <a href="txid.c.html#LN50"><span class='Ref_to_Const'>USE_BSEARCH_IF_NXIP_GREATER</span></a> 
+    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN237"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN50"><span class='Ref_to_Const'>USE_BSEARCH_IF_NXIP_GREATER</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN246"></a>        <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>res</span><span class='Delimiter'>; 
+</span> 
+        <a href="txid.c.html#LN246"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span>bsearch<span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Keyword'>value</span><span class='Delimiter'>, </span><a href="txid.c.html#LN237"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN237"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="txid.c.html#LN187"><span class='Ref_to_Func'>cmp_txid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* if found, transaction is still in progress */ 
+</span>        <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN246"><span class='Ref_To_Local'>res</span></a><span class='Parentheses'>) </span><span class='Operator'>? </span><span class='Boolean'>false </span><span class='Operator'>: </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN255"></a>        <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN255"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="txid.c.html#LN255"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN237"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Delimiter'>; </span><a href="txid.c.html#LN255"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Keyword'>value </span><span class='Operator'>== </span><a href="txid.c.html#LN237"><span class='Ref_to_Parameter'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN255"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end is_visible_txid &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * helper functions to use StringInfo for TxidSnapshot creation. 
+ */ 
+</span> 
+<span class='Keyword'>static </span><a href="../../../include/lib/stringinfo.h.html#LN42"><span class='Ref_to_Typedef'>StringInfo</span></a> 
+<a name="LN271"></a><span class='Declare_Function'>buf_init</span><span class='Parentheses'>(</span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a> <span class='Declare_Parameter'>xmin</span><span class='Delimiter'>, </span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a> <span class='Declare_Parameter'>xmax</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN273"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Declare_Local'>snap</span><span class='Delimiter'>; 
+</span><a name="LN274"></a>    <a href="../../../include/lib/stringinfo.h.html#LN42"><span class='Ref_to_Typedef'>StringInfo</span></a>  <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN273"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>.</span><a href="txid.c.html#LN66"><span class='Ref_to_Member'>xmin</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN271"><span class='Ref_to_Parameter'>xmin</span></a><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN273"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>.</span><a href="txid.c.html#LN67"><span class='Ref_to_Member'>xmax</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN271"><span class='Ref_to_Parameter'>xmax</span></a><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN273"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>.</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN274"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="../../lib/stringinfo.c.html#LN26"><span class='Ref_to_Func'>makeStringInfo</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/lib/stringinfo.h.html#LN142"><span class='Ref_to_Proto'>appendBinaryStringInfo</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN274"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="txid.c.html#LN273"><span class='Ref_To_Local'>snap</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN72"><span class='Ref_to_Macro'>TXID_SNAPSHOT_SIZE</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="txid.c.html#LN274"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>static void 
+</span><a name="LN286"></a><span class='Declare_Function'>buf_add_txid</span><span class='Parentheses'>(</span><a href="../../../include/lib/stringinfo.h.html#LN42"><span class='Ref_to_Typedef'>StringInfo</span></a> <span class='Declare_Parameter'>buf</span><span class='Delimiter'>, </span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a> <span class='Declare_Parameter'>xid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN288"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="txid.c.html#LN286"><span class='Ref_to_Parameter'>buf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* do this before possible realloc */ 
+</span>    <a href="txid.c.html#LN288"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/lib/stringinfo.h.html#LN142"><span class='Ref_to_Proto'>appendBinaryStringInfo</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN286"><span class='Ref_to_Parameter'>buf</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="txid.c.html#LN286"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="txid.c.html#LN286"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>static </span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>* 
+</span><a name="LN297"></a><span class='Declare_Function'>buf_finalize</span><span class='Parentheses'>(</span><a href="../../../include/lib/stringinfo.h.html#LN42"><span class='Ref_to_Typedef'>StringInfo</span></a> <span class='Declare_Parameter'>buf</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN299"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="txid.c.html#LN297"><span class='Ref_to_Parameter'>buf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/postgres.h.html#LN327"><span class='Ref_to_Macro'>SET_VARSIZE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN299"><span class='Ref_To_Local'>snap</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN297"><span class='Ref_to_Parameter'>buf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN37"><span class='Ref_to_Member'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* buf is not needed anymore */ 
+</span>    <a href="txid.c.html#LN297"><span class='Ref_to_Parameter'>buf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN297"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="txid.c.html#LN299"><span class='Ref_To_Local'>snap</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * simple number parser. 
+ * 
+ * We return 0 on error, which is invalid value for txid. 
+ */ 
+</span><span class='Keyword'>static </span><a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a> 
+<a name="LN316"></a><span class='Declare_Function'>str2txid</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>s</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>**</span><span class='Declare_Parameter'>endp</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN318"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>val</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN319"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>cutoff</span> <span class='Operator'>= </span><a href="txid.c.html#LN38"><span class='Ref_to_Const'>MAX_TXID</span></a> <span class='Operator'>/ </span><span class='Number'>10</span><span class='Delimiter'>; 
+</span><a name="LN320"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>cutlim</span> <span class='Operator'>= </span><a href="txid.c.html#LN38"><span class='Ref_to_Const'>MAX_TXID</span></a> <span class='Operator'>% </span><span class='Number'>10</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>; </span><span class='Operator'>*</span><a href="txid.c.html#LN316"><span class='Ref_to_Parameter'>s</span></a><span class='Delimiter'>; </span><a href="txid.c.html#LN316"><span class='Ref_to_Parameter'>s</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN324"></a>        <span class='Keyword'>unsigned</span>    <span class='Declare_Local'>d</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="txid.c.html#LN316"><span class='Ref_to_Parameter'>s</span></a> <span class='Operator'>&LT; </span><span class='String'>'0'</span> <span class='Operator'>|| *</span><a href="txid.c.html#LN316"><span class='Ref_to_Parameter'>s</span></a> <span class='Operator'>&GT; </span><span class='String'>'9'</span><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <a href="txid.c.html#LN324"><span class='Ref_To_Local'>d</span></a> <span class='Operator'>= *</span><a href="txid.c.html#LN316"><span class='Ref_to_Parameter'>s</span></a> <span class='Operator'>- </span><span class='String'>'0'</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * check for overflow 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN318"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN319"><span class='Ref_To_Local'>cutoff</span></a> <span class='Operator'>|| </span><span class='Parentheses'>(</span><a href="txid.c.html#LN318"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>== </span><a href="txid.c.html#LN319"><span class='Ref_To_Local'>cutoff</span></a> <span class='Operator'>&& </span><a href="txid.c.html#LN324"><span class='Ref_To_Local'>d</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN320"><span class='Ref_To_Local'>cutlim</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="txid.c.html#LN318"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="txid.c.html#LN318"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN318"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>* </span><span class='Number'>10</span> <span class='Operator'>+ </span><a href="txid.c.html#LN324"><span class='Ref_To_Local'>d</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN316"><span class='Ref_to_Parameter'>endp</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="txid.c.html#LN316"><span class='Ref_to_Parameter'>endp</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN316"><span class='Ref_to_Parameter'>s</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="txid.c.html#LN318"><span class='Ref_To_Local'>val</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end str2txid &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * parse snapshot from cstring 
+ */ 
+</span><span class='Keyword'>static </span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>* 
+</span><a name="LN350"></a><span class='Declare_Function'>parse_snapshot</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>str</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN352"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>xmin</span><span class='Delimiter'>; 
+</span><a name="LN353"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>xmax</span><span class='Delimiter'>; 
+</span><a name="LN354"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>last_val</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span><a name="LN355"></a>                <span class='Declare_Local'>val</span><span class='Delimiter'>; 
+</span><a name="LN356"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>str_start</span> <span class='Operator'>= </span><a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a><span class='Delimiter'>; 
+</span><a name="LN357"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>endp</span><span class='Delimiter'>; 
+</span><a name="LN358"></a>    <a href="../../../include/lib/stringinfo.h.html#LN42"><span class='Ref_to_Typedef'>StringInfo</span></a>  <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN352"><span class='Ref_To_Local'>xmin</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN315"><span class='Ref_to_Func'>str2txid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN357"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="txid.c.html#LN357"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>!= </span><span class='String'>':'</span><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="txid.c.html#LN401"><span class='Ref_to_Label'>bad_format</span></a><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN357"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN353"><span class='Ref_To_Local'>xmax</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN315"><span class='Ref_to_Func'>str2txid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN357"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="txid.c.html#LN357"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>!= </span><span class='String'>':'</span><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="txid.c.html#LN401"><span class='Ref_to_Label'>bad_format</span></a><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN357"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* it should look sane */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN352"><span class='Ref_To_Local'>xmin</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="txid.c.html#LN353"><span class='Ref_To_Local'>xmax</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="txid.c.html#LN352"><span class='Ref_To_Local'>xmin</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN353"><span class='Ref_To_Local'>xmax</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="txid.c.html#LN401"><span class='Ref_to_Label'>bad_format</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* allocate buffer */ 
+</span>    <a href="txid.c.html#LN358"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN270"><span class='Ref_to_Func'>buf_init</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN352"><span class='Ref_To_Local'>xmin</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN353"><span class='Ref_To_Local'>xmax</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* loop over values */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a> <span class='Operator'>!= </span><span class='String'>'\0'</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* read next value */ 
+</span>        <a href="txid.c.html#LN355"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN315"><span class='Ref_to_Func'>str2txid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN357"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN357"><span class='Ref_To_Local'>endp</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* require the input to be in order */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN355"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN352"><span class='Ref_To_Local'>xmin</span></a> <span class='Operator'>|| </span><a href="txid.c.html#LN355"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>&GT;= </span><a href="txid.c.html#LN353"><span class='Ref_To_Local'>xmax</span></a> <span class='Operator'>|| </span><a href="txid.c.html#LN355"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN354"><span class='Ref_To_Local'>last_val</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="txid.c.html#LN401"><span class='Ref_to_Label'>bad_format</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* skip duplicates */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN355"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>!= </span><a href="txid.c.html#LN354"><span class='Ref_To_Local'>last_val</span></a><span class='Parentheses'>) 
+</span>            <a href="txid.c.html#LN285"><span class='Ref_to_Func'>buf_add_txid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN358"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN355"><span class='Ref_To_Local'>val</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="txid.c.html#LN354"><span class='Ref_To_Local'>last_val</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN355"><span class='Ref_To_Local'>val</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a> <span class='Operator'>== </span><span class='String'>','</span><span class='Parentheses'>) 
+</span>            <a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="txid.c.html#LN350"><span class='Ref_to_Parameter'>str</span></a> <span class='Operator'>!= </span><span class='String'>'\0'</span><span class='Parentheses'>) 
+</span>            <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="txid.c.html#LN401"><span class='Ref_to_Label'>bad_format</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while *str!='\0' &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="txid.c.html#LN296"><span class='Ref_to_Func'>buf_finalize</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN358"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN401"></a><span class='Label'>bad_format</span><span class='Operator'>: 
+</span>    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INVALID_TEXT_REPRESENTATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid input syntax for type %s: \"%s\""</span><span class='Delimiter'>, 
+</span>                    <span class='String'>"txid_snapshot"</span><span class='Delimiter'>, </span><a href="txid.c.html#LN356"><span class='Ref_To_Local'>str_start</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>;</span>                <span class='Comment_Single_Line'>/* keep compiler quiet */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end parse_snapshot &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Public functions. 
+ * 
+ * txid_current() and txid_current_snapshot() are the only ones that 
+ * communicate with core xid machinery.  All the others work on data 
+ * returned by them. 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * txid_current() returns int8 
+ * 
+ *  Return the current toplevel transaction ID as TXID 
+ *  If the current transaction does not have one, one is assigned. 
+ * 
+ *  This value has the epoch as the high 32 bits and the 32-bit xid 
+ *  as the low 32 bits. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN427"></a><span class='Declare_Function'>txid_current</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN429"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>val</span><span class='Delimiter'>; 
+</span><a name="LN430"></a>    <a href="txid.c.html#LN80"><span class='Ref_to_Typedef'>TxidEpoch</span></a>   <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Must prevent during recovery because if an xid is not assigned we try 
+     * to assign one, which would fail. Programs already rely on this function 
+     * to always return a valid current xid, so we should not change this to 
+     * return NULL or similar invalid xid. 
+     */ 
+</span>    <a href="../../tcop/utility.c.html#LN271"><span class='Ref_to_Func'>PreventCommandDuringRecovery</span></a><span class='Parentheses'>(</span><span class='String'>"txid_current()"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN90"><span class='Ref_to_Func'>load_xid_epoch</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN430"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN429"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN163"><span class='Ref_to_Func'>convert_xid</span></a><span class='Parentheses'>(</span><a href="../../../include/access/xact.h.html#LN331"><span class='Ref_to_Proto'>GetTopTransactionId</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN430"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN326"><span class='Ref_to_Macro'>PG_RETURN_INT64</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN429"><span class='Ref_To_Local'>val</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end txid_current &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Same as txid_current() but doesn't assign a new xid if there isn't one 
+ * yet. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN452"></a><span class='Declare_Function'>txid_current_if_assigned</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN454"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>val</span><span class='Delimiter'>; 
+</span><a name="LN455"></a>    <a href="txid.c.html#LN80"><span class='Ref_to_Typedef'>TxidEpoch</span></a>   <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN456"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>topxid</span> <span class='Operator'>= </span><a href="../../../include/access/xact.h.html#LN332"><span class='Ref_to_Proto'>GetTopTransactionIdIfAny</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN456"><span class='Ref_To_Local'>topxid</span></a> <span class='Operator'>== </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/fmgr.h.html#LN304"><span class='Ref_to_Macro'>PG_RETURN_NULL</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN90"><span class='Ref_to_Func'>load_xid_epoch</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN455"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN454"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN163"><span class='Ref_to_Func'>convert_xid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN456"><span class='Ref_To_Local'>topxid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN455"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN326"><span class='Ref_to_Macro'>PG_RETURN_INT64</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN454"><span class='Ref_To_Local'>val</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * txid_current_snapshot() returns txid_snapshot 
+ * 
+ *      Return current snapshot in TXID format 
+ * 
+ * Note that only top-transaction XIDs are included in the snapshot. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN476"></a><span class='Declare_Function'>txid_current_snapshot</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN478"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span><span class='Delimiter'>; 
+</span><a name="LN479"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>nxip</span><span class='Delimiter'>, 
+</span><a name="LN480"></a>                <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN481"></a>    <a href="txid.c.html#LN80"><span class='Ref_to_Typedef'>TxidEpoch</span></a>   <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN482"></a>    <a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a>    <span class='Declare_Local'>cur</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN482"><span class='Ref_To_Local'>cur</span></a> <span class='Operator'>= </span><a href="../../../include/utils/snapmgr.h.html#LN77"><span class='Ref_to_Proto'>GetActiveSnapshot</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN482"><span class='Ref_To_Local'>cur</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"no active snapshot set"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN90"><span class='Ref_to_Func'>load_xid_epoch</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN481"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Compile-time limits on the procarray (MAX_BACKENDS processes plus 
+     * MAX_BACKENDS prepared transactions) guarantee nxip won't be too large. 
+     */ 
+</span>    <a href="../../../include/c.h.html#LN751"><span class='Ref_to_Macro'>StaticAssertStmt</span></a><span class='Parentheses'>(</span><a href="../../../include/postmaster/postmaster.h.html#LN74"><span class='Ref_to_Const'>MAX_BACKENDS</span></a> <span class='Operator'>* </span><span class='Number'>2</span> <span class='Operator'>&LT;= </span><a href="txid.c.html#LN74"><span class='Ref_to_Const'>TXID_SNAPSHOT_MAX_NXIP</span></a><span class='Delimiter'>, 
+</span>                     <span class='String'>"possible overflow in txid_current_snapshot()"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* allocate */ 
+</span>    <a href="txid.c.html#LN479"><span class='Ref_To_Local'>nxip</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN482"><span class='Ref_To_Local'>cur</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/snapshot.h.html#LN77"><span class='Ref_to_Member'>xcnt</span></a><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN478"><span class='Ref_To_Local'>snap</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN72"><span class='Ref_to_Macro'>TXID_SNAPSHOT_SIZE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN479"><span class='Ref_To_Local'>nxip</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* fill */ 
+</span>    <a href="txid.c.html#LN478"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN66"><span class='Ref_to_Member'>xmin</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN163"><span class='Ref_to_Func'>convert_xid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN482"><span class='Ref_To_Local'>cur</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/snapshot.h.html#LN65"><span class='Ref_to_Member'>xmin</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN481"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN478"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN67"><span class='Ref_to_Member'>xmax</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN163"><span class='Ref_to_Func'>convert_xid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN482"><span class='Ref_To_Local'>cur</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/snapshot.h.html#LN66"><span class='Ref_to_Member'>xmax</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN481"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN478"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN479"><span class='Ref_To_Local'>nxip</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN480"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="txid.c.html#LN480"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN479"><span class='Ref_To_Local'>nxip</span></a><span class='Delimiter'>; </span><a href="txid.c.html#LN480"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <a href="txid.c.html#LN478"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN480"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="txid.c.html#LN163"><span class='Ref_to_Func'>convert_xid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN482"><span class='Ref_To_Local'>cur</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/snapshot.h.html#LN76"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN480"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], </span><span class='Operator'>&</span><a href="txid.c.html#LN481"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We want them guaranteed to be in ascending order.  This also removes 
+     * any duplicate xids.  Normally, an XID can only be assigned to one 
+     * backend, but when preparing a transaction for two-phase commit, there 
+     * is a transient state when both the original backend and the dummy 
+     * PGPROC entry reserved for the prepared transaction hold the same XID. 
+     */ 
+</span>    <a href="txid.c.html#LN207"><span class='Ref_to_Func'>sort_snapshot</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN478"><span class='Ref_To_Local'>snap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set size after sorting, because it may have removed duplicate xips */ 
+</span>    <a href="../../../include/postgres.h.html#LN327"><span class='Ref_to_Macro'>SET_VARSIZE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN478"><span class='Ref_To_Local'>snap</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN72"><span class='Ref_to_Macro'>TXID_SNAPSHOT_SIZE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN478"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN478"><span class='Ref_To_Local'>snap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end txid_current_snapshot &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * txid_snapshot_in(cstring) returns txid_snapshot 
+ * 
+ *      input function for type txid_snapshot 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN529"></a><span class='Declare_Function'>txid_snapshot_in</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN531"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>str</span> <span class='Operator'>= </span><a href="../../../include/fmgr.h.html#LN241"><span class='Ref_to_Macro'>PG_GETARG_CSTRING</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN532"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN532"><span class='Ref_To_Local'>snap</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN349"><span class='Ref_to_Func'>parse_snapshot</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN531"><span class='Ref_To_Local'>str</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN532"><span class='Ref_To_Local'>snap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * txid_snapshot_out(txid_snapshot) returns cstring 
+ * 
+ *      output function for type txid_snapshot 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN545"></a><span class='Declare_Function'>txid_snapshot_out</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN547"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN250"><span class='Ref_to_Macro'>PG_GETARG_VARLENA_P</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN548"></a>    <a href="../../../include/lib/stringinfo.h.html#LN34"><span class='Ref_to_Struct'>StringInfoData</span></a> <span class='Declare_Local'>str</span><span class='Delimiter'>; 
+</span><a name="LN549"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../lib/stringinfo.c.html#LN44"><span class='Ref_to_Func'>initStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN548"><span class='Ref_To_Local'>str</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../bin/pg_waldump/compat.c.html#LN69"><span class='Ref_to_Func'>appendStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN548"><span class='Ref_To_Local'>str</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN44"><span class='Ref_to_Const'>TXID_FMT</span></a> <span class='String'>":"</span><span class='Delimiter'>, </span><a href="txid.c.html#LN547"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN66"><span class='Ref_to_Member'>xmin</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../bin/pg_waldump/compat.c.html#LN69"><span class='Ref_to_Func'>appendStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN548"><span class='Ref_To_Local'>str</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN44"><span class='Ref_to_Const'>TXID_FMT</span></a> <span class='String'>":"</span><span class='Delimiter'>, </span><a href="txid.c.html#LN547"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN67"><span class='Ref_to_Member'>xmax</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN549"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="txid.c.html#LN549"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN547"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Delimiter'>; </span><a href="txid.c.html#LN549"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN549"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="../../replication/syncrep_scanner.l.html#LN76"><span class='Ref_to_Proto'>appendStringInfoChar</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN548"><span class='Ref_To_Local'>str</span></a><span class='Delimiter'>, </span><span class='String'>','</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../bin/pg_waldump/compat.c.html#LN69"><span class='Ref_to_Func'>appendStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN548"><span class='Ref_To_Local'>str</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN44"><span class='Ref_to_Const'>TXID_FMT</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN547"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN549"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN321"><span class='Ref_to_Macro'>PG_RETURN_CSTRING</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN548"><span class='Ref_To_Local'>str</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end txid_snapshot_out &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * txid_snapshot_recv(internal) returns txid_snapshot 
+ * 
+ *      binary input function for type txid_snapshot 
+ * 
+ *      format: int4 nxip, int8 xmin, int8 xmax, int8 xip 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN574"></a><span class='Declare_Function'>txid_snapshot_recv</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN576"></a>    <a href="../../../include/lib/stringinfo.h.html#LN42"><span class='Ref_to_Typedef'>StringInfo</span></a>  <span class='Declare_Local'>buf</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/lib/stringinfo.h.html#LN42"><span class='Ref_to_Typedef'>StringInfo</span></a><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN577"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span><span class='Delimiter'>; 
+</span><a name="LN578"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>last</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN579"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nxip</span><span class='Delimiter'>; 
+</span><a name="LN580"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN581"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>xmin</span><span class='Delimiter'>, 
+</span><a name="LN582"></a>                <span class='Declare_Local'>xmax</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* load and validate nxip */ 
+</span>    <a href="txid.c.html#LN579"><span class='Ref_To_Local'>nxip</span></a> <span class='Operator'>= </span><a href="../../../include/libpq/pqformat.h.html#LN38"><span class='Ref_to_Proto'>pq_getmsgint</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN576"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Number'>4</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN579"><span class='Ref_To_Local'>nxip</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="txid.c.html#LN579"><span class='Ref_To_Local'>nxip</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN74"><span class='Ref_to_Const'>TXID_SNAPSHOT_MAX_NXIP</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="txid.c.html#LN620"><span class='Ref_to_Label'>bad_format</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN581"><span class='Ref_To_Local'>xmin</span></a> <span class='Operator'>= </span><a href="../../../include/libpq/pqformat.h.html#LN39"><span class='Ref_to_Proto'>pq_getmsgint64</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN576"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN582"><span class='Ref_To_Local'>xmax</span></a> <span class='Operator'>= </span><a href="../../../include/libpq/pqformat.h.html#LN39"><span class='Ref_to_Proto'>pq_getmsgint64</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN576"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN581"><span class='Ref_To_Local'>xmin</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="txid.c.html#LN582"><span class='Ref_To_Local'>xmax</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="txid.c.html#LN581"><span class='Ref_To_Local'>xmin</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN582"><span class='Ref_To_Local'>xmax</span></a> <span class='Operator'>|| </span><a href="txid.c.html#LN582"><span class='Ref_To_Local'>xmax</span></a> <span class='Operator'>&GT; </span><a href="txid.c.html#LN38"><span class='Ref_to_Const'>MAX_TXID</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="txid.c.html#LN620"><span class='Ref_to_Label'>bad_format</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="txid.c.html#LN577"><span class='Ref_To_Local'>snap</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN72"><span class='Ref_to_Macro'>TXID_SNAPSHOT_SIZE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN579"><span class='Ref_To_Local'>nxip</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN577"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN66"><span class='Ref_to_Member'>xmin</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN581"><span class='Ref_To_Local'>xmin</span></a><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN577"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN67"><span class='Ref_to_Member'>xmax</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN582"><span class='Ref_To_Local'>xmax</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN580"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="txid.c.html#LN580"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN579"><span class='Ref_To_Local'>nxip</span></a><span class='Delimiter'>; </span><a href="txid.c.html#LN580"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN600"></a>        <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>cur</span> <span class='Operator'>= </span><a href="../../../include/libpq/pqformat.h.html#LN39"><span class='Ref_to_Proto'>pq_getmsgint64</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN576"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN600"><span class='Ref_To_Local'>cur</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN578"><span class='Ref_To_Local'>last</span></a> <span class='Operator'>|| </span><a href="txid.c.html#LN600"><span class='Ref_To_Local'>cur</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN581"><span class='Ref_To_Local'>xmin</span></a> <span class='Operator'>|| </span><a href="txid.c.html#LN600"><span class='Ref_To_Local'>cur</span></a> <span class='Operator'>&GT;= </span><a href="txid.c.html#LN582"><span class='Ref_To_Local'>xmax</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="txid.c.html#LN620"><span class='Ref_to_Label'>bad_format</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* skip duplicate xips */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN600"><span class='Ref_To_Local'>cur</span></a> <span class='Operator'>== </span><a href="txid.c.html#LN578"><span class='Ref_To_Local'>last</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="txid.c.html#LN580"><span class='Ref_To_Local'>i</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>            <a href="txid.c.html#LN579"><span class='Ref_To_Local'>nxip</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="txid.c.html#LN577"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN580"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="txid.c.html#LN600"><span class='Ref_To_Local'>cur</span></a><span class='Delimiter'>; 
+</span>        <a href="txid.c.html#LN578"><span class='Ref_To_Local'>last</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN600"><span class='Ref_To_Local'>cur</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="txid.c.html#LN577"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN579"><span class='Ref_To_Local'>nxip</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/postgres.h.html#LN327"><span class='Ref_to_Macro'>SET_VARSIZE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN577"><span class='Ref_To_Local'>snap</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN72"><span class='Ref_to_Macro'>TXID_SNAPSHOT_SIZE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN579"><span class='Ref_To_Local'>nxip</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN577"><span class='Ref_To_Local'>snap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN620"></a><span class='Label'>bad_format</span><span class='Operator'>: 
+</span>    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INVALID_BINARY_REPRESENTATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid external txid_snapshot data"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* keep compiler quiet */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end txid_snapshot_recv &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * txid_snapshot_send(txid_snapshot) returns bytea 
+ * 
+ *      binary output function for type txid_snapshot 
+ * 
+ *      format: int4 nxip, int8 xmin, int8 xmax, int8 xip 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN635"></a><span class='Declare_Function'>txid_snapshot_send</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN637"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN250"><span class='Ref_to_Macro'>PG_GETARG_VARLENA_P</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN638"></a>    <a href="../../../include/lib/stringinfo.h.html#LN34"><span class='Ref_to_Struct'>StringInfoData</span></a> <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span><a name="LN639"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/libpq/pqformat.h.html#LN31"><span class='Ref_to_Proto'>pq_begintypsend</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN638"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/libpq/pqformat.h.html#LN25"><span class='Ref_to_Proto'>pq_sendint</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN638"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN637"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Delimiter'>, </span><span class='Number'>4</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/libpq/pqformat.h.html#LN26"><span class='Ref_to_Proto'>pq_sendint64</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN638"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN637"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN66"><span class='Ref_to_Member'>xmin</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/libpq/pqformat.h.html#LN26"><span class='Ref_to_Proto'>pq_sendint64</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN638"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN637"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN67"><span class='Ref_to_Member'>xmax</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN639"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="txid.c.html#LN639"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN637"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Delimiter'>; </span><a href="txid.c.html#LN639"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/libpq/pqformat.h.html#LN26"><span class='Ref_to_Proto'>pq_sendint64</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN638"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN637"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN639"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/fmgr.h.html#LN328"><span class='Ref_to_Macro'>PG_RETURN_BYTEA_P</span></a><span class='Parentheses'>(</span><a href="../../../include/libpq/pqformat.h.html#LN32"><span class='Ref_to_Proto'>pq_endtypsend</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="txid.c.html#LN638"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * txid_visible_in_snapshot(int8, txid_snapshot) returns bool 
+ * 
+ *      is txid visible in snapshot ? 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN656"></a><span class='Declare_Function'>txid_visible_in_snapshot</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN658"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>value</span> <span class='Operator'>= </span><a href="../../../include/fmgr.h.html#LN246"><span class='Ref_to_Macro'>PG_GETARG_INT64</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN659"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN250"><span class='Ref_to_Macro'>PG_GETARG_VARLENA_P</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN236"><span class='Ref_to_Func'>is_visible_txid</span></a><span class='Parentheses'>(</span><span class='Keyword'>value</span><span class='Delimiter'>, </span><a href="txid.c.html#LN659"><span class='Ref_To_Local'>snap</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * txid_snapshot_xmin(txid_snapshot) returns int8 
+ * 
+ *      return snapshot's xmin 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN670"></a><span class='Declare_Function'>txid_snapshot_xmin</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN672"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN250"><span class='Ref_to_Macro'>PG_GETARG_VARLENA_P</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN326"><span class='Ref_to_Macro'>PG_RETURN_INT64</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN672"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN66"><span class='Ref_to_Member'>xmin</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * txid_snapshot_xmax(txid_snapshot) returns int8 
+ * 
+ *      return snapshot's xmax 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN683"></a><span class='Declare_Function'>txid_snapshot_xmax</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN685"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN250"><span class='Ref_to_Macro'>PG_GETARG_VARLENA_P</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN326"><span class='Ref_to_Macro'>PG_RETURN_INT64</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN685"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN67"><span class='Ref_to_Member'>xmax</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * txid_snapshot_xip(txid_snapshot) returns setof int8 
+ * 
+ *      return in-progress TXIDs in snapshot. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN696"></a><span class='Declare_Function'>txid_snapshot_xip</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN698"></a>    <a href="../../../include/funcapi.h.html#LN56"><span class='Ref_to_Struct'>FuncCallContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>fctx</span><span class='Delimiter'>; 
+</span><a name="LN699"></a>    <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>snap</span><span class='Delimiter'>; 
+</span><a name="LN700"></a>    <a href="txid.c.html#LN41"><span class='Ref_to_Typedef'>txid</span></a>        <span class='Declare_Local'>value</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* on first call initialize snap_state and get copy of snapshot */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/funcapi.h.html#LN284"><span class='Ref_to_Macro'>SRF_IS_FIRSTCALL</span></a><span class='Parentheses'>())</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN705"></a>        <a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>arg</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="txid.c.html#LN56"><span class='Ref_to_Typedef'>TxidSnapshot</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN250"><span class='Ref_to_Macro'>PG_GETARG_VARLENA_P</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="txid.c.html#LN698"><span class='Ref_To_Local'>fctx</span></a> <span class='Operator'>= </span><a href="../../../include/funcapi.h.html#LN286"><span class='Ref_to_Macro'>SRF_FIRSTCALL_INIT</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* make a copy of user snapshot */ 
+</span>        <a href="txid.c.html#LN699"><span class='Ref_To_Local'>snap</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN70"><span class='Ref_to_Proto'>MemoryContextAlloc</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN698"><span class='Ref_To_Local'>fctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/funcapi.h.html#LN108"><span class='Ref_to_Member'>multi_call_memory_ctx</span></a><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN303"><span class='Ref_to_Macro'>VARSIZE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN705"><span class='Ref_To_Local'>arg</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><a href="txid.c.html#LN699"><span class='Ref_To_Local'>snap</span></a><span class='Delimiter'>, </span><a href="txid.c.html#LN705"><span class='Ref_To_Local'>arg</span></a><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN303"><span class='Ref_to_Macro'>VARSIZE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN705"><span class='Ref_To_Local'>arg</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="txid.c.html#LN698"><span class='Ref_To_Local'>fctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/funcapi.h.html#LN89"><span class='Ref_to_Member'>user_fctx</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN699"><span class='Ref_To_Local'>snap</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* return values one-by-one */ 
+</span>    <a href="txid.c.html#LN698"><span class='Ref_To_Local'>fctx</span></a> <span class='Operator'>= </span><a href="../../../include/funcapi.h.html#LN288"><span class='Ref_to_Macro'>SRF_PERCALL_SETUP</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="txid.c.html#LN699"><span class='Ref_To_Local'>snap</span></a> <span class='Operator'>= </span><a href="txid.c.html#LN698"><span class='Ref_To_Local'>fctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/funcapi.h.html#LN89"><span class='Ref_to_Member'>user_fctx</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN698"><span class='Ref_To_Local'>fctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/funcapi.h.html#LN64"><span class='Ref_to_Member'>call_cntr</span></a> <span class='Operator'>&LT; </span><a href="txid.c.html#LN699"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN65"><span class='Ref_to_Member'>nxip</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Keyword'>value </span><span class='Operator'>= </span><a href="txid.c.html#LN699"><span class='Ref_To_Local'>snap</span></a><span class='Operator'>-&GT;</span><a href="txid.c.html#LN69"><span class='Ref_to_Member'>xip</span></a><span class='Delimiter'>[</span><a href="txid.c.html#LN698"><span class='Ref_To_Local'>fctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/funcapi.h.html#LN64"><span class='Ref_to_Member'>call_cntr</span></a><span class='Delimiter'>]; 
+</span>        <a href="../../../include/funcapi.h.html#LN290"><span class='Ref_to_Macro'>SRF_RETURN_NEXT</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN698"><span class='Ref_To_Local'>fctx</span></a><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN624"><span class='Ref_to_Macro'>Int64GetDatum</span></a><span class='Parentheses'>(</span><span class='Keyword'>value</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/funcapi.h.html#LN308"><span class='Ref_to_Macro'>SRF_RETURN_DONE</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN698"><span class='Ref_To_Local'>fctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end txid_snapshot_xip &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Report the status of a recent transaction ID, or null for wrapped, 
+ * truncated away or otherwise too old XIDs. 
+ * 
+ * The passed epoch-qualified xid is treated as a normal xid, not a 
+ * multixact id. 
+ * 
+ * If it points to a committed subxact the result is the subxact status even 
+ * though the parent xact may still be in progress or may have aborted. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN741"></a><span class='Declare_Function'>txid_status</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN743"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN744"></a>    <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>xid_with_epoch</span> <span class='Operator'>= </span><a href="../../../include/fmgr.h.html#LN246"><span class='Ref_to_Macro'>PG_GETARG_INT64</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN745"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We must protect against concurrent truncation of clog entries to avoid 
+     * an I/O error on SLRU lookup. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CLogTruncationLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN109"><span class='Ref_to_Func'>TransactionIdInRecentPast</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN744"><span class='Ref_To_Local'>xid_with_epoch</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="txid.c.html#LN745"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN745"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/xact.h.html#LN345"><span class='Ref_to_Proto'>TransactionIdIsCurrentTransactionId</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN745"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>))</span> 
+            <a href="txid.c.html#LN743"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN138"><span class='Ref_to_Macro'>gettext_noop</span></a><span class='Parentheses'>(</span><span class='String'>"in progress"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../access/transam/transam.c.html#LN123"><span class='Ref_to_Func'>TransactionIdDidCommit</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN745"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>))</span> 
+            <a href="txid.c.html#LN743"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN138"><span class='Ref_to_Macro'>gettext_noop</span></a><span class='Parentheses'>(</span><span class='String'>"committed"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN162"><span class='Ref_to_Proto'>TransactionIdDidAbort</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN745"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>))</span> 
+            <a href="txid.c.html#LN743"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN138"><span class='Ref_to_Macro'>gettext_noop</span></a><span class='Parentheses'>(</span><span class='String'>"aborted"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * The xact is not marked as either committed or aborted in clog. 
+             * 
+             * It could be a transaction that ended without updating clog or 
+             * writing an abort record due to a crash. We can safely assume 
+             * it's aborted if it isn't committed and is older than our 
+             * snapshot xmin. 
+             * 
+             * Otherwise it must be in-progress (or have been at the time we 
+             * checked commit/abort status). 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN745"><span class='Ref_To_Local'>xid</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/snapmgr.h.html#LN77"><span class='Ref_to_Proto'>GetActiveSnapshot</span></a><span class='Parentheses'>()</span><span class='Operator'>-&GT;</span><a href="../../../include/utils/snapshot.h.html#LN65"><span class='Ref_to_Member'>xmin</span></a><span class='Parentheses'>))</span> 
+                <a href="txid.c.html#LN743"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN138"><span class='Ref_to_Macro'>gettext_noop</span></a><span class='Parentheses'>(</span><span class='String'>"aborted"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="txid.c.html#LN743"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN138"><span class='Ref_to_Macro'>gettext_noop</span></a><span class='Parentheses'>(</span><span class='String'>"in progress"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if TransactionIdInRecent... &raquo; </span> 
+    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="txid.c.html#LN743"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CLogTruncationLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="txid.c.html#LN743"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/fmgr.h.html#LN304"><span class='Ref_to_Macro'>PG_RETURN_NULL</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="../../../include/fmgr.h.html#LN329"><span class='Ref_to_Macro'>PG_RETURN_TEXT_P</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/builtins.h.html#LN85"><span class='Ref_to_Proto'>cstring_to_text</span></a><span class='Parentheses'>(</span><a href="txid.c.html#LN743"><span class='Ref_To_Local'>status</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end txid_status &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

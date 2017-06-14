@@ -1,0 +1,532 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\storage\ipc\shmem.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\storage\ipc\shmem.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:49 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * shmem.c 
+ *    create shared memory and initialize shared memory data structures. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/storage/ipc/shmem.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+/* 
+ * POSTGRES processes share one or more regions of shared memory. 
+ * The shared memory is created by a postmaster and is inherited 
+ * by each backend via fork() (or, in some ports, via other OS-specific 
+ * methods).  The routines in this file are used for allocating and 
+ * binding to shared memory data structures. 
+ * 
+ * NOTES: 
+ *      (a) There are three kinds of shared memory data structures 
+ *  available to POSTGRES: fixed-size structures, queues and hash 
+ *  tables.  Fixed-size structures contain things like global variables 
+ *  for a module and should never be allocated after the shared memory 
+ *  initialization phase.  Hash tables have a fixed maximum size, but 
+ *  their actual size can vary dynamically.  When entries are added 
+ *  to the table, more space is allocated.  Queues link data structures 
+ *  that have been allocated either within fixed-size structures or as hash 
+ *  buckets.  Each shared data structure has a string name to identify 
+ *  it (assigned in the module that declares it). 
+ * 
+ *      (b) During initialization, each module looks for its 
+ *  shared data structures in a hash table called the "Shmem Index". 
+ *  If the data structure is not present, the caller can allocate 
+ *  a new one and initialize it.  If the data structure is present, 
+ *  the caller "attaches" to the structure by initializing a pointer 
+ *  in the local address space. 
+ *      The shmem index has two purposes: first, it gives us 
+ *  a simple model of how the world looks when a backend process 
+ *  initializes.  If something is present in the shmem index, 
+ *  it is initialized.  If it is not, it is uninitialized.  Second, 
+ *  the shmem index allows us to allocate shared memory on demand 
+ *  instead of trying to preallocate structures and hard-wire the 
+ *  sizes and locations in header files.  If you are using a lot 
+ *  of shared memory in a lot of different places (and changing 
+ *  things during development), this is important. 
+ * 
+ *      (c) In standard Unix-ish environments, individual backends do not 
+ *  need to re-establish their local pointers into shared memory, because 
+ *  they inherit correct values of those variables via fork() from the 
+ *  postmaster.  However, this does not work in the EXEC_BACKEND case. 
+ *  In ports using EXEC_BACKEND, new backends have to set up their local 
+ *  pointers using the method described in (b) above. 
+ * 
+ *      (d) memory allocation model: shared memory can never be 
+ *  freed, once allocated.   Each hash table has its own free list, 
+ *  so hash buckets can be reused when an item is deleted.  However, 
+ *  if one hash table grows very large and then shrinks, its space 
+ *  cannot be redistributed to other tables.  We could build a simple 
+ *  hash bucket garbage collector if need be.  Right now, it seems 
+ *  unnecessary. 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/transam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/pg_shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/spin.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* shared memory global variables */ 
+</span> 
+<a name="LN77"></a><span class='Keyword'>static </span><a href="../../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Var'>ShmemSegHdr</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* shared mem segment header */ 
+</span> 
+<a name="LN79"></a><span class='Keyword'>static void </span><span class='Operator'>*</span><span class='Declare_Var'>ShmemBase</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* start address of shared memory */ 
+</span> 
+<a name="LN81"></a><span class='Keyword'>static void </span><span class='Operator'>*</span><span class='Declare_Var'>ShmemEnd</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* end+1 address of shared memory */ 
+</span> 
+<a name="LN83"></a><a href="../../../include/storage/s_lock.h.html#LN137"><span class='Ref_to_Typedef'>slock_t</span></a>    <span class='Operator'>*</span><span class='Declare_Var'>ShmemLock</span><span class='Delimiter'>;</span>          <span class='Comment_Multi_Line'>/* spinlock for shared memory and LWLock 
+                                 * allocation */ 
+</span> 
+<a name="LN86"></a><span class='Keyword'>static </span><a href="../../utils/hash/dynahash.c.html#LN192"><span class='Ref_to_Struct'>HTAB</span></a> <span class='Operator'>*</span><span class='Declare_Var'>ShmemIndex</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* primary index hashtable for shmem */ 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ *  InitShmemAccess() --- set up basic pointers to shared memory. 
+ * 
+ * Note: the argument should be declared "PGShmemHeader *seghdr", 
+ * but we use void to avoid having to include ipc.h in shmem.h. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN96"></a><span class='Declare_Function'>InitShmemAccess</span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>seghdr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN98"></a>    <a href="../../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Local'>shmhdr</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="shmem.c.html#LN96"><span class='Ref_to_Parameter'>seghdr</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN98"><span class='Ref_To_Local'>shmhdr</span></a><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN79"><span class='Ref_to_Global_Var'>ShmemBase</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="shmem.c.html#LN98"><span class='Ref_To_Local'>shmhdr</span></a><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN81"><span class='Ref_to_Global_Var'>ShmemEnd</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="shmem.c.html#LN79"><span class='Ref_to_Global_Var'>ShmemBase</span></a> <span class='Operator'>+ </span><a href="shmem.c.html#LN98"><span class='Ref_To_Local'>shmhdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN33"><span class='Ref_to_Member'>totalsize</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ *  InitShmemAllocation() --- set up shared-memory space allocation. 
+ * 
+ * This should be called only in the postmaster or a standalone backend. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN111"></a><span class='Declare_Function'>InitShmemAllocation</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN113"></a>    <a href="../../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Local'>shmhdr</span> <span class='Operator'>= </span><a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a><span class='Delimiter'>; 
+</span><a name="LN114"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>aligned</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="shmem.c.html#LN113"><span class='Ref_To_Local'>shmhdr</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Initialize the spinlock used by ShmemAlloc.  We must use 
+     * ShmemAllocUnlocked, since obviously ShmemAlloc can't be called yet. 
+     */ 
+</span>    <a href="shmem.c.html#LN83"><span class='Ref_to_Global_Var'>ShmemLock</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/s_lock.h.html#LN137"><span class='Ref_to_Typedef'>slock_t</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/storage/shmem.h.html#LN38"><span class='Ref_to_Proto'>ShmemAllocUnlocked</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/s_lock.h.html#LN137"><span class='Ref_to_Typedef'>slock_t</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/spin.h.html#LN59"><span class='Ref_to_Macro'>SpinLockInit</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN83"><span class='Ref_to_Global_Var'>ShmemLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Allocations after this point should go through ShmemAlloc, which 
+     * expects to allocate everything on cache line boundaries.  Make sure the 
+     * first allocation begins on a cache line boundary. 
+     */ 
+</span>    <a href="shmem.c.html#LN114"><span class='Ref_To_Local'>aligned</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN590"><span class='Ref_to_Macro'>CACHELINEALIGN</span></a><span class='Parentheses'>((((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="shmem.c.html#LN113"><span class='Ref_To_Local'>shmhdr</span></a><span class='Parentheses'>)</span> <span class='Operator'>+ </span><a href="shmem.c.html#LN113"><span class='Ref_To_Local'>shmhdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN34"><span class='Ref_to_Member'>freeoffset</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN113"><span class='Ref_To_Local'>shmhdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN34"><span class='Ref_to_Member'>freeoffset</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN114"><span class='Ref_To_Local'>aligned</span></a> <span class='Operator'>- </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="shmem.c.html#LN113"><span class='Ref_To_Local'>shmhdr</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* ShmemIndex can't be set up yet (need LWLocks first) */ 
+</span>    <a href="shmem.c.html#LN113"><span class='Ref_To_Local'>shmhdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN36"><span class='Ref_to_Member'>index</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN86"><span class='Ref_to_Global_Var'>ShmemIndex</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../utils/hash/dynahash.c.html#LN192"><span class='Ref_to_Struct'>HTAB</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Initialize ShmemVariableCache for transaction manager. (This doesn't 
+     * really belong here, but not worth moving.) 
+     */ 
+</span>    <a href="../../access/transam/varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN144"><span class='Ref_to_Typedef'>VariableCache</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/shmem.h.html#LN36"><span class='Ref_to_Proto'>ShmemAlloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="../../access/transam/varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    memset<span class='Parentheses'>(</span><a href="../../access/transam/varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="../../access/transam/varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end InitShmemAllocation &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ShmemAlloc -- allocate max-aligned chunk from shared memory 
+ * 
+ * Throws error if request cannot be satisfied. 
+ * 
+ * Assumes ShmemLock and ShmemSegHdr are initialized. 
+ */ 
+</span><span class='Keyword'>void </span><span class='Operator'>* 
+</span><a name="LN156"></a><span class='Declare_Function'>ShmemAlloc</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN158"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>newSpace</span><span class='Delimiter'>; 
+</span> 
+    <a href="shmem.c.html#LN158"><span class='Ref_To_Local'>newSpace</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN37"><span class='Ref_to_Proto'>ShmemAllocNoError</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN156"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="shmem.c.html#LN158"><span class='Ref_To_Local'>newSpace</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OUT_OF_MEMORY<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"out of shared memory (%zu bytes requested)"</span><span class='Delimiter'>, 
+</span>                        <a href="shmem.c.html#LN156"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="shmem.c.html#LN158"><span class='Ref_To_Local'>newSpace</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * ShmemAllocNoError -- allocate max-aligned chunk from shared memory 
+ * 
+ * As ShmemAlloc, but returns NULL if out of space, rather than erroring. 
+ */ 
+</span><span class='Keyword'>void </span><span class='Operator'>* 
+</span><a name="LN175"></a><span class='Declare_Function'>ShmemAllocNoError</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN177"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>newStart</span><span class='Delimiter'>; 
+</span><a name="LN178"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>newFree</span><span class='Delimiter'>; 
+</span><a name="LN179"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>newSpace</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Ensure all space is adequately aligned.  We used to only MAXALIGN this 
+     * space but experience has proved that on modern systems that is not good 
+     * enough.  Many parts of the system are very sensitive to critical data 
+     * structures getting split across cache line boundaries.  To avoid that, 
+     * attempt to align the beginning of the allocation to a cache line 
+     * boundary.  The calling code will still need to be careful about how it 
+     * uses the allocated space - e.g. by padding each element in an array of 
+     * structures out to a power-of-two size - but without this, even that 
+     * won't be sufficient. 
+     */ 
+</span>    <a href="shmem.c.html#LN175"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN590"><span class='Ref_to_Macro'>CACHELINEALIGN</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN175"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN83"><span class='Ref_to_Global_Var'>ShmemLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="shmem.c.html#LN177"><span class='Ref_To_Local'>newStart</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN34"><span class='Ref_to_Member'>freeoffset</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="shmem.c.html#LN178"><span class='Ref_To_Local'>newFree</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN177"><span class='Ref_To_Local'>newStart</span></a> <span class='Operator'>+ </span><a href="shmem.c.html#LN175"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="shmem.c.html#LN178"><span class='Ref_To_Local'>newFree</span></a> <span class='Operator'>&LT;= </span><a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN33"><span class='Ref_to_Member'>totalsize</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="shmem.c.html#LN179"><span class='Ref_To_Local'>newSpace</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) ((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="shmem.c.html#LN79"><span class='Ref_to_Global_Var'>ShmemBase</span></a> <span class='Operator'>+ </span><a href="shmem.c.html#LN177"><span class='Ref_To_Local'>newStart</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN34"><span class='Ref_to_Member'>freeoffset</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN178"><span class='Ref_To_Local'>newFree</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <a href="shmem.c.html#LN179"><span class='Ref_To_Local'>newSpace</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN83"><span class='Ref_to_Global_Var'>ShmemLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* note this assert is okay with newSpace == NULL */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="shmem.c.html#LN179"><span class='Ref_To_Local'>newSpace</span></a> <span class='Operator'>== </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/c.h.html#LN590"><span class='Ref_to_Macro'>CACHELINEALIGN</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN179"><span class='Ref_To_Local'>newSpace</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="shmem.c.html#LN179"><span class='Ref_To_Local'>newSpace</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ShmemAllocNoError &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ShmemAllocUnlocked -- allocate max-aligned chunk from shared memory 
+ * 
+ * Allocate space without locking ShmemLock.  This should be used for, 
+ * and only for, allocations that must happen before ShmemLock is ready. 
+ * 
+ * We consider maxalign, rather than cachealign, sufficient here. 
+ */ 
+</span><span class='Keyword'>void </span><span class='Operator'>* 
+</span><a name="LN226"></a><span class='Declare_Function'>ShmemAllocUnlocked</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN228"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>newStart</span><span class='Delimiter'>; 
+</span><a name="LN229"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>newFree</span><span class='Delimiter'>; 
+</span><a name="LN230"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>newSpace</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Ensure allocated space is adequately aligned. 
+     */ 
+</span>    <a href="shmem.c.html#LN226"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN226"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="shmem.c.html#LN228"><span class='Ref_To_Local'>newStart</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN34"><span class='Ref_to_Member'>freeoffset</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="shmem.c.html#LN229"><span class='Ref_To_Local'>newFree</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN228"><span class='Ref_To_Local'>newStart</span></a> <span class='Operator'>+ </span><a href="shmem.c.html#LN226"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="shmem.c.html#LN229"><span class='Ref_To_Local'>newFree</span></a> <span class='Operator'>&GT; </span><a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN33"><span class='Ref_to_Member'>totalsize</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OUT_OF_MEMORY<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"out of shared memory (%zu bytes requested)"</span><span class='Delimiter'>, 
+</span>                        <a href="shmem.c.html#LN226"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN34"><span class='Ref_to_Member'>freeoffset</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN229"><span class='Ref_To_Local'>newFree</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="shmem.c.html#LN230"><span class='Ref_To_Local'>newSpace</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) ((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="shmem.c.html#LN79"><span class='Ref_to_Global_Var'>ShmemBase</span></a> <span class='Operator'>+ </span><a href="shmem.c.html#LN228"><span class='Ref_To_Local'>newStart</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="shmem.c.html#LN230"><span class='Ref_To_Local'>newSpace</span></a> <span class='Operator'>== </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN230"><span class='Ref_To_Local'>newSpace</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="shmem.c.html#LN230"><span class='Ref_To_Local'>newSpace</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ShmemAllocUnlocked &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ShmemAddrIsValid -- test if an address refers to shared memory 
+ * 
+ * Returns TRUE if the pointer points within the shared memory segment. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN262"></a><span class='Declare_Function'>ShmemAddrIsValid</span><span class='Parentheses'>(</span><span class='Keyword'>const void </span><span class='Operator'>*</span><span class='Declare_Parameter'>addr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="shmem.c.html#LN262"><span class='Ref_to_Parameter'>addr</span></a> <span class='Operator'>&GT;= </span><a href="shmem.c.html#LN79"><span class='Ref_to_Global_Var'>ShmemBase</span></a><span class='Parentheses'>) </span><span class='Operator'>&& </span><span class='Parentheses'>(</span><a href="shmem.c.html#LN262"><span class='Ref_to_Parameter'>addr</span></a> <span class='Operator'>&LT; </span><a href="shmem.c.html#LN81"><span class='Ref_to_Global_Var'>ShmemEnd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ *  InitShmemIndex() --- set up or attach to shmem index table. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN271"></a><span class='Declare_Function'>InitShmemIndex</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN273"></a>    <a href="../../../include/utils/hsearch.h.html#LN64"><span class='Ref_to_Struct'>HASHCTL</span></a>     <span class='Declare_Local'>info</span><span class='Delimiter'>; 
+</span><a name="LN274"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>hash_flags</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create the shared memory shmem index. 
+     * 
+     * Since ShmemInitHash calls ShmemInitStruct, which expects the ShmemIndex 
+     * hashtable to exist already, we have a bit of a circularity problem in 
+     * initializing the ShmemIndex itself.  The special "ShmemIndex" hash 
+     * table name will tell ShmemInitStruct to fake it. 
+     */ 
+</span>    <a href="shmem.c.html#LN273"><span class='Ref_To_Local'>info</span></a><span class='Operator'>.</span><a href="../../../include/utils/hsearch.h.html#LN71"><span class='Ref_to_Member'>keysize</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN52"><span class='Ref_to_Const'>SHMEM_INDEX_KEYSIZE</span></a><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN273"><span class='Ref_To_Local'>info</span></a><span class='Operator'>.</span><a href="../../../include/utils/hsearch.h.html#LN72"><span class='Ref_to_Member'>entrysize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/shmem.h.html#LN57"><span class='Ref_to_Typedef'>ShmemIndexEnt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN274"><span class='Ref_To_Local'>hash_flags</span></a> <span class='Operator'>= </span><a href="../../../include/utils/hsearch.h.html#LN86"><span class='Ref_to_Const'>HASH_ELEM</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="shmem.c.html#LN86"><span class='Ref_to_Global_Var'>ShmemIndex</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN41"><span class='Ref_to_Proto'>ShmemInitHash</span></a><span class='Parentheses'>(</span><span class='String'>"ShmemIndex"</span><span class='Delimiter'>, 
+</span>                               <a href="../../../include/storage/shmem.h.html#LN54"><span class='Ref_to_Const'>SHMEM_INDEX_SIZE</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/shmem.h.html#LN54"><span class='Ref_to_Const'>SHMEM_INDEX_SIZE</span></a><span class='Delimiter'>, 
+</span>                               <span class='Operator'>&</span><a href="shmem.c.html#LN273"><span class='Ref_To_Local'>info</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN274"><span class='Ref_To_Local'>hash_flags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end InitShmemIndex &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ShmemInitHash -- Create and initialize, or attach to, a 
+ *      shared memory hash table. 
+ * 
+ * We assume caller is doing some kind of synchronization 
+ * so that two processes don't try to create/initialize the same 
+ * table at once.  (In practice, all creations are done in the postmaster 
+ * process; child processes should always be attaching to existing tables.) 
+ * 
+ * max_size is the estimated maximum number of hashtable entries.  This is 
+ * not a hard limit, but the access efficiency will degrade if it is 
+ * exceeded substantially (since it's used to compute directory size and 
+ * the hash table buckets will get overfull). 
+ * 
+ * init_size is the number of hashtable entries to preallocate.  For a table 
+ * whose maximum size is certain, this should be equal to max_size; that 
+ * ensures that no run-time out-of-shared-memory failures can occur. 
+ * 
+ * Note: before Postgres 9.0, this function returned NULL for some failure 
+ * cases.  Now, it always throws error instead, so callers need not check 
+ * for NULL. 
+ */ 
+</span><a href="../../utils/hash/dynahash.c.html#LN192"><span class='Ref_to_Struct'>HTAB</span></a> <span class='Operator'>* 
+</span><a name="LN316"></a><span class='Declare_Function'>ShmemInitHash</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>name</span><span class='Delimiter'>, </span><span class='Comment_Single_Line'>/* table string name for shmem index */ 
+</span><a name="LN317"></a>              <span class='Keyword'>long </span><span class='Declare_Parameter'>init_size</span><span class='Delimiter'>,</span>   <span class='Comment_Single_Line'>/* initial table size */ 
+</span><a name="LN318"></a>              <span class='Keyword'>long </span><span class='Declare_Parameter'>max_size</span><span class='Delimiter'>,</span>    <span class='Comment_Single_Line'>/* max size of the table */ 
+</span><a name="LN319"></a>              <a href="../../../include/utils/hsearch.h.html#LN64"><span class='Ref_to_Struct'>HASHCTL</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>infoP</span><span class='Delimiter'>,</span>   <span class='Comment_Single_Line'>/* info about key and bucket size */ 
+</span><a name="LN320"></a>              <span class='Keyword'>int </span><span class='Declare_Parameter'>hash_flags</span><span class='Parentheses'>)</span>   <span class='Comment_Single_Line'>/* info about infoP */ 
+</span><span class='Delimiter'>{ 
+</span><a name="LN322"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span><a name="LN323"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>location</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Hash tables allocated in shared memory have a fixed directory; it can't 
+     * grow or other backends wouldn't be able to find it. So, make sure we 
+     * make it big enough to start with. 
+     * 
+     * The shared memory allocator must be specified too. 
+     */ 
+</span>    <a href="shmem.c.html#LN319"><span class='Ref_to_Parameter'>infoP</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/hsearch.h.html#LN68"><span class='Ref_to_Member'>dsize</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN319"><span class='Ref_to_Parameter'>infoP</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/hsearch.h.html#LN69"><span class='Ref_to_Member'>max_dsize</span></a> <span class='Operator'>= </span><a href="../../../include/utils/hsearch.h.html#LN139"><span class='Ref_to_Proto'>hash_select_dirsize</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN318"><span class='Ref_to_Parameter'>max_size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN319"><span class='Ref_to_Parameter'>infoP</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/hsearch.h.html#LN76"><span class='Ref_to_Member'>alloc</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN37"><span class='Ref_to_Proto'>ShmemAllocNoError</span></a><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN320"><span class='Ref_to_Parameter'>hash_flags</span></a> <span class='Operator'>|= </span><a href="../../../include/utils/hsearch.h.html#LN93"><span class='Ref_to_Const'>HASH_SHARED_MEM</span></a> <span class='Operator'>| </span><a href="../../../include/utils/hsearch.h.html#LN91"><span class='Ref_to_Const'>HASH_ALLOC</span></a> <span class='Operator'>| </span><a href="../../../include/utils/hsearch.h.html#LN84"><span class='Ref_to_Const'>HASH_DIRSIZE</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* look it up in the shmem index */ 
+</span>    <a href="shmem.c.html#LN323"><span class='Ref_To_Local'>location</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN43"><span class='Ref_to_Proto'>ShmemInitStruct</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN316"><span class='Ref_to_Parameter'>name</span></a><span class='Delimiter'>, 
+</span>                               <a href="../../../include/utils/hsearch.h.html#LN140"><span class='Ref_to_Proto'>hash_get_shared_size</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN319"><span class='Ref_to_Parameter'>infoP</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN320"><span class='Ref_to_Parameter'>hash_flags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                               <span class='Operator'>&</span><a href="shmem.c.html#LN322"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * if it already exists, attach to it rather than allocate and initialize 
+     * new space 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="shmem.c.html#LN322"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>        <a href="shmem.c.html#LN320"><span class='Ref_to_Parameter'>hash_flags</span></a> <span class='Operator'>|= </span><a href="../../../include/utils/hsearch.h.html#LN94"><span class='Ref_to_Const'>HASH_ATTACH</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Pass location of hashtable header to hash_create */ 
+</span>    <a href="shmem.c.html#LN319"><span class='Ref_to_Parameter'>infoP</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/hsearch.h.html#LN78"><span class='Ref_to_Member'>hctl</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../utils/hash/dynahash.c.html#LN142"><span class='Ref_to_Struct'>HASHHDR</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="shmem.c.html#LN323"><span class='Ref_To_Local'>location</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../../include/utils/hsearch.h.html#LN121"><span class='Ref_to_Proto'>hash_create</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN316"><span class='Ref_to_Parameter'>name</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN317"><span class='Ref_to_Parameter'>init_size</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN319"><span class='Ref_to_Parameter'>infoP</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN320"><span class='Ref_to_Parameter'>hash_flags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ShmemInitHash &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ShmemInitStruct -- Create/attach to a structure in shared memory. 
+ * 
+ *      This is called during initialization to find or allocate 
+ *      a data structure in shared memory.  If no other process 
+ *      has created the structure, this routine allocates space 
+ *      for it.  If it exists already, a pointer to the existing 
+ *      structure is returned. 
+ * 
+ *  Returns: pointer to the object.  *foundPtr is set TRUE if the object was 
+ *      already in the shmem index (hence, already initialized). 
+ * 
+ *  Note: before Postgres 9.0, this function returned NULL for some failure 
+ *  cases.  Now, it always throws error instead, so callers need not check 
+ *  for NULL. 
+ */ 
+</span><span class='Keyword'>void </span><span class='Operator'>* 
+</span><a name="LN371"></a><span class='Declare_Function'>ShmemInitStruct</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>name</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>foundPtr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN373"></a>    <a href="../../../include/storage/shmem.h.html#LN57"><span class='Ref_to_Typedef'>ShmemIndexEnt</span></a> <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span><a name="LN374"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>structPtr</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>ShmemIndexLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="shmem.c.html#LN86"><span class='Ref_to_Global_Var'>ShmemIndex</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN380"></a>        <a href="../../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Local'>shmemseghdr</span> <span class='Operator'>= </span><a href="shmem.c.html#LN77"><span class='Ref_to_Global_Var'>ShmemSegHdr</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must be trying to create/attach to ShmemIndex itself */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>name</span></a><span class='Delimiter'>, </span><span class='String'>"ShmemIndex"</span><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Must be initializing a (non-standalone) backend */ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="shmem.c.html#LN380"><span class='Ref_To_Local'>shmemseghdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN36"><span class='Ref_to_Member'>index</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN380"><span class='Ref_To_Local'>shmemseghdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN36"><span class='Ref_to_Member'>index</span></a><span class='Delimiter'>; 
+</span>            <span class='Operator'>*</span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>foundPtr</span></a> <span class='Operator'>= </span><span class='Boolean'>TRUE</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * If the shmem index doesn't exist, we are bootstrapping: we must 
+             * be trying to init the shmem index itself. 
+             * 
+             * Notice that the ShmemIndexLock is released before the shmem 
+             * index has been initialized.  This should be OK because no other 
+             * process can be accessing shared memory yet. 
+             */ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="shmem.c.html#LN380"><span class='Ref_To_Local'>shmemseghdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN36"><span class='Ref_to_Member'>index</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN36"><span class='Ref_to_Proto'>ShmemAlloc</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="shmem.c.html#LN380"><span class='Ref_To_Local'>shmemseghdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN36"><span class='Ref_to_Member'>index</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a><span class='Delimiter'>; 
+</span>            <span class='Operator'>*</span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>foundPtr</span></a> <span class='Operator'>= </span><span class='Boolean'>FALSE</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>ShmemIndexLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !ShmemIndex &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* look it up in the shmem index */ 
+</span>    <a href="shmem.c.html#LN373"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/shmem.h.html#LN57"><span class='Ref_to_Typedef'>ShmemIndexEnt</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/hsearch.h.html#LN125"><span class='Ref_to_Proto'>hash_search</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN86"><span class='Ref_to_Global_Var'>ShmemIndex</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>name</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/hsearch.h.html#LN107"><span class='Ref_to_EnumConst'>HASH_ENTER_NULL</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>foundPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="shmem.c.html#LN373"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>ShmemIndexLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OUT_OF_MEMORY<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>        <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not create ShmemIndex entry for data structure \"%s\""</span><span class='Delimiter'>, 
+</span>               <a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>foundPtr</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Structure is in the shmem index so someone else has allocated it 
+         * already.  The size better be the same as the size we are trying to 
+         * initialize to, or there is a name conflict (or worse). 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="shmem.c.html#LN373"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/shmem.h.html#LN61"><span class='Ref_to_Member'>size</span></a> <span class='Operator'>!= </span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>ShmemIndexLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                  <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"ShmemIndex entry size is wrong for data structure"</span> 
+                          <span class='String'>" \"%s\": expected %zu, actual %zu"</span><span class='Delimiter'>, 
+</span>                          <a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>name</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN373"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/shmem.h.html#LN61"><span class='Ref_to_Member'>size</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN373"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/shmem.h.html#LN60"><span class='Ref_to_Member'>location</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* It isn't in the table yet. allocate and initialize it */ 
+</span>        <a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN37"><span class='Ref_to_Proto'>ShmemAllocNoError</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* out of memory; remove the failed ShmemIndex entry */ 
+</span>            <a href="../../../include/utils/hsearch.h.html#LN125"><span class='Ref_to_Proto'>hash_search</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN86"><span class='Ref_to_Global_Var'>ShmemIndex</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>name</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/hsearch.h.html#LN106"><span class='Ref_to_EnumConst'>HASH_REMOVE</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>ShmemIndexLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OUT_OF_MEMORY<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"not enough shared memory for data structure"</span> 
+                            <span class='String'>" \"%s\" (%zu bytes requested)"</span><span class='Delimiter'>, 
+</span>                            <a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>name</span></a><span class='Delimiter'>, </span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="shmem.c.html#LN373"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/shmem.h.html#LN61"><span class='Ref_to_Member'>size</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN371"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span>        <a href="shmem.c.html#LN373"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/shmem.h.html#LN60"><span class='Ref_to_Member'>location</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>ShmemIndexLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/shmem.h.html#LN39"><span class='Ref_to_Proto'>ShmemAddrIsValid</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a> <span class='Operator'>== </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/c.h.html#LN590"><span class='Ref_to_Macro'>CACHELINEALIGN</span></a><span class='Parentheses'>(</span><a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="shmem.c.html#LN374"><span class='Ref_To_Local'>structPtr</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ShmemInitStruct &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Add two Size values, checking for overflow 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN474"></a><span class='Declare_Function'>add_size</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>s1</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>s2</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN476"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <a href="shmem.c.html#LN476"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN474"><span class='Ref_to_Parameter'>s1</span></a> <span class='Operator'>+ </span><a href="shmem.c.html#LN474"><span class='Ref_to_Parameter'>s2</span></a><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* We are assuming Size is an unsigned type here... */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="shmem.c.html#LN476"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>&LT; </span><a href="shmem.c.html#LN474"><span class='Ref_to_Parameter'>s1</span></a> <span class='Operator'>|| </span><a href="shmem.c.html#LN476"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>&LT; </span><a href="shmem.c.html#LN474"><span class='Ref_to_Parameter'>s2</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROGRAM_LIMIT_EXCEEDED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"requested shared memory size overflows size_t"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="shmem.c.html#LN476"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Multiply two Size values, checking for overflow 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN491"></a><span class='Declare_Function'>mul_size</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>s1</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>s2</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN493"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="shmem.c.html#LN491"><span class='Ref_to_Parameter'>s1</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="shmem.c.html#LN491"><span class='Ref_to_Parameter'>s2</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="shmem.c.html#LN493"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="shmem.c.html#LN491"><span class='Ref_to_Parameter'>s1</span></a> <span class='Operator'>* </span><a href="shmem.c.html#LN491"><span class='Ref_to_Parameter'>s2</span></a><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* We are assuming Size is an unsigned type here... */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="shmem.c.html#LN493"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>/ </span><a href="shmem.c.html#LN491"><span class='Ref_to_Parameter'>s2</span></a> <span class='Operator'>!= </span><a href="shmem.c.html#LN491"><span class='Ref_to_Parameter'>s1</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROGRAM_LIMIT_EXCEEDED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"requested shared memory size overflows size_t"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="shmem.c.html#LN493"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

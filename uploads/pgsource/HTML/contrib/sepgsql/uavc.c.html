@@ -1,0 +1,556 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>contrib\sepgsql\uavc.c</title>
+<LINK REL=StyleSheet HREF="../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>contrib\sepgsql\uavc.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:27 2017
+</td></tr>
+<tr><td><a href='../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/* ------------------------------------------------------------------------- 
+ * 
+ * contrib/sepgsql/uavc.c 
+ * 
+ * Implementation of userspace access vector cache; that enables to cache 
+ * access control decisions recently used, and reduce number of kernel 
+ * invocations to avoid unnecessary performance hit. 
+ * 
+ * Copyright (c) 2011-2017, PostgreSQL Global Development Group 
+ * 
+ * ------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/hash.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"commands/seclabel.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/guc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"sepgsql.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * avc_cache 
+ * 
+ * It enables to cache access control decision (and behavior on execution of 
+ * trusted procedure, db_procedure class only) for a particular pair of 
+ * security labels and object class in userspace. 
+ */ 
+</span><span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN32"></a>    <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>hash</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* hash value of this cache entry */ 
+</span><a name="LN33"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>scontext</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* security context of the subject */ 
+</span><a name="LN34"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>tcontext</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* security context of the target */ 
+</span><a name="LN35"></a>    <a href="../../src/include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Member'>tclass</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* object class of the target */ 
+</span> 
+<a name="LN37"></a>    <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>allowed</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* permissions to be allowed */ 
+</span><a name="LN38"></a>    <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>auditallow</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* permissions to be audited on allowed */ 
+</span><a name="LN39"></a>    <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>auditdeny</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* permissions to be audited on denied */ 
+</span> 
+<a name="LN41"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>permissive</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* true, if permissive rule */ 
+</span><a name="LN42"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>hot_cache</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* true, if recently referenced */ 
+</span><a name="LN43"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>tcontext_is_valid</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* true, if tcontext is valid */ 
+</span><a name="LN45"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>ncontext</span><span class='Delimiter'>;</span>       <span class='Comment_Multi_Line'>/* temporary scontext on execution of trusted 
+                                 * procedure, or NULL elsewhere */ 
+</span><a name="LN47"></a><span class='Delimiter'>}</span>   <span class='Declare_Typedef'>avc_cache</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Declaration of static variables 
+ */ 
+</span><a name="LN52"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>AVC_NUM_SLOTS</span>       <span class='Number'>512</span> 
+<a name="LN53"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>AVC_NUM_RECLAIM</span>     <span class='Number'>16</span> 
+<a name="LN54"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>AVC_DEF_THRESHOLD</span>   <span class='Number'>384</span> 
+ 
+<a name="LN56"></a><span class='Keyword'>static </span><a href="../../src/include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Var'>avc_mem_cxt</span><span class='Delimiter'>; 
+</span><a name="LN57"></a><span class='Keyword'>static </span><a href="../../src/include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Var'>avc_slots</span><span class='Delimiter'>[</span><a href="uavc.c.html#LN52"><span class='Ref_to_Const'>AVC_NUM_SLOTS</span></a><span class='Delimiter'>];</span>  <span class='Comment_Single_Line'>/* avc's hash buckets */ 
+</span><a name="LN58"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>avc_num_caches</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* number of caches currently used */ 
+</span><a name="LN59"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>avc_lru_hint</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* index of the buckets to be reclaimed next */ 
+</span><a name="LN60"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>avc_threshold</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* threshold to launch cache-reclaiming  */ 
+</span><a name="LN61"></a><span class='Keyword'>static char </span><span class='Operator'>*</span><span class='Declare_Var'>avc_unlabeled</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* system 'unlabeled' label */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Hash function 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> 
+<a name="LN67"></a><span class='Declare_Function'>sepgsql_avc_hash</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>scontext</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>tcontext</span><span class='Delimiter'>, </span><a href="../../src/include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>tclass</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="../../src/backend/access/hash/hashfunc.c.html#LN305"><span class='Ref_to_Func'>hash_any</span></a><span class='Parentheses'>((</span><span class='Keyword'>const unsigned char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="uavc.c.html#LN67"><span class='Ref_to_Parameter'>scontext</span></a><span class='Delimiter'>, </span>strlen<span class='Parentheses'>(</span><a href="uavc.c.html#LN67"><span class='Ref_to_Parameter'>scontext</span></a><span class='Parentheses'>))</span> 
+        <span class='Operator'>^ </span><a href="../../src/backend/access/hash/hashfunc.c.html#LN305"><span class='Ref_to_Func'>hash_any</span></a><span class='Parentheses'>((</span><span class='Keyword'>const unsigned char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="uavc.c.html#LN67"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Delimiter'>, </span>strlen<span class='Parentheses'>(</span><a href="uavc.c.html#LN67"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Parentheses'>))</span> 
+        <span class='Operator'>^ </span><a href="uavc.c.html#LN67"><span class='Ref_to_Parameter'>tclass</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Reset all the avc caches 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN78"></a><span class='Declare_Function'>sepgsql_avc_reset</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../src/include/utils/memutils.h.html#LN73"><span class='Ref_to_Proto'>MemoryContextReset</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN56"><span class='Ref_to_Global_Var'>avc_mem_cxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    memset<span class='Parentheses'>(</span><a href="uavc.c.html#LN57"><span class='Ref_to_Global_Var'>avc_slots</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../src/include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="uavc.c.html#LN52"><span class='Ref_to_Const'>AVC_NUM_SLOTS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN58"><span class='Ref_to_Global_Var'>avc_num_caches</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN59"><span class='Ref_to_Global_Var'>avc_lru_hint</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN61"><span class='Ref_to_Global_Var'>avc_unlabeled</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Reclaim caches recently unreferenced 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN92"></a><span class='Declare_Function'>sepgsql_avc_reclaim</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN94"></a>    <a href="../../src/include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>cell</span><span class='Delimiter'>; 
+</span><a name="LN95"></a>    <a href="../../src/include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>next</span><span class='Delimiter'>; 
+</span><a name="LN96"></a>    <a href="../../src/include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>prev</span><span class='Delimiter'>; 
+</span><a name="LN97"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>index</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN58"><span class='Ref_to_Global_Var'>avc_num_caches</span></a> <span class='Operator'>&GT;= </span><a href="uavc.c.html#LN60"><span class='Ref_to_Global_Var'>avc_threshold</span></a> <span class='Operator'>- </span><a href="uavc.c.html#LN53"><span class='Ref_to_Const'>AVC_NUM_RECLAIM</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="uavc.c.html#LN97"><span class='Ref_To_Local'>index</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN59"><span class='Ref_to_Global_Var'>avc_lru_hint</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="uavc.c.html#LN96"><span class='Ref_To_Local'>prev</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN94"><span class='Ref_To_Local'>cell</span></a> <span class='Operator'>= </span><a href="../../src/include/nodes/pg_list.h.html#LN75"><span class='Ref_to_Func'>list_head</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN57"><span class='Ref_to_Global_Var'>avc_slots</span></a><span class='Delimiter'>[</span><a href="uavc.c.html#LN97"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; </span><a href="uavc.c.html#LN94"><span class='Ref_To_Local'>cell</span></a><span class='Delimiter'>; </span><a href="uavc.c.html#LN94"><span class='Ref_To_Local'>cell</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN95"><span class='Ref_To_Local'>next</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN106"></a>            <a href="uavc.c.html#LN30"><span class='Ref_to_Typedef'>avc_cache</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>cache</span> <span class='Operator'>= </span><a href="../../src/include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN94"><span class='Ref_To_Local'>cell</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="uavc.c.html#LN95"><span class='Ref_To_Local'>next</span></a> <span class='Operator'>= </span><a href="../../src/include/nodes/pg_list.h.html#LN104"><span class='Ref_to_Macro'>lnext</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN94"><span class='Ref_To_Local'>cell</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="uavc.c.html#LN106"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN42"><span class='Ref_to_Member'>hot_cache</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="uavc.c.html#LN57"><span class='Ref_to_Global_Var'>avc_slots</span></a><span class='Delimiter'>[</span><a href="uavc.c.html#LN97"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>] 
+</span>                    <span class='Operator'>= </span><a href="../../src/include/nodes/pg_list.h.html#LN238"><span class='Ref_to_Proto'>list_delete_cell</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN57"><span class='Ref_to_Global_Var'>avc_slots</span></a><span class='Delimiter'>[</span><a href="uavc.c.html#LN97"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>], </span><a href="uavc.c.html#LN94"><span class='Ref_To_Local'>cell</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN96"><span class='Ref_To_Local'>prev</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="../../src/include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN106"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN33"><span class='Ref_to_Member'>scontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../src/include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN106"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN34"><span class='Ref_to_Member'>tcontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN106"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN45"><span class='Ref_to_Member'>ncontext</span></a><span class='Parentheses'>) 
+</span>                    <a href="../../src/include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN106"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN45"><span class='Ref_to_Member'>ncontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../src/include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN106"><span class='Ref_To_Local'>cache</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="uavc.c.html#LN58"><span class='Ref_to_Global_Var'>avc_num_caches</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="uavc.c.html#LN106"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN42"><span class='Ref_to_Member'>hot_cache</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                <a href="uavc.c.html#LN96"><span class='Ref_To_Local'>prev</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN94"><span class='Ref_To_Local'>cell</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for cell=list_head(avc_sl... &raquo; </span> 
+        <a href="uavc.c.html#LN59"><span class='Ref_to_Global_Var'>avc_lru_hint</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="uavc.c.html#LN59"><span class='Ref_to_Global_Var'>avc_lru_hint</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>% </span><a href="uavc.c.html#LN52"><span class='Ref_to_Const'>AVC_NUM_SLOTS</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while avc_num_caches&GT;=avc_t... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end sepgsql_avc_reclaim &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ------------------------------------------------------------------------- 
+ * 
+ * sepgsql_avc_check_valid 
+ * 
+ * This function checks whether the cached entries are still valid.  If 
+ * the security policy has been reloaded (or any other events that requires 
+ * resetting userspace caches has occurred) since the last reference to 
+ * the access vector cache, we must flush the cache. 
+ * 
+ * Access control decisions must be atomic, but multiple system calls may 
+ * be required to make a decision; thus, when referencing the access vector 
+ * cache, we must loop until we complete without an intervening cache flush 
+ * event.  In practice, looping even once should be very rare.  Callers should 
+ * do something like this: 
+ * 
+ *   sepgsql_avc_check_valid(); 
+ *   do { 
+ *           : 
+ *       &LT;reference to uavc&GT; 
+ *           : 
+ *   } while (!sepgsql_avc_check_valid()) 
+ * 
+ * ------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN157"></a><span class='Declare_Function'>sepgsql_avc_check_valid</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>selinux_status_updated<span class='Parentheses'>() </span><span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="uavc.c.html#LN77"><span class='Ref_to_Func'>sepgsql_avc_reset</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * sepgsql_avc_unlabeled 
+ * 
+ * Returns an alternative label to be applied when no label or an invalid 
+ * label would otherwise be assigned. 
+ */ 
+</span><span class='Keyword'>static char </span><span class='Operator'>* 
+</span><a name="LN175"></a><span class='Declare_Function'>sepgsql_avc_unlabeled</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="uavc.c.html#LN61"><span class='Ref_to_Global_Var'>avc_unlabeled</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN179"></a>        security_context_t <span class='Declare_Local'>unlabeled</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span>security_get_initial_context_raw<span class='Parentheses'>(</span><span class='String'>"unlabeled"</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="uavc.c.html#LN179"><span class='Ref_To_Local'>unlabeled</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INTERNAL_ERROR<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>               <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"SELinux: failed to get initial security label: %m"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <a href="../../src/include/utils/elog.h.html#LN283"><span class='Ref_to_Macro'>PG_TRY</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="uavc.c.html#LN61"><span class='Ref_to_Global_Var'>avc_unlabeled</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/palloc.h.html#LN125"><span class='Ref_to_Proto'>MemoryContextStrdup</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN56"><span class='Ref_to_Global_Var'>avc_mem_cxt</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN179"><span class='Ref_To_Local'>unlabeled</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="../../src/include/utils/elog.h.html#LN292"><span class='Ref_to_Macro'>PG_CATCH</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>{ 
+</span>            freecon<span class='Parentheses'>(</span><a href="uavc.c.html#LN179"><span class='Ref_To_Local'>unlabeled</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../src/include/utils/elog.h.html#LN310"><span class='Ref_to_Macro'>PG_RE_THROW</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="../../src/include/utils/elog.h.html#LN299"><span class='Ref_to_Macro'>PG_END_TRY</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        freecon<span class='Parentheses'>(</span><a href="uavc.c.html#LN179"><span class='Ref_To_Local'>unlabeled</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !avc_unlabeled &raquo; </span> 
+    <span class='Control'>return</span> <a href="uavc.c.html#LN61"><span class='Ref_to_Global_Var'>avc_unlabeled</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end sepgsql_avc_unlabeled &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * sepgsql_avc_compute 
+ * 
+ * A fallback path, when cache mishit. It asks SELinux its access control 
+ * decision for the supplied pair of security context and object class. 
+ */ 
+</span><span class='Keyword'>static </span><a href="uavc.c.html#LN30"><span class='Ref_to_Typedef'>avc_cache</span></a> <span class='Operator'>* 
+</span><a name="LN208"></a><span class='Declare_Function'>sepgsql_avc_compute</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>scontext</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>tcontext</span><span class='Delimiter'>, </span><a href="../../src/include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>tclass</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN210"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>ucontext</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN211"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>ncontext</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN212"></a>    <a href="../../src/include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldctx</span><span class='Delimiter'>; 
+</span><a name="LN213"></a>    <a href="uavc.c.html#LN30"><span class='Ref_to_Typedef'>avc_cache</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>cache</span><span class='Delimiter'>; 
+</span><a name="LN214"></a>    <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>hash</span><span class='Delimiter'>; 
+</span><a name="LN215"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>index</span><span class='Delimiter'>; 
+</span><a name="LN216"></a>    <span class='Control'>struct</span> av_decision <span class='Declare_Local'>avd</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN214"><span class='Ref_To_Local'>hash</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN66"><span class='Ref_to_Func'>sepgsql_avc_hash</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tclass</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN215"><span class='Ref_To_Local'>index</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN214"><span class='Ref_To_Local'>hash</span></a> <span class='Operator'>% </span><a href="uavc.c.html#LN52"><span class='Ref_to_Const'>AVC_NUM_SLOTS</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Validation check of the supplied security context. Because it always 
+     * invoke system-call, frequent check should be avoided. Unless security 
+     * policy is reloaded, validation status shall be kept, so we also cache 
+     * whether the supplied security context was valid, or not. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>security_check_context_raw<span class='Parentheses'>((</span>security_context_t<span class='Parentheses'>) </span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Parentheses'>)</span> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="uavc.c.html#LN210"><span class='Ref_To_Local'>ucontext</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN174"><span class='Ref_to_Func'>sepgsql_avc_unlabeled</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Ask SELinux its access control decision 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="uavc.c.html#LN210"><span class='Ref_To_Local'>ucontext</span></a><span class='Parentheses'>) 
+</span>        <a href="sepgsql.h.html#LN234"><span class='Ref_to_Proto'>sepgsql_compute_avd</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tclass</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="uavc.c.html#LN216"><span class='Ref_To_Local'>avd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="sepgsql.h.html#LN234"><span class='Ref_to_Proto'>sepgsql_compute_avd</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN210"><span class='Ref_To_Local'>ucontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tclass</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="uavc.c.html#LN216"><span class='Ref_To_Local'>avd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * It also caches a security label to be switched when a client labeled as 
+     * 'scontext' executes a procedure labeled as 'tcontext', not only access 
+     * control decision on the procedure. The security label to be switched 
+     * shall be computed uniquely on a pair of 'scontext' and 'tcontext', 
+     * thus, it is reasonable to cache the new label on avc, and enables to 
+     * reduce unnecessary system calls. It shall be referenced at 
+     * sepgsql_needs_fmgr_hook to check whether the supplied function is a 
+     * trusted procedure, or not. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tclass</span></a> <span class='Operator'>== </span><a href="sepgsql.h.html#LN47"><span class='Ref_to_Const'>SEPG_CLASS_DB_PROCEDURE</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="uavc.c.html#LN210"><span class='Ref_To_Local'>ucontext</span></a><span class='Parentheses'>) 
+</span>            <a href="uavc.c.html#LN211"><span class='Ref_To_Local'>ncontext</span></a> <span class='Operator'>= </span><a href="sepgsql.h.html#LN239"><span class='Ref_to_Proto'>sepgsql_compute_create</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Delimiter'>, 
+</span>                                              <a href="sepgsql.h.html#LN35"><span class='Ref_to_Const'>SEPG_CLASS_PROCESS</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="uavc.c.html#LN211"><span class='Ref_To_Local'>ncontext</span></a> <span class='Operator'>= </span><a href="sepgsql.h.html#LN239"><span class='Ref_to_Proto'>sepgsql_compute_create</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN210"><span class='Ref_To_Local'>ucontext</span></a><span class='Delimiter'>, 
+</span>                                              <a href="sepgsql.h.html#LN35"><span class='Ref_to_Const'>SEPG_CLASS_PROCESS</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN211"><span class='Ref_To_Local'>ncontext</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../src/include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN211"><span class='Ref_To_Local'>ncontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="uavc.c.html#LN211"><span class='Ref_To_Local'>ncontext</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Set up an avc_cache object 
+     */ 
+</span>    <a href="uavc.c.html#LN212"><span class='Ref_To_Local'>oldctx</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN56"><span class='Ref_to_Global_Var'>avc_mem_cxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a> <span class='Operator'>= </span><a href="../../src/include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="uavc.c.html#LN30"><span class='Ref_to_Typedef'>avc_cache</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN32"><span class='Ref_to_Member'>hash</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN214"><span class='Ref_To_Local'>hash</span></a><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN33"><span class='Ref_to_Member'>scontext</span></a> <span class='Operator'>= </span><a href="../../src/include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>scontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN34"><span class='Ref_to_Member'>tcontext</span></a> <span class='Operator'>= </span><a href="../../src/include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN35"><span class='Ref_to_Member'>tclass</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN208"><span class='Ref_to_Parameter'>tclass</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN37"><span class='Ref_to_Member'>allowed</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN216"><span class='Ref_To_Local'>avd</span></a><span class='Operator'>.</span>allowed<span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN38"><span class='Ref_to_Member'>auditallow</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN216"><span class='Ref_To_Local'>avd</span></a><span class='Operator'>.</span>auditallow<span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN39"><span class='Ref_to_Member'>auditdeny</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN216"><span class='Ref_To_Local'>avd</span></a><span class='Operator'>.</span>auditdeny<span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN42"><span class='Ref_to_Member'>hot_cache</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN216"><span class='Ref_To_Local'>avd</span></a><span class='Operator'>.</span>flags <span class='Operator'>& </span>SELINUX_AVD_FLAGS_PERMISSIVE<span class='Parentheses'>) 
+</span>        <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN41"><span class='Ref_to_Member'>permissive</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="uavc.c.html#LN210"><span class='Ref_To_Local'>ucontext</span></a><span class='Parentheses'>) 
+</span>        <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN43"><span class='Ref_to_Member'>tcontext_is_valid</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN211"><span class='Ref_To_Local'>ncontext</span></a><span class='Parentheses'>) 
+</span>        <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN45"><span class='Ref_to_Member'>ncontext</span></a> <span class='Operator'>= </span><a href="../../src/include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN211"><span class='Ref_To_Local'>ncontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN58"><span class='Ref_to_Global_Var'>avc_num_caches</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN58"><span class='Ref_to_Global_Var'>avc_num_caches</span></a> <span class='Operator'>&GT; </span><a href="uavc.c.html#LN60"><span class='Ref_to_Global_Var'>avc_threshold</span></a><span class='Parentheses'>) 
+</span>        <a href="uavc.c.html#LN91"><span class='Ref_to_Func'>sepgsql_avc_reclaim</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN57"><span class='Ref_to_Global_Var'>avc_slots</span></a><span class='Delimiter'>[</span><a href="uavc.c.html#LN215"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../src/include/nodes/pg_list.h.html#LN215"><span class='Ref_to_Proto'>lcons</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN57"><span class='Ref_to_Global_Var'>avc_slots</span></a><span class='Delimiter'>[</span><a href="uavc.c.html#LN215"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../src/include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN212"><span class='Ref_To_Local'>oldctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="uavc.c.html#LN213"><span class='Ref_To_Local'>cache</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end sepgsql_avc_compute &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * sepgsql_avc_lookup 
+ * 
+ * Look up a cache entry that matches the supplied security contexts and 
+ * object class.  If not found, create a new cache entry. 
+ */ 
+</span><span class='Keyword'>static </span><a href="uavc.c.html#LN30"><span class='Ref_to_Typedef'>avc_cache</span></a> <span class='Operator'>* 
+</span><a name="LN305"></a><span class='Declare_Function'>sepgsql_avc_lookup</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>scontext</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>tcontext</span><span class='Delimiter'>, </span><a href="../../src/include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>tclass</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN307"></a>    <a href="uavc.c.html#LN30"><span class='Ref_to_Typedef'>avc_cache</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>cache</span><span class='Delimiter'>; 
+</span><a name="LN308"></a>    <a href="../../src/include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>cell</span><span class='Delimiter'>; 
+</span><a name="LN309"></a>    <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>hash</span><span class='Delimiter'>; 
+</span><a name="LN310"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>index</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN309"><span class='Ref_To_Local'>hash</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN66"><span class='Ref_to_Func'>sepgsql_avc_hash</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN305"><span class='Ref_to_Parameter'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN305"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN305"><span class='Ref_to_Parameter'>tclass</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN310"><span class='Ref_To_Local'>index</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN309"><span class='Ref_To_Local'>hash</span></a> <span class='Operator'>% </span><a href="uavc.c.html#LN52"><span class='Ref_to_Const'>AVC_NUM_SLOTS</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../src/include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN308"><span class='Ref_To_Local'>cell</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN57"><span class='Ref_to_Global_Var'>avc_slots</span></a><span class='Delimiter'>[</span><a href="uavc.c.html#LN310"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="uavc.c.html#LN307"><span class='Ref_To_Local'>cache</span></a> <span class='Operator'>= </span><a href="../../src/include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN308"><span class='Ref_To_Local'>cell</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN307"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN32"><span class='Ref_to_Member'>hash</span></a> <span class='Operator'>== </span><a href="uavc.c.html#LN309"><span class='Ref_To_Local'>hash</span></a> <span class='Operator'>&& 
+</span>            <a href="uavc.c.html#LN307"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN35"><span class='Ref_to_Member'>tclass</span></a> <span class='Operator'>== </span><a href="uavc.c.html#LN305"><span class='Ref_to_Parameter'>tclass</span></a> <span class='Operator'>&& 
+</span>            strcmp<span class='Parentheses'>(</span><a href="uavc.c.html#LN307"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN34"><span class='Ref_to_Member'>tcontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN305"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>            strcmp<span class='Parentheses'>(</span><a href="uavc.c.html#LN307"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN33"><span class='Ref_to_Member'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN305"><span class='Ref_to_Parameter'>scontext</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="uavc.c.html#LN307"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN42"><span class='Ref_to_Member'>hot_cache</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <a href="uavc.c.html#LN307"><span class='Ref_To_Local'>cache</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Comment_Multi_Line'>/* not found, so insert a new cache */ 
+</span>    <span class='Control'>return</span> <a href="uavc.c.html#LN207"><span class='Ref_to_Func'>sepgsql_avc_compute</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN305"><span class='Ref_to_Parameter'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN305"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN305"><span class='Ref_to_Parameter'>tclass</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end sepgsql_avc_lookup &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * sepgsql_avc_check_perms(_label) 
+ * 
+ * It returns 'true', if the security policy suggested to allow the required 
+ * permissions. Otherwise, it returns 'false' or raises an error according 
+ * to the 'abort_on_violation' argument. 
+ * The 'tobject' and 'tclass' identify the target object being referenced, 
+ * and 'required' is a bitmask of permissions (SEPG_*__*) defined for each 
+ * object classes. 
+ * The 'audit_name' is the object name (optional). If SEPGSQL_AVC_NOAUDIT 
+ * was supplied, it means to skip all the audit messages. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN345"></a><span class='Declare_Function'>sepgsql_avc_check_perms_label</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>tcontext</span><span class='Delimiter'>, 
+</span><a name="LN346"></a>                              <a href="../../src/include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>tclass</span><span class='Delimiter'>, </span><a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Parameter'>required</span><span class='Delimiter'>, 
+</span><a name="LN347"></a>                              <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>audit_name</span><span class='Delimiter'>, 
+</span><a name="LN348"></a>                              <span class='Keyword'>bool </span><span class='Declare_Parameter'>abort_on_violation</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN350"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>scontext</span> <span class='Operator'>= </span><a href="label.c.html#LN89"><span class='Ref_to_Func'>sepgsql_get_client_label</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN351"></a>    <a href="uavc.c.html#LN30"><span class='Ref_to_Typedef'>avc_cache</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>cache</span><span class='Delimiter'>; 
+</span><a name="LN352"></a>    <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>denied</span><span class='Delimiter'>; 
+</span><a name="LN353"></a>    <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>audited</span><span class='Delimiter'>; 
+</span><a name="LN354"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN156"><span class='Ref_to_Func'>sepgsql_avc_check_valid</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Control'>do</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="uavc.c.html#LN354"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If the target object is unlabeled, we perform the check using the 
+         * label supplied by sepgsql_avc_unlabeled(). 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN345"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Parentheses'>) 
+</span>            <a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN304"><span class='Ref_to_Func'>sepgsql_avc_lookup</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN350"><span class='Ref_To_Local'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN345"><span class='Ref_to_Parameter'>tcontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN346"><span class='Ref_to_Parameter'>tclass</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN304"><span class='Ref_to_Func'>sepgsql_avc_lookup</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN350"><span class='Ref_To_Local'>scontext</span></a><span class='Delimiter'>, 
+</span>                                       <a href="uavc.c.html#LN174"><span class='Ref_to_Func'>sepgsql_avc_unlabeled</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><a href="uavc.c.html#LN346"><span class='Ref_to_Parameter'>tclass</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="uavc.c.html#LN352"><span class='Ref_To_Local'>denied</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN346"><span class='Ref_to_Parameter'>required</span></a> <span class='Operator'>& ~</span><a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN37"><span class='Ref_to_Member'>allowed</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Compute permissions to be audited 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hooks.c.html#LN74"><span class='Ref_to_Func'>sepgsql_get_debug_audit</span></a><span class='Parentheses'>())</span> 
+            <a href="uavc.c.html#LN353"><span class='Ref_To_Local'>audited</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="uavc.c.html#LN352"><span class='Ref_To_Local'>denied</span></a> <span class='Operator'>? </span><span class='Parentheses'>(</span><a href="uavc.c.html#LN352"><span class='Ref_To_Local'>denied</span></a> <span class='Operator'>& ~</span><span class='Number'>0</span><span class='Parentheses'>) </span><span class='Operator'>: </span><span class='Parentheses'>(</span><a href="uavc.c.html#LN346"><span class='Ref_to_Parameter'>required</span></a> <span class='Operator'>& ~</span><span class='Number'>0</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="uavc.c.html#LN353"><span class='Ref_To_Local'>audited</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN352"><span class='Ref_To_Local'>denied</span></a> <span class='Operator'>? </span><span class='Parentheses'>(</span><a href="uavc.c.html#LN352"><span class='Ref_To_Local'>denied</span></a> <span class='Operator'>& </span><a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN39"><span class='Ref_to_Member'>auditdeny</span></a><span class='Parentheses'>) 
+</span>                <span class='Operator'>: </span><span class='Parentheses'>(</span><a href="uavc.c.html#LN346"><span class='Ref_to_Parameter'>required</span></a> <span class='Operator'>& </span><a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN38"><span class='Ref_to_Member'>auditallow</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN352"><span class='Ref_To_Local'>denied</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * In permissive mode or permissive domain, violated permissions 
+             * shall be audited to the log files at once, and then implicitly 
+             * allowed to avoid a flood of access denied logs, because the 
+             * purpose of permissive mode/domain is to collect a violation log 
+             * that will make it possible to fix up the security policy. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="sepgsql.h.html#LN225"><span class='Ref_to_Proto'>sepgsql_getenforce</span></a><span class='Parentheses'>() </span><span class='Operator'>|| </span><a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN41"><span class='Ref_to_Member'>permissive</span></a><span class='Parentheses'>)</span> 
+                <a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN37"><span class='Ref_to_Member'>allowed</span></a> <span class='Operator'>|= </span><a href="uavc.c.html#LN346"><span class='Ref_to_Parameter'>required</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="uavc.c.html#LN354"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end do &raquo; </span> <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="uavc.c.html#LN156"><span class='Ref_to_Func'>sepgsql_avc_check_valid</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * In the case when we have something auditable actions here, 
+     * sepgsql_audit_log shall be called with text representation of security 
+     * labels for both of subject and object. It records this access 
+     * violation, so DBA will be able to find out unexpected security problems 
+     * later. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN353"><span class='Ref_To_Local'>audited</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>        <a href="uavc.c.html#LN347"><span class='Ref_to_Parameter'>audit_name</span></a> <span class='Operator'>!= </span><a href="sepgsql.h.html#LN254"><span class='Ref_to_Const'>SEPGSQL_AVC_NOAUDIT</span></a> <span class='Operator'>&& 
+</span>        <a href="sepgsql.h.html#LN223"><span class='Ref_to_Proto'>sepgsql_get_mode</span></a><span class='Parentheses'>() </span><span class='Operator'>!= </span><a href="sepgsql.h.html#LN29"><span class='Ref_to_Const'>SEPGSQL_MODE_INTERNAL</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="sepgsql.h.html#LN227"><span class='Ref_to_Proto'>sepgsql_audit_log</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN352"><span class='Ref_To_Local'>denied</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                          <a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN33"><span class='Ref_to_Member'>scontext</span></a><span class='Delimiter'>, 
+</span>                          <a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN43"><span class='Ref_to_Member'>tcontext_is_valid</span></a> <span class='Operator'>? 
+</span>                          <a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN34"><span class='Ref_to_Member'>tcontext</span></a> <span class='Operator'>: </span><a href="uavc.c.html#LN174"><span class='Ref_to_Func'>sepgsql_avc_unlabeled</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                          <a href="uavc.c.html#LN351"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN35"><span class='Ref_to_Member'>tclass</span></a><span class='Delimiter'>, 
+</span>                          <a href="uavc.c.html#LN353"><span class='Ref_To_Local'>audited</span></a><span class='Delimiter'>, 
+</span>                          <a href="uavc.c.html#LN347"><span class='Ref_to_Parameter'>audit_name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN348"><span class='Ref_to_Parameter'>abort_on_violation</span></a> <span class='Operator'>&& !</span><a href="uavc.c.html#LN354"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) 
+</span>        <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_PRIVILEGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"SELinux: security policy violation"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="uavc.c.html#LN354"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end sepgsql_avc_check_perms_label &raquo; </span> 
+ 
+<span class='Keyword'>bool 
+</span><a name="LN427"></a><span class='Declare_Function'>sepgsql_avc_check_perms</span><span class='Parentheses'>(</span><span class='Keyword'>const </span><a href="../../src/include/catalog/objectaddress.h.html#LN23"><span class='Ref_to_Struct'>ObjectAddress</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>tobject</span><span class='Delimiter'>, 
+</span><a name="LN428"></a>                        <a href="../../src/include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>tclass</span><span class='Delimiter'>, </span><a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Parameter'>required</span><span class='Delimiter'>, 
+</span><a name="LN429"></a>                        <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>audit_name</span><span class='Delimiter'>, 
+</span><a name="LN430"></a>                        <span class='Keyword'>bool </span><span class='Declare_Parameter'>abort_on_violation</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN432"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>tcontext</span> <span class='Operator'>= </span><a href="../../src/include/commands/seclabel.h.html#LN16"><span class='Ref_to_Proto'>GetSecurityLabel</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN427"><span class='Ref_to_Parameter'>tobject</span></a><span class='Delimiter'>, </span><a href="sepgsql.h.html#LN22"><span class='Ref_to_Const'>SEPGSQL_LABEL_TAG</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN433"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN433"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="sepgsql.h.html#LN255"><span class='Ref_to_Proto'>sepgsql_avc_check_perms_label</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN432"><span class='Ref_To_Local'>tcontext</span></a><span class='Delimiter'>, 
+</span>                                       <a href="uavc.c.html#LN428"><span class='Ref_to_Parameter'>tclass</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN428"><span class='Ref_to_Parameter'>required</span></a><span class='Delimiter'>, 
+</span>                                       <a href="uavc.c.html#LN429"><span class='Ref_to_Parameter'>audit_name</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN430"><span class='Ref_to_Parameter'>abort_on_violation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN432"><span class='Ref_To_Local'>tcontext</span></a><span class='Parentheses'>) 
+</span>        <a href="../../src/include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN432"><span class='Ref_To_Local'>tcontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="uavc.c.html#LN433"><span class='Ref_To_Local'>rc</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * sepgsql_avc_trusted_proc 
+ * 
+ * If the supplied function OID is configured as a trusted procedure, this 
+ * function will return a security label to be used during the execution of 
+ * that function.  Otherwise, it returns NULL. 
+ */ 
+</span><span class='Keyword'>char </span><span class='Operator'>* 
+</span><a name="LN452"></a><span class='Declare_Function'>sepgsql_avc_trusted_proc</span><span class='Parentheses'>(</span><a href="../../src/include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>functionId</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN454"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>scontext</span> <span class='Operator'>= </span><a href="label.c.html#LN89"><span class='Ref_to_Func'>sepgsql_get_client_label</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN455"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>tcontext</span><span class='Delimiter'>; 
+</span><a name="LN456"></a>    <a href="../../src/include/catalog/objectaddress.h.html#LN23"><span class='Ref_to_Struct'>ObjectAddress</span></a> <span class='Declare_Local'>tobject</span><span class='Delimiter'>; 
+</span><a name="LN457"></a>    <a href="uavc.c.html#LN30"><span class='Ref_to_Typedef'>avc_cache</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>cache</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN456"><span class='Ref_To_Local'>tobject</span></a><span class='Operator'>.</span><a href="../../src/include/catalog/objectaddress.h.html#LN25"><span class='Ref_to_Member'>classId</span></a> <span class='Operator'>= </span><a href="../../src/include/catalog/pg_proc.h.html#LN32"><span class='Ref_to_Const'>ProcedureRelationId</span></a><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN456"><span class='Ref_To_Local'>tobject</span></a><span class='Operator'>.</span><a href="../../src/include/catalog/objectaddress.h.html#LN26"><span class='Ref_to_Member'>objectId</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN452"><span class='Ref_to_Parameter'>functionId</span></a><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN456"><span class='Ref_To_Local'>tobject</span></a><span class='Operator'>.</span><a href="../../src/include/catalog/objectaddress.h.html#LN27"><span class='Ref_to_Member'>objectSubId</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN455"><span class='Ref_To_Local'>tcontext</span></a> <span class='Operator'>= </span><a href="../../src/include/commands/seclabel.h.html#LN16"><span class='Ref_to_Proto'>GetSecurityLabel</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="uavc.c.html#LN456"><span class='Ref_To_Local'>tobject</span></a><span class='Delimiter'>, </span><a href="sepgsql.h.html#LN22"><span class='Ref_to_Const'>SEPGSQL_LABEL_TAG</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="uavc.c.html#LN156"><span class='Ref_to_Func'>sepgsql_avc_check_valid</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Control'>do</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN455"><span class='Ref_To_Local'>tcontext</span></a><span class='Parentheses'>) 
+</span>            <a href="uavc.c.html#LN457"><span class='Ref_To_Local'>cache</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN304"><span class='Ref_to_Func'>sepgsql_avc_lookup</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN454"><span class='Ref_To_Local'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN455"><span class='Ref_To_Local'>tcontext</span></a><span class='Delimiter'>, 
+</span>                                       <a href="sepgsql.h.html#LN47"><span class='Ref_to_Const'>SEPG_CLASS_DB_PROCEDURE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="uavc.c.html#LN457"><span class='Ref_To_Local'>cache</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN304"><span class='Ref_to_Func'>sepgsql_avc_lookup</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN454"><span class='Ref_To_Local'>scontext</span></a><span class='Delimiter'>, </span><a href="uavc.c.html#LN174"><span class='Ref_to_Func'>sepgsql_avc_unlabeled</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                                       <a href="sepgsql.h.html#LN47"><span class='Ref_to_Const'>SEPG_CLASS_DB_PROCEDURE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} </span><span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="uavc.c.html#LN156"><span class='Ref_to_Func'>sepgsql_avc_check_valid</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="uavc.c.html#LN457"><span class='Ref_To_Local'>cache</span></a><span class='Operator'>-&GT;</span><a href="uavc.c.html#LN45"><span class='Ref_to_Member'>ncontext</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end sepgsql_avc_trusted_proc &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * sepgsql_avc_exit 
+ * 
+ * Clean up userspace AVC on process exit. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN484"></a><span class='Declare_Function'>sepgsql_avc_exit</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>code</span><span class='Delimiter'>, </span><a href="../../src/include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    selinux_status_close<span class='Parentheses'>()</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * sepgsql_avc_init 
+ * 
+ * Initialize the userspace AVC.  This should be called from _PG_init. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN495"></a><span class='Declare_Function'>sepgsql_avc_init</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN497"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * All the avc stuff shall be allocated in avc_mem_cxt 
+     */ 
+</span>    <a href="uavc.c.html#LN56"><span class='Ref_to_Global_Var'>avc_mem_cxt</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/memutils.h.html#LN145"><span class='Ref_to_Proto'>AllocSetContextCreate</span></a><span class='Parentheses'>(</span><a href="../../src/backend/utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, 
+</span>                                        <span class='String'>"userspace access vector cache"</span><span class='Delimiter'>, 
+</span>                                        <a href="../../src/include/utils/memutils.h.html#LN164"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_SIZES</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    memset<span class='Parentheses'>(</span><a href="uavc.c.html#LN57"><span class='Ref_to_Global_Var'>avc_slots</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="uavc.c.html#LN57"><span class='Ref_to_Global_Var'>avc_slots</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN58"><span class='Ref_to_Global_Var'>avc_num_caches</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN59"><span class='Ref_to_Global_Var'>avc_lru_hint</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="uavc.c.html#LN60"><span class='Ref_to_Global_Var'>avc_threshold</span></a> <span class='Operator'>= </span><a href="uavc.c.html#LN54"><span class='Ref_to_Const'>AVC_DEF_THRESHOLD</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * SELinux allows to mmap(2) its kernel status page in read-only mode to 
+     * inform userspace applications its status updating (such as policy 
+     * reloading) without system-call invocations. This feature is only 
+     * supported in Linux-2.6.38 or later, however, libselinux provides a 
+     * fallback mode to know its status using netlink sockets. 
+     */ 
+</span>    <a href="uavc.c.html#LN497"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span>selinux_status_open<span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN497"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INTERNAL_ERROR<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"SELinux: could not open selinux status : %m"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="uavc.c.html#LN497"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"SELinux: kernel status page uses fallback mode"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Arrange to close selinux status page on process exit. */ 
+</span>    <a href="../../src/include/storage/ipc.h.html#LN68"><span class='Ref_to_Proto'>on_proc_exit</span></a><span class='Parentheses'>(</span><a href="uavc.c.html#LN483"><span class='Ref_to_Func'>sepgsql_avc_exit</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end sepgsql_avc_init &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

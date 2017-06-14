@@ -1,0 +1,1341 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\executor\execTuples.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\executor\execTuples.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:39 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * execTuples.c 
+ *    Routines dealing with TupleTableSlots.  These are used for resource 
+ *    management associated with tuples (eg, releasing buffer pins for 
+ *    tuples in disk buffers, or freeing the memory occupied by transient 
+ *    tuples).  Slots also provide access abstraction that lets us implement 
+ *    "virtual" tuples to reduce data-copying overhead. 
+ * 
+ *    Routines dealing with the type information for tuples. Currently, 
+ *    the type information for a tuple is an array of FormData_pg_attribute. 
+ *    This information is needed by routines manipulating tuples 
+ *    (getattribute, formtuple, etc.). 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/executor/execTuples.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+/* 
+ * INTERFACE ROUTINES 
+ * 
+ *   SLOT CREATION/DESTRUCTION 
+ *      MakeTupleTableSlot      - create an empty slot 
+ *      ExecAllocTableSlot      - create a slot within a tuple table 
+ *      ExecResetTupleTable     - clear and optionally delete a tuple table 
+ *      MakeSingleTupleTableSlot - make a standalone slot, set its descriptor 
+ *      ExecDropSingleTupleTableSlot - destroy a standalone slot 
+ * 
+ *   SLOT ACCESSORS 
+ *      ExecSetSlotDescriptor   - set a slot's tuple descriptor 
+ *      ExecStoreTuple          - store a physical tuple in the slot 
+ *      ExecStoreMinimalTuple   - store a minimal physical tuple in the slot 
+ *      ExecClearTuple          - clear contents of a slot 
+ *      ExecStoreVirtualTuple   - mark slot as containing a virtual tuple 
+ *      ExecCopySlotTuple       - build a physical tuple from a slot 
+ *      ExecCopySlotMinimalTuple - build a minimal physical tuple from a slot 
+ *      ExecMaterializeSlot     - convert virtual to physical storage 
+ *      ExecCopySlot            - copy one slot's contents to another 
+ * 
+ *   CONVENIENCE INITIALIZATION ROUTINES 
+ *      ExecInitResultTupleSlot    \    convenience routines to initialize 
+ *      ExecInitScanTupleSlot       \   the various tuple slots for nodes 
+ *      ExecInitExtraTupleSlot      /   which store copies of tuples. 
+ *      ExecInitNullTupleSlot      / 
+ * 
+ *   Routines that probably belong somewhere else: 
+ *      ExecTypeFromTL          - form a TupleDesc from a target list 
+ * 
+ *   EXAMPLE OF HOW TABLE ROUTINES WORK 
+ *      Suppose we have a query such as SELECT emp.name FROM emp and we have 
+ *      a single SeqScan node in the query plan. 
+ * 
+ *      At ExecutorStart() 
+ *      ---------------- 
+ *      - ExecInitSeqScan() calls ExecInitScanTupleSlot() and 
+ *        ExecInitResultTupleSlot() to construct TupleTableSlots 
+ *        for the tuples returned by the access methods and the 
+ *        tuples resulting from performing target list projections. 
+ * 
+ *      During ExecutorRun() 
+ *      ---------------- 
+ *      - SeqNext() calls ExecStoreTuple() to place the tuple returned 
+ *        by the access methods into the scan tuple slot. 
+ * 
+ *      - ExecSeqScan() calls ExecStoreTuple() to take the result 
+ *        tuple from ExecProject() and place it into the result tuple slot. 
+ * 
+ *      - ExecutePlan() calls the output function. 
+ * 
+ *      The important thing to watch in the executor code is how pointers 
+ *      to the slots containing tuples are passed instead of the tuples 
+ *      themselves.  This facilitates the communication of related information 
+ *      (such as whether or not a tuple should be pfreed, what buffer contains 
+ *      this tuple, the tuple's tuple descriptor, etc).  It also allows us 
+ *      to avoid physically constructing projection tuples in many cases. 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/htup_details.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/tuptoaster.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"funcapi.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_type.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"nodes/nodeFuncs.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/bufmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/builtins.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/lsyscache.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/typcache.h"</span> 
+ 
+ 
+<a name="LN94"></a><span class='Keyword'>static </span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> <span class='Declare_Prototype'>ExecTypeFromTLInternal</span><span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>targetList</span><span class='Delimiter'>, 
+</span><a name="LN95"></a>                       <span class='Keyword'>bool </span><span class='Declare_Parameter'>hasoid</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>skipjunk</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *                tuple table create/delete functions 
+ * ---------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      MakeTupleTableSlot 
+ * 
+ *      Basic routine to make an empty TupleTableSlot. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN110"></a><span class='Declare_Function'>MakeTupleTableSlot</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN112"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= </span><a href="../../include/nodes/nodes.h.html#LN556"><span class='Ref_to_Macro'>makeNode</span></a><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN116"><span class='Ref_to_Member'>tts_shouldFree</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN117"><span class='Ref_to_Member'>tts_shouldFreeMin</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN121"><span class='Ref_to_Member'>tts_mcxt</span></a> <span class='Operator'>= </span><a href="../utils/mmgr/mcxt.c.html#LN36"><span class='Ref_to_Global_Var'>CurrentMemoryContext</span></a><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a> <span class='Operator'>= </span><a href="../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN123"><span class='Ref_to_Member'>tts_nvalid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN112"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecAllocTableSlot 
+ * 
+ *      Create a tuple table slot within a tuple table (which is just a List). 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN136"></a><span class='Declare_Function'>ExecAllocTableSlot</span><span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>**</span><span class='Declare_Parameter'>tupleTable</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN138"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= </span><a href="execTuples.c.html#LN109"><span class='Ref_to_Func'>MakeTupleTableSlot</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="execTuples.c.html#LN136"><span class='Ref_to_Parameter'>tupleTable</span></a> <span class='Operator'>= </span><a href="../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="execTuples.c.html#LN136"><span class='Ref_to_Parameter'>tupleTable</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN138"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN138"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecResetTupleTable 
+ * 
+ *      This releases any resources (buffer pins, tupdesc refcounts) 
+ *      held by the tuple table, and optionally releases the memory 
+ *      occupied by the tuple table data structure. 
+ *      It is expected that this routine be called by EndPlan(). 
+ * -------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN155"></a><span class='Declare_Function'>ExecResetTupleTable</span><span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>tupleTable</span><span class='Delimiter'>,</span>   <span class='Comment_Single_Line'>/* tuple table */ 
+</span><a name="LN156"></a>                    <span class='Keyword'>bool </span><span class='Declare_Parameter'>shouldFree</span><span class='Parentheses'>)</span>    <span class='Comment_Single_Line'>/* true if we should free memory */ 
+</span><span class='Delimiter'>{ 
+</span><a name="LN158"></a>    <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>lc</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN158"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN155"><span class='Ref_to_Parameter'>tupleTable</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN162"></a>        <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN108"><span class='Ref_to_Macro'>lfirst_node</span></a><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN158"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Always release resources and reset the slot to empty */ 
+</span>        <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../include/access/tupdesc.h.html#LN106"><span class='Ref_to_Macro'>ReleaseTupleDesc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="execTuples.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* If shouldFree, release memory occupied by the slot itself */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN156"><span class='Ref_to_Parameter'>shouldFree</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Parentheses'>) 
+</span>                <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Parentheses'>) 
+</span>                <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* If shouldFree, release the list structure */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN156"><span class='Ref_to_Parameter'>shouldFree</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/nodes/pg_list.h.html#LN265"><span class='Ref_to_Proto'>list_free</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN155"><span class='Ref_to_Parameter'>tupleTable</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecResetTupleTable &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      MakeSingleTupleTableSlot 
+ * 
+ *      This is a convenience routine for operations that need a 
+ *      standalone TupleTableSlot not gotten from the main executor 
+ *      tuple table.  It makes a single slot and initializes it 
+ *      to use the given tuple descriptor. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN198"></a><span class='Declare_Function'>MakeSingleTupleTableSlot</span><span class='Parentheses'>(</span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> <span class='Declare_Parameter'>tupdesc</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN200"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= </span><a href="execTuples.c.html#LN109"><span class='Ref_to_Func'>MakeTupleTableSlot</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/executor/tuptable.h.html#LN146"><span class='Ref_to_Proto'>ExecSetSlotDescriptor</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN200"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN198"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN200"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecDropSingleTupleTableSlot 
+ * 
+ *      Release a TupleTableSlot made with MakeSingleTupleTableSlot. 
+ *      DON'T use this on a slot that's part of a tuple table list! 
+ * -------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN215"></a><span class='Declare_Function'>ExecDropSingleTupleTableSlot</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* This should match ExecResetTupleTable's processing of one slot */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN215"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>, </span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN215"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN215"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/access/tupdesc.h.html#LN106"><span class='Ref_to_Macro'>ReleaseTupleDesc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN215"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN215"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN215"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN215"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN215"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN215"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *                tuple table slot accessor functions 
+ * ---------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecSetSlotDescriptor 
+ * 
+ *      This function is used to set the tuple descriptor associated 
+ *      with the slot's tuple.  The passed descriptor must have lifespan 
+ *      at least equal to the slot's.  If it is a reference-counted descriptor 
+ *      then the reference count is incremented for as long as the slot holds 
+ *      a reference. 
+ * -------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN246"></a><span class='Declare_Function'>ExecSetSlotDescriptor</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Delimiter'>,</span>     <span class='Comment_Single_Line'>/* slot to change */ 
+</span><a name="LN247"></a>                      <a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> <span class='Declare_Parameter'>tupdesc</span><span class='Parentheses'>)</span>        <span class='Comment_Single_Line'>/* new tuple descriptor */ 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* For safety, make sure slot is empty before changing it */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Release any old descriptor.  Also release old Datum/isnull arrays if 
+     * present (we don't bother to check if they could be re-used). 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/access/tupdesc.h.html#LN106"><span class='Ref_to_Macro'>ReleaseTupleDesc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Install the new descriptor; if it's refcounted, bump its refcount. 
+     */ 
+</span>    <a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN247"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Delimiter'>; 
+</span>    <a href="../../include/access/tupdesc.h.html#LN100"><span class='Ref_to_Macro'>PinTupleDesc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN247"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Allocate Datum/isnull arrays of the appropriate size.  These must have 
+     * the same lifetime as the slot, so allocate in the slot's own context. 
+     */ 
+</span>    <a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/palloc.h.html#LN70"><span class='Ref_to_Proto'>MemoryContextAlloc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN121"><span class='Ref_to_Member'>tts_mcxt</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN247"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN72"><span class='Ref_to_Member'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/palloc.h.html#LN70"><span class='Ref_to_Proto'>MemoryContextAlloc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN246"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN121"><span class='Ref_to_Member'>tts_mcxt</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN247"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN72"><span class='Ref_to_Member'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>bool</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecSetSlotDescriptor &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecStoreTuple 
+ * 
+ *      This function is used to store a physical tuple into a specified 
+ *      slot in the tuple table. 
+ * 
+ *      tuple:  tuple to store 
+ *      slot:   slot to store it in 
+ *      buffer: disk buffer if tuple is in a disk page, else InvalidBuffer 
+ *      shouldFree: true if ExecClearTuple should pfree() the tuple 
+ *                  when done with it 
+ * 
+ * If 'buffer' is not InvalidBuffer, the tuple table code acquires a pin 
+ * on the buffer which is held until the slot is cleared, so that the tuple 
+ * won't go away on us. 
+ * 
+ * shouldFree is normally set 'true' for tuples constructed on-the-fly. 
+ * It must always be 'false' for tuples that are stored in disk pages, 
+ * since we don't want to try to pfree those. 
+ * 
+ * Another case where it is 'false' is when the referenced tuple is held 
+ * in a tuple table slot belonging to a lower-level executor Proc node. 
+ * In this case the lower-level slot retains ownership and responsibility 
+ * for eventually releasing the tuple.  When this method is used, we must 
+ * be certain that the upper-level Proc node will lose interest in the tuple 
+ * sooner than the lower-level one does!  If you're not certain, copy the 
+ * lower-level tuple with heap_copytuple and let the upper-level table 
+ * slot assume ownership of the copy! 
+ * 
+ * Return value is just the passed-in slot pointer. 
+ * 
+ * NOTE: before PostgreSQL 8.1, this function would accept a NULL tuple 
+ * pointer and effectively behave like ExecClearTuple (though you could 
+ * still specify a buffer to pin, which would be an odd combination). 
+ * This saved a couple lines of code in a few places, but seemed more likely 
+ * to mask logic errors than to be really useful, so it's now disallowed. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN319"></a><span class='Declare_Function'>ExecStoreTuple</span><span class='Parentheses'>(</span><a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> <span class='Declare_Parameter'>tuple</span><span class='Delimiter'>, 
+</span><a name="LN320"></a>               <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Delimiter'>, 
+</span><a name="LN321"></a>               <a href="../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Parameter'>buffer</span><span class='Delimiter'>, 
+</span><a name="LN322"></a>               <span class='Keyword'>bool </span><span class='Declare_Parameter'>shouldFree</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN319"><span class='Ref_to_Parameter'>tuple</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* passing shouldFree=true for a tuple on a disk page is not sane */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN321"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>) </span><span class='Operator'>? </span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execTuples.c.html#LN322"><span class='Ref_to_Parameter'>shouldFree</span></a><span class='Parentheses'>) </span><span class='Operator'>: </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Free any old physical tuple belonging to the slot. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN116"><span class='Ref_to_Member'>tts_shouldFree</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/access/htup_details.h.html#LN815"><span class='Ref_to_Proto'>heap_freetuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN117"><span class='Ref_to_Member'>tts_shouldFreeMin</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/access/htup_details.h.html#LN818"><span class='Ref_to_Proto'>heap_free_minimal_tuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Store the new tuple into the specified slot. 
+     */ 
+</span>    <a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN116"><span class='Ref_to_Member'>tts_shouldFree</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN322"><span class='Ref_to_Parameter'>shouldFree</span></a><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN117"><span class='Ref_to_Member'>tts_shouldFreeMin</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN319"><span class='Ref_to_Parameter'>tuple</span></a><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Mark extracted state invalid */ 
+</span>    <a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN123"><span class='Ref_to_Member'>tts_nvalid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If tuple is on a disk page, keep the page pinned as long as we hold a 
+     * pointer into it.  We assume the caller already has such a pin. 
+     * 
+     * This is coded to optimize the case where the slot previously held a 
+     * tuple on the same disk page: in that case releasing and re-acquiring 
+     * the pin is a waste of cycles.  This is a common situation during 
+     * seqscans, so it's worth troubling over. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a> <span class='Operator'>!= </span><a href="execTuples.c.html#LN321"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a><span class='Parentheses'>))</span> 
+            <a href="../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN321"><span class='Ref_to_Parameter'>buffer</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN321"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>))</span> 
+            <a href="../../include/storage/bufmgr.h.html#LN177"><span class='Ref_to_Proto'>IncrBufferRefCount</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN321"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN320"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecStoreTuple &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecStoreMinimalTuple 
+ * 
+ *      Like ExecStoreTuple, but insert a "minimal" tuple into the slot. 
+ * 
+ * No 'buffer' parameter since minimal tuples are never stored in relations. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN383"></a><span class='Declare_Function'>ExecStoreMinimalTuple</span><span class='Parentheses'>(</span><a href="../../include/access/htup.h.html#LN26"><span class='Ref_to_Typedef'>MinimalTuple</span></a> <span class='Declare_Parameter'>mtup</span><span class='Delimiter'>, 
+</span><a name="LN384"></a>                      <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Delimiter'>, 
+</span><a name="LN385"></a>                      <span class='Keyword'>bool </span><span class='Declare_Parameter'>shouldFree</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN383"><span class='Ref_to_Parameter'>mtup</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Free any old physical tuple belonging to the slot. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN116"><span class='Ref_to_Member'>tts_shouldFree</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/access/htup_details.h.html#LN815"><span class='Ref_to_Proto'>heap_freetuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN117"><span class='Ref_to_Member'>tts_shouldFreeMin</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/access/htup_details.h.html#LN818"><span class='Ref_to_Proto'>heap_free_minimal_tuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Drop the pin on the referenced buffer, if there is one. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a><span class='Parentheses'>))</span> 
+        <a href="../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a> <span class='Operator'>= </span><a href="../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Store the new tuple into the specified slot. 
+     */ 
+</span>    <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN116"><span class='Ref_to_Member'>tts_shouldFree</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN117"><span class='Ref_to_Member'>tts_shouldFreeMin</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN385"><span class='Ref_to_Parameter'>shouldFree</span></a><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a> <span class='Operator'>= &</span><a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN127"><span class='Ref_to_Member'>tts_minhdr</span></a><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN383"><span class='Ref_to_Parameter'>mtup</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN127"><span class='Ref_to_Member'>tts_minhdr</span></a><span class='Operator'>.</span><a href="../../include/access/htup.h.html#LN63"><span class='Ref_to_Member'>t_len</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN383"><span class='Ref_to_Parameter'>mtup</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/htup_details.h.html#LN628"><span class='Ref_to_Member'>t_len</span></a> <span class='Operator'>+ </span><a href="../../include/access/htup_details.h.html#LN619"><span class='Ref_to_Const'>MINIMAL_TUPLE_OFFSET</span></a><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN127"><span class='Ref_to_Member'>tts_minhdr</span></a><span class='Operator'>.</span><a href="../../include/access/htup.h.html#LN66"><span class='Ref_to_Member'>t_data</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/access/htup.h.html#LN22"><span class='Ref_to_Typedef'>HeapTupleHeader</span></a><span class='Parentheses'>) ((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execTuples.c.html#LN383"><span class='Ref_to_Parameter'>mtup</span></a> <span class='Operator'>- </span><a href="../../include/access/htup_details.h.html#LN619"><span class='Ref_to_Const'>MINIMAL_TUPLE_OFFSET</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* no need to set t_self or t_tableOid since we won't allow access */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* Mark extracted state invalid */ 
+</span>    <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN123"><span class='Ref_to_Member'>tts_nvalid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN384"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecStoreMinimalTuple &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecClearTuple 
+ * 
+ *      This function is used to clear out a slot in the tuple table. 
+ * 
+ *      NB: only the tuple is cleared, not the tuple descriptor (if any). 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span>                <span class='Comment_Single_Line'>/* return: slot passed */ 
+</span><a name="LN438"></a><span class='Declare_Function'>ExecClearTuple</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>)</span>    <span class='Comment_Single_Line'>/* slot in which to store tuple */ 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Free the old physical tuple if necessary. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN116"><span class='Ref_to_Member'>tts_shouldFree</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/access/htup_details.h.html#LN815"><span class='Ref_to_Proto'>heap_freetuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN117"><span class='Ref_to_Member'>tts_shouldFreeMin</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/access/htup_details.h.html#LN818"><span class='Ref_to_Proto'>heap_free_minimal_tuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN116"><span class='Ref_to_Member'>tts_shouldFree</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN117"><span class='Ref_to_Member'>tts_shouldFreeMin</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Drop the pin on the referenced buffer, if there is one. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a><span class='Parentheses'>))</span> 
+        <a href="../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a> <span class='Operator'>= </span><a href="../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Mark it empty. 
+     */ 
+</span>    <a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN123"><span class='Ref_to_Member'>tts_nvalid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN438"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecClearTuple &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecStoreVirtualTuple 
+ *          Mark a slot as containing a virtual tuple. 
+ * 
+ * The protocol for loading a slot with virtual tuple data is: 
+ *      * Call ExecClearTuple to mark the slot empty. 
+ *      * Store data into the Datum/isnull arrays. 
+ *      * Call ExecStoreVirtualTuple to mark the slot valid. 
+ * This is a bit unclean but it avoids one round of data copying. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN487"></a><span class='Declare_Function'>ExecStoreVirtualTuple</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN487"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN487"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN487"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN487"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN487"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN123"><span class='Ref_to_Member'>tts_nvalid</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN487"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN72"><span class='Ref_to_Member'>natts</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN487"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecStoreAllNullTuple 
+ *          Set up the slot to contain a null in every column. 
+ * 
+ * At first glance this might sound just like ExecClearTuple, but it's 
+ * entirely different: the slot ends up full, not empty. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN511"></a><span class='Declare_Function'>ExecStoreAllNullTuple</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN511"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN511"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Clear any old contents */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN511"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Fill all the columns of the virtual tuple with nulls 
+     */ 
+</span>    <a href="../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN511"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>           <a href="execTuples.c.html#LN511"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN72"><span class='Ref_to_Member'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    memset<span class='Parentheses'>(</span><a href="execTuples.c.html#LN511"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, 
+</span>           <a href="execTuples.c.html#LN511"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN72"><span class='Ref_to_Member'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>bool</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../include/executor/tuptable.h.html#LN155"><span class='Ref_to_Proto'>ExecStoreVirtualTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN511"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecStoreAllNullTuple &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecCopySlotTuple 
+ *          Obtain a copy of a slot's regular physical tuple.  The copy is 
+ *          palloc'd in the current memory context. 
+ *          The slot itself is undisturbed. 
+ * 
+ *      This works even if the slot contains a virtual or minimal tuple; 
+ *      however the "system columns" of the result will not be meaningful. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> 
+<a name="LN544"></a><span class='Declare_Function'>ExecCopySlotTuple</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN544"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execTuples.c.html#LN544"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we have a physical tuple (either format) then just copy it. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN131"><span class='Ref_to_Macro'>TTS_HAS_PHYSICAL_TUPLE</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN544"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <a href="../access/common/heaptuple.c.html#LN606"><span class='Ref_to_Func'>heap_copytuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN544"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN544"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="../../include/access/htup_details.h.html#LN820"><span class='Ref_to_Proto'>heap_tuple_from_minimal_tuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN544"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Otherwise we need to build a tuple from the Datum array. 
+     */ 
+</span>    <span class='Control'>return</span> <a href="../access/common/heaptuple.c.html#LN690"><span class='Ref_to_Func'>heap_form_tuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN544"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Delimiter'>, 
+</span>                           <a href="execTuples.c.html#LN544"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Delimiter'>, 
+</span>                           <a href="execTuples.c.html#LN544"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecCopySlotTuple &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecCopySlotMinimalTuple 
+ *          Obtain a copy of a slot's minimal physical tuple.  The copy is 
+ *          palloc'd in the current memory context. 
+ *          The slot itself is undisturbed. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/access/htup.h.html#LN26"><span class='Ref_to_Typedef'>MinimalTuple</span></a> 
+<a name="LN576"></a><span class='Declare_Function'>ExecCopySlotMinimalTuple</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN576"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execTuples.c.html#LN576"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we have a physical tuple then just copy it.  Prefer to copy 
+     * tts_mintuple since that's a tad cheaper. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN576"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="../../include/access/htup_details.h.html#LN819"><span class='Ref_to_Proto'>heap_copy_minimal_tuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN576"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN576"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="../../include/access/htup_details.h.html#LN821"><span class='Ref_to_Proto'>minimal_tuple_from_heap_tuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN576"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Otherwise we need to build a tuple from the Datum array. 
+     */ 
+</span>    <span class='Control'>return</span> <a href="../../include/access/htup_details.h.html#LN816"><span class='Ref_to_Proto'>heap_form_minimal_tuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN576"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Delimiter'>, 
+</span>                                   <a href="execTuples.c.html#LN576"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Delimiter'>, 
+</span>                                   <a href="execTuples.c.html#LN576"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecCopySlotMinimalTuple &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecFetchSlotTuple 
+ *          Fetch the slot's regular physical tuple. 
+ * 
+ *      If the slot contains a virtual tuple, we convert it to physical 
+ *      form.  The slot retains ownership of the physical tuple. 
+ *      If it contains a minimal tuple we convert to regular form and store 
+ *      that in addition to the minimal tuple (not instead of, because 
+ *      callers may hold pointers to Datums within the minimal tuple). 
+ * 
+ * The main difference between this and ExecMaterializeSlot() is that this 
+ * does not guarantee that the contained tuple is local storage. 
+ * Hence, the result must be treated as read-only. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> 
+<a name="LN617"></a><span class='Declare_Function'>ExecFetchSlotTuple</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN617"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execTuples.c.html#LN617"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we have a regular physical tuple then just return it. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN131"><span class='Ref_to_Macro'>TTS_HAS_PHYSICAL_TUPLE</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN617"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <a href="execTuples.c.html#LN617"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Otherwise materialize the slot... 
+     */ 
+</span>    <span class='Control'>return</span> <a href="../../include/executor/tuptable.h.html#LN162"><span class='Ref_to_Proto'>ExecMaterializeSlot</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN617"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecFetchSlotTuple &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecFetchSlotMinimalTuple 
+ *          Fetch the slot's minimal physical tuple. 
+ * 
+ *      If the slot contains a virtual tuple, we convert it to minimal 
+ *      physical form.  The slot retains ownership of the minimal tuple. 
+ *      If it contains a regular tuple we convert to minimal form and store 
+ *      that in addition to the regular tuple (not instead of, because 
+ *      callers may hold pointers to Datums within the regular tuple). 
+ * 
+ * As above, the result must be treated as read-only. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/access/htup.h.html#LN26"><span class='Ref_to_Typedef'>MinimalTuple</span></a> 
+<a name="LN651"></a><span class='Declare_Function'>ExecFetchSlotMinimalTuple</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN653"></a>    <a href="../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldContext</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN651"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execTuples.c.html#LN651"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we have a minimal physical tuple (local or not) then just return it. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN651"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="execTuples.c.html#LN651"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Otherwise, copy or build a minimal tuple, and store it into the slot. 
+     * 
+     * We may be called in a context that is shorter-lived than the tuple 
+     * slot, but we have to ensure that the materialized tuple will survive 
+     * anyway. 
+     */ 
+</span>    <a href="execTuples.c.html#LN653"><span class='Ref_To_Local'>oldContext</span></a> <span class='Operator'>= </span><a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN651"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN121"><span class='Ref_to_Member'>tts_mcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN651"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN158"><span class='Ref_to_Proto'>ExecCopySlotMinimalTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN651"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN651"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN117"><span class='Ref_to_Member'>tts_shouldFreeMin</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN653"><span class='Ref_To_Local'>oldContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Note: we may now have a situation where we have a local minimal tuple 
+     * attached to a virtual or non-local physical tuple.  There seems no harm 
+     * in that at the moment, but if any materializes, we should change this 
+     * function to force the slot into minimal-tuple-only state. 
+     */ 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN651"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecFetchSlotMinimalTuple &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecFetchSlotTupleDatum 
+ *          Fetch the slot's tuple as a composite-type Datum. 
+ * 
+ *      The result is always freshly palloc'd in the caller's memory context. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN697"></a><span class='Declare_Function'>ExecFetchSlotTupleDatum</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN699"></a>    <a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>tup</span><span class='Delimiter'>; 
+</span><a name="LN700"></a>    <a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a>   <span class='Declare_Local'>tupdesc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Fetch slot's contents in regular-physical-tuple form */ 
+</span>    <a href="execTuples.c.html#LN699"><span class='Ref_To_Local'>tup</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN159"><span class='Ref_to_Proto'>ExecFetchSlotTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN697"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN700"><span class='Ref_To_Local'>tupdesc</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN697"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Convert to Datum form */ 
+</span>    <span class='Control'>return</span> <a href="../access/common/heaptuple.c.html#LN654"><span class='Ref_to_Func'>heap_copy_tuple_as_datum</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN699"><span class='Ref_To_Local'>tup</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN700"><span class='Ref_To_Local'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecMaterializeSlot 
+ *          Force a slot into the "materialized" state. 
+ * 
+ *      This causes the slot's tuple to be a local copy not dependent on 
+ *      any external storage.  A pointer to the contained tuple is returned. 
+ * 
+ *      A typical use for this operation is to prepare a computed tuple 
+ *      for being stored on disk.  The original data may or may not be 
+ *      virtual, but in any case we need a private copy for heap_insert 
+ *      to scribble on. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> 
+<a name="LN724"></a><span class='Declare_Function'>ExecMaterializeSlot</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN726"></a>    <a href="../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldContext</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * sanity checks 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we have a regular physical tuple, and it's locally palloc'd, we have 
+     * nothing to do. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a> <span class='Operator'>&& </span><a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN116"><span class='Ref_to_Member'>tts_shouldFree</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Otherwise, copy or build a physical tuple, and store it into the slot. 
+     * 
+     * We may be called in a context that is shorter-lived than the tuple 
+     * slot, but we have to ensure that the materialized tuple will survive 
+     * anyway. 
+     */ 
+</span>    <a href="execTuples.c.html#LN726"><span class='Ref_To_Local'>oldContext</span></a> <span class='Operator'>= </span><a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN121"><span class='Ref_to_Member'>tts_mcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN157"><span class='Ref_to_Proto'>ExecCopySlotTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN116"><span class='Ref_to_Member'>tts_shouldFree</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN726"><span class='Ref_To_Local'>oldContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Drop the pin on the referenced buffer, if there is one. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a><span class='Parentheses'>))</span> 
+        <a href="../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN122"><span class='Ref_to_Member'>tts_buffer</span></a> <span class='Operator'>= </span><a href="../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Mark extracted state invalid.  This is important because the slot is 
+     * not supposed to depend any more on the previous external data; we 
+     * mustn't leave any dangling pass-by-reference datums in tts_values. 
+     * However, we have not actually invalidated any such datums, if there 
+     * happen to be any previously fetched from the slot.  (Note in particular 
+     * that we have not pfree'd tts_mintuple, if there is one.) 
+     */ 
+</span>    <a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN123"><span class='Ref_to_Member'>tts_nvalid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * On the same principle of not depending on previous remote storage, 
+     * forget the mintuple if it's not local storage.  (If it is local 
+     * storage, we must not pfree it now, since callers might have already 
+     * fetched datum pointers referencing it.) 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN117"><span class='Ref_to_Member'>tts_shouldFreeMin</span></a><span class='Parentheses'>) 
+</span>        <a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN126"><span class='Ref_to_Member'>tts_mintuple</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN724"><span class='Ref_to_Parameter'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN119"><span class='Ref_to_Member'>tts_tuple</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecMaterializeSlot &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecCopySlot 
+ *          Copy the source slot's contents into the destination slot. 
+ * 
+ *      The destination acquires a private copy that will not go away 
+ *      if the source is cleared. 
+ * 
+ *      The caller must ensure the slots have compatible tupdescs. 
+ * -------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN794"></a><span class='Declare_Function'>ExecCopySlot</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>dstslot</span><span class='Delimiter'>, </span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>srcslot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN796"></a>    <a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>newTuple</span><span class='Delimiter'>; 
+</span><a name="LN797"></a>    <a href="../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldContext</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * There might be ways to optimize this when the source is virtual, but 
+     * for now just always build a physical copy.  Make sure it is in the 
+     * right context. 
+     */ 
+</span>    <a href="execTuples.c.html#LN797"><span class='Ref_To_Local'>oldContext</span></a> <span class='Operator'>= </span><a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN794"><span class='Ref_to_Parameter'>dstslot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN121"><span class='Ref_to_Member'>tts_mcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN796"><span class='Ref_To_Local'>newTuple</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN157"><span class='Ref_to_Proto'>ExecCopySlotTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN794"><span class='Ref_to_Parameter'>srcslot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN797"><span class='Ref_To_Local'>oldContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../include/executor/tuptable.h.html#LN147"><span class='Ref_to_Proto'>ExecStoreTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN796"><span class='Ref_To_Local'>newTuple</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN794"><span class='Ref_to_Parameter'>dstslot</span></a><span class='Delimiter'>, </span><a href="../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *              convenience initialization routines 
+ * ---------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      ExecInit{Result,Scan,Extra}TupleSlot 
+ * 
+ *      These are convenience routines to initialize the specified slot 
+ *      in nodes inheriting the appropriate state.  ExecInitExtraTupleSlot 
+ *      is used for initializing special-purpose slots. 
+ * -------------------------------- 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      ExecInitResultTupleSlot 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN831"></a><span class='Declare_Function'>ExecInitResultTupleSlot</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>planstate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="execTuples.c.html#LN831"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN841"><span class='Ref_to_Member'>ps_ResultTupleSlot</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN135"><span class='Ref_to_Func'>ExecAllocTableSlot</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execTuples.c.html#LN831"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN449"><span class='Ref_to_Member'>es_tupleTable</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      ExecInitScanTupleSlot 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN841"></a><span class='Declare_Function'>ExecInitScanTupleSlot</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><a href="../../include/nodes/execnodes.h.html#LN1055"><span class='Ref_to_Struct'>ScanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>scanstate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="execTuples.c.html#LN841"><span class='Ref_to_Parameter'>scanstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1060"><span class='Ref_to_Member'>ss_ScanTupleSlot</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN135"><span class='Ref_to_Func'>ExecAllocTableSlot</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execTuples.c.html#LN841"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN449"><span class='Ref_to_Member'>es_tupleTable</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      ExecInitExtraTupleSlot 
+ * ---------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN851"></a><span class='Declare_Function'>ExecInitExtraTupleSlot</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="execTuples.c.html#LN135"><span class='Ref_to_Func'>ExecAllocTableSlot</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execTuples.c.html#LN851"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN449"><span class='Ref_to_Member'>es_tupleTable</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      ExecInitNullTupleSlot 
+ * 
+ * Build a slot containing an all-nulls tuple of the given type. 
+ * This is used as a substitute for an input tuple when performing an 
+ * outer join. 
+ * ---------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN865"></a><span class='Declare_Function'>ExecInitNullTupleSlot</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> <span class='Declare_Parameter'>tupType</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN867"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN402"><span class='Ref_to_Proto'>ExecInitExtraTupleSlot</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN865"><span class='Ref_to_Parameter'>estate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/executor/tuptable.h.html#LN146"><span class='Ref_to_Proto'>ExecSetSlotDescriptor</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN867"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN865"><span class='Ref_to_Parameter'>tupType</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../include/executor/tuptable.h.html#LN156"><span class='Ref_to_Proto'>ExecStoreAllNullTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN867"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecTypeFromTL 
+ * 
+ *      Generate a tuple descriptor for the result tuple of a targetlist. 
+ *      (A parse/plan tlist must be passed, not an ExprState tlist.) 
+ *      Note that resjunk columns, if any, are included in the result. 
+ * 
+ *      Currently there are about 4 different places where we create 
+ *      TupleDescriptors.  They should all be merged, or perhaps 
+ *      be rewritten to call BuildDesc(). 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> 
+<a name="LN887"></a><span class='Declare_Function'>ExecTypeFromTL</span><span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>targetList</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>hasoid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="execTuples.c.html#LN94"><span class='Ref_to_Proto'>ExecTypeFromTLInternal</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN887"><span class='Ref_to_Parameter'>targetList</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN887"><span class='Ref_to_Parameter'>hasoid</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecCleanTypeFromTL 
+ * 
+ *      Same as above, but resjunk columns are omitted from the result. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> 
+<a name="LN899"></a><span class='Declare_Function'>ExecCleanTypeFromTL</span><span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>targetList</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>hasoid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="execTuples.c.html#LN94"><span class='Ref_to_Proto'>ExecTypeFromTLInternal</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN899"><span class='Ref_to_Parameter'>targetList</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN899"><span class='Ref_to_Parameter'>hasoid</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>static </span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> 
+<a name="LN905"></a><span class='Declare_Function'>ExecTypeFromTLInternal</span><span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>targetList</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>hasoid</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>skipjunk</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN907"></a>    <a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a>   <span class='Declare_Local'>typeInfo</span><span class='Delimiter'>; 
+</span><a name="LN908"></a>    <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>l</span><span class='Delimiter'>; 
+</span><a name="LN909"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>len</span><span class='Delimiter'>; 
+</span><a name="LN910"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>cur_resno</span> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN905"><span class='Ref_to_Parameter'>skipjunk</span></a><span class='Parentheses'>) 
+</span>        <a href="execTuples.c.html#LN909"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN502"><span class='Ref_to_Proto'>ExecCleanTargetListLength</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN905"><span class='Ref_to_Parameter'>targetList</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="execTuples.c.html#LN909"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN501"><span class='Ref_to_Proto'>ExecTargetListLength</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN905"><span class='Ref_to_Parameter'>targetList</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN907"><span class='Ref_To_Local'>typeInfo</span></a> <span class='Operator'>= </span><a href="../access/common/tupdesc.c.html#LN39"><span class='Ref_to_Func'>CreateTemplateTupleDesc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN909"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN905"><span class='Ref_to_Parameter'>hasoid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN908"><span class='Ref_To_Local'>l</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN905"><span class='Ref_to_Parameter'>targetList</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN920"></a>        <a href="../../include/nodes/primnodes.h.html#LN1363"><span class='Ref_to_Struct'>TargetEntry</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tle</span> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN908"><span class='Ref_To_Local'>l</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN905"><span class='Ref_to_Parameter'>skipjunk</span></a> <span class='Operator'>&& </span><a href="execTuples.c.html#LN920"><span class='Ref_To_Local'>tle</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/primnodes.h.html#LN1373"><span class='Ref_to_Member'>resjunk</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <a href="../../include/access/tupdesc.h.html#LN114"><span class='Ref_to_Proto'>TupleDescInitEntry</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN907"><span class='Ref_To_Local'>typeInfo</span></a><span class='Delimiter'>, 
+</span>                           <a href="execTuples.c.html#LN910"><span class='Ref_To_Local'>cur_resno</span></a><span class='Delimiter'>, 
+</span>                           <a href="execTuples.c.html#LN920"><span class='Ref_To_Local'>tle</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/primnodes.h.html#LN1368"><span class='Ref_to_Member'>resname</span></a><span class='Delimiter'>, 
+</span>                           <a href="../../include/nodes/nodeFuncs.h.html#LN31"><span class='Ref_to_Proto'>exprType</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execTuples.c.html#LN920"><span class='Ref_To_Local'>tle</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/primnodes.h.html#LN1366"><span class='Ref_to_Member'>expr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                           <a href="../../include/nodes/nodeFuncs.h.html#LN32"><span class='Ref_to_Proto'>exprTypmod</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execTuples.c.html#LN920"><span class='Ref_To_Local'>tle</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/primnodes.h.html#LN1366"><span class='Ref_to_Member'>expr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                           <span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/access/tupdesc.h.html#LN128"><span class='Ref_to_Proto'>TupleDescInitEntryCollation</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN907"><span class='Ref_To_Local'>typeInfo</span></a><span class='Delimiter'>, 
+</span>                                    <a href="execTuples.c.html#LN910"><span class='Ref_To_Local'>cur_resno</span></a><span class='Delimiter'>, 
+</span>                                    <a href="../../include/nodes/nodeFuncs.h.html#LN38"><span class='Ref_to_Proto'>exprCollation</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execTuples.c.html#LN920"><span class='Ref_To_Local'>tle</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/primnodes.h.html#LN1366"><span class='Ref_to_Member'>expr</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="execTuples.c.html#LN910"><span class='Ref_To_Local'>cur_resno</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN907"><span class='Ref_To_Local'>typeInfo</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecTypeFromTLInternal &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ExecTypeFromExprList - build a tuple descriptor from a list of Exprs 
+ * 
+ * This is roughly like ExecTypeFromTL, but we work from bare expressions 
+ * not TargetEntrys.  No names are attached to the tupledesc's columns. 
+ */ 
+</span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> 
+<a name="LN946"></a><span class='Declare_Function'>ExecTypeFromExprList</span><span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>exprList</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN948"></a>    <a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a>   <span class='Declare_Local'>typeInfo</span><span class='Delimiter'>; 
+</span><a name="LN949"></a>    <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>lc</span><span class='Delimiter'>; 
+</span><a name="LN950"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>cur_resno</span> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN948"><span class='Ref_To_Local'>typeInfo</span></a> <span class='Operator'>= </span><a href="../access/common/tupdesc.c.html#LN39"><span class='Ref_to_Func'>CreateTemplateTupleDesc</span></a><span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN946"><span class='Ref_to_Parameter'>exprList</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN949"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN946"><span class='Ref_to_Parameter'>exprList</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN956"></a>        <a href="../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>e</span> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN949"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/access/tupdesc.h.html#LN114"><span class='Ref_to_Proto'>TupleDescInitEntry</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN948"><span class='Ref_To_Local'>typeInfo</span></a><span class='Delimiter'>, 
+</span>                           <a href="execTuples.c.html#LN950"><span class='Ref_To_Local'>cur_resno</span></a><span class='Delimiter'>, 
+</span>                           <span class='Null_Value'>NULL</span><span class='Delimiter'>, 
+</span>                           <a href="../../include/nodes/nodeFuncs.h.html#LN31"><span class='Ref_to_Proto'>exprType</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN956"><span class='Ref_To_Local'>e</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                           <a href="../../include/nodes/nodeFuncs.h.html#LN32"><span class='Ref_to_Proto'>exprTypmod</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN956"><span class='Ref_To_Local'>e</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                           <span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/access/tupdesc.h.html#LN128"><span class='Ref_to_Proto'>TupleDescInitEntryCollation</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN948"><span class='Ref_To_Local'>typeInfo</span></a><span class='Delimiter'>, 
+</span>                                    <a href="execTuples.c.html#LN950"><span class='Ref_To_Local'>cur_resno</span></a><span class='Delimiter'>, 
+</span>                                    <a href="../../include/nodes/nodeFuncs.h.html#LN38"><span class='Ref_to_Proto'>exprCollation</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN956"><span class='Ref_To_Local'>e</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="execTuples.c.html#LN950"><span class='Ref_To_Local'>cur_resno</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN948"><span class='Ref_To_Local'>typeInfo</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecTypeFromExprList &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ExecTypeSetColNames - set column names in a TupleDesc 
+ * 
+ * Column names must be provided as an alias list (list of String nodes). 
+ * 
+ * For some callers, the supplied tupdesc has a named rowtype (not RECORD) 
+ * and it is moderately likely that the alias list matches the column names 
+ * already present in the tupdesc.  If we do change any column names then 
+ * we must reset the tupdesc's type to anonymous RECORD; but we avoid doing 
+ * so if no names change. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN985"></a><span class='Declare_Function'>ExecTypeSetColNames</span><span class='Parentheses'>(</span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> <span class='Declare_Parameter'>typeInfo</span><span class='Delimiter'>, </span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>namesList</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN987"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>modified</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN988"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>colno</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN989"></a>    <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>lc</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN989"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN985"><span class='Ref_to_Parameter'>namesList</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN993"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>cname</span> <span class='Operator'>= </span><a href="../../include/nodes/value.h.html#LN53"><span class='Ref_to_Macro'>strVal</span></a><span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN989"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span><a name="LN994"></a>        <a href="../../include/catalog/pg_attribute.h.html#LN186"><span class='Ref_to_Typedef'>Form_pg_attribute</span></a> <span class='Declare_Local'>attr</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Guard against too-long names list */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN988"><span class='Ref_To_Local'>colno</span></a> <span class='Operator'>&GT;= </span><a href="execTuples.c.html#LN985"><span class='Ref_to_Parameter'>typeInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN72"><span class='Ref_to_Member'>natts</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <a href="execTuples.c.html#LN994"><span class='Ref_To_Local'>attr</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN985"><span class='Ref_to_Parameter'>typeInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN73"><span class='Ref_to_Member'>attrs</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN988"><span class='Ref_To_Local'>colno</span></a><span class='Operator'>++</span><span class='Delimiter'>]; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Ignore empty aliases (these must be for dropped columns) */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN993"><span class='Ref_To_Local'>cname</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='String'>'\0'</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Change tupdesc only if alias is actually different */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="execTuples.c.html#LN993"><span class='Ref_To_Local'>cname</span></a><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN994"><span class='Ref_To_Local'>attr</span></a><span class='Operator'>-&GT;</span>attname<span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../include/utils/builtins.h.html#LN40"><span class='Ref_to_Proto'>namestrcpy</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="execTuples.c.html#LN994"><span class='Ref_To_Local'>attr</span></a><span class='Operator'>-&GT;</span>attname<span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="execTuples.c.html#LN993"><span class='Ref_To_Local'>cname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="execTuples.c.html#LN987"><span class='Ref_To_Local'>modified</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* If we modified the tupdesc, it's now a new record type */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN987"><span class='Ref_To_Local'>modified</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="execTuples.c.html#LN985"><span class='Ref_to_Parameter'>typeInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN76"><span class='Ref_to_Member'>tdtypeid</span></a> <span class='Operator'>= </span><a href="../../include/catalog/pg_type.h.html#LN679"><span class='Ref_to_Const'>RECORDOID</span></a><span class='Delimiter'>; 
+</span>        <a href="execTuples.c.html#LN985"><span class='Ref_to_Parameter'>typeInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN77"><span class='Ref_to_Member'>tdtypmod</span></a> <span class='Operator'>= -</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end ExecTypeSetColNames &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * BlessTupleDesc - make a completed tuple descriptor useful for SRFs 
+ * 
+ * Rowtype Datums returned by a function must contain valid type information. 
+ * This happens "for free" if the tupdesc came from a relcache entry, but 
+ * not if we have manufactured a tupdesc for a transient RECORD datatype. 
+ * In that case we have to notify typcache.c of the existence of the type. 
+ */ 
+</span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> 
+<a name="LN1030"></a><span class='Declare_Function'>BlessTupleDesc</span><span class='Parentheses'>(</span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> <span class='Declare_Parameter'>tupdesc</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN1030"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN76"><span class='Ref_to_Member'>tdtypeid</span></a> <span class='Operator'>== </span><a href="../../include/catalog/pg_type.h.html#LN679"><span class='Ref_to_Const'>RECORDOID</span></a> <span class='Operator'>&& 
+</span>        <a href="execTuples.c.html#LN1030"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN77"><span class='Ref_to_Member'>tdtypmod</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/typcache.h.html#LN158"><span class='Ref_to_Proto'>assign_record_type_typmod</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1030"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN1030"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Delimiter'>;</span>             <span class='Comment_Single_Line'>/* just for notational convenience */ 
+</span><span class='Delimiter'>} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * TupleDescGetSlot - Initialize a slot based on the supplied tupledesc 
+ * 
+ * Note: this is obsolete; it is sufficient to call BlessTupleDesc on 
+ * the tupdesc.  We keep it around just for backwards compatibility with 
+ * existing user-written SRFs. 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN1047"></a><span class='Declare_Function'>TupleDescGetSlot</span><span class='Parentheses'>(</span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> <span class='Declare_Parameter'>tupdesc</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1049"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* The useful work is here */ 
+</span>    <a href="../../include/funcapi.h.html#LN229"><span class='Ref_to_Proto'>BlessTupleDesc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1047"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Make a standalone slot */ 
+</span>    <a href="execTuples.c.html#LN1049"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN144"><span class='Ref_to_Proto'>MakeSingleTupleTableSlot</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1047"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Return the slot */ 
+</span>    <span class='Control'>return</span> <a href="execTuples.c.html#LN1049"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * TupleDescGetAttInMetadata - Build an AttInMetadata structure based on the 
+ * supplied TupleDesc. AttInMetadata can be used in conjunction with C strings 
+ * to produce a properly formed tuple. 
+ */ 
+</span><a href="../../include/funcapi.h.html#LN34"><span class='Ref_to_Struct'>AttInMetadata</span></a> <span class='Operator'>* 
+</span><a name="LN1067"></a><span class='Declare_Function'>TupleDescGetAttInMetadata</span><span class='Parentheses'>(</span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> <span class='Declare_Parameter'>tupdesc</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1069"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>natts</span> <span class='Operator'>= </span><a href="execTuples.c.html#LN1067"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN72"><span class='Ref_to_Member'>natts</span></a><span class='Delimiter'>; 
+</span><a name="LN1070"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN1071"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>atttypeid</span><span class='Delimiter'>; 
+</span><a name="LN1072"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>attinfuncid</span><span class='Delimiter'>; 
+</span><a name="LN1073"></a>    <a href="../../include/fmgr.h.html#LN55"><span class='Ref_to_Struct'>FmgrInfo</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>attinfuncinfo</span><span class='Delimiter'>; 
+</span><a name="LN1074"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>        <span class='Operator'>*</span><span class='Declare_Local'>attioparams</span><span class='Delimiter'>; 
+</span><a name="LN1075"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>atttypmods</span><span class='Delimiter'>; 
+</span><a name="LN1076"></a>    <a href="../../include/funcapi.h.html#LN34"><span class='Ref_to_Struct'>AttInMetadata</span></a> <span class='Operator'>*</span><span class='Declare_Local'>attinmeta</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN1076"><span class='Ref_To_Local'>attinmeta</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/funcapi.h.html#LN34"><span class='Ref_to_Struct'>AttInMetadata</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/funcapi.h.html#LN34"><span class='Ref_to_Struct'>AttInMetadata</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* "Bless" the tupledesc so that we can make rowtype datums with it */ 
+</span>    <a href="execTuples.c.html#LN1076"><span class='Ref_To_Local'>attinmeta</span></a><span class='Operator'>-&GT;</span><a href="../../include/funcapi.h.html#LN37"><span class='Ref_to_Member'>tupdesc</span></a> <span class='Operator'>= </span><a href="../../include/funcapi.h.html#LN229"><span class='Ref_to_Proto'>BlessTupleDesc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1067"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Gather info needed later to call the "in" function for each attribute 
+     */ 
+</span>    <a href="execTuples.c.html#LN1073"><span class='Ref_To_Local'>attinfuncinfo</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN55"><span class='Ref_to_Struct'>FmgrInfo</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1069"><span class='Ref_To_Local'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN55"><span class='Ref_to_Struct'>FmgrInfo</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN1074"><span class='Ref_To_Local'>attioparams</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1069"><span class='Ref_To_Local'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN1075"><span class='Ref_To_Local'>atttypmods</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1069"><span class='Ref_To_Local'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN1070"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execTuples.c.html#LN1070"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execTuples.c.html#LN1069"><span class='Ref_To_Local'>natts</span></a><span class='Delimiter'>; </span><a href="execTuples.c.html#LN1070"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Ignore dropped attributes */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execTuples.c.html#LN1067"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN73"><span class='Ref_to_Member'>attrs</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1070"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span>attisdropped<span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="execTuples.c.html#LN1071"><span class='Ref_To_Local'>atttypeid</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN1067"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN73"><span class='Ref_to_Member'>attrs</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1070"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span>atttypid<span class='Delimiter'>; 
+</span>            <a href="../../include/utils/lsyscache.h.html#LN161"><span class='Ref_to_Proto'>getTypeInputInfo</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1071"><span class='Ref_To_Local'>atttypeid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execTuples.c.html#LN1072"><span class='Ref_To_Local'>attinfuncid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execTuples.c.html#LN1074"><span class='Ref_To_Local'>attioparams</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1070"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../include/fmgr.h.html#LN92"><span class='Ref_to_Proto'>fmgr_info</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1072"><span class='Ref_To_Local'>attinfuncid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execTuples.c.html#LN1073"><span class='Ref_To_Local'>attinfuncinfo</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1070"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="execTuples.c.html#LN1075"><span class='Ref_To_Local'>atttypmods</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1070"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="execTuples.c.html#LN1067"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN73"><span class='Ref_to_Member'>attrs</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1070"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span>atttypmod<span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="execTuples.c.html#LN1076"><span class='Ref_To_Local'>attinmeta</span></a><span class='Operator'>-&GT;</span><a href="../../include/funcapi.h.html#LN40"><span class='Ref_to_Member'>attinfuncs</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN1073"><span class='Ref_To_Local'>attinfuncinfo</span></a><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN1076"><span class='Ref_To_Local'>attinmeta</span></a><span class='Operator'>-&GT;</span><a href="../../include/funcapi.h.html#LN43"><span class='Ref_to_Member'>attioparams</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN1074"><span class='Ref_To_Local'>attioparams</span></a><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN1076"><span class='Ref_To_Local'>attinmeta</span></a><span class='Operator'>-&GT;</span><a href="../../include/funcapi.h.html#LN46"><span class='Ref_to_Member'>atttypmods</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN1075"><span class='Ref_To_Local'>atttypmods</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN1076"><span class='Ref_To_Local'>attinmeta</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TupleDescGetAttInMetadata &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * BuildTupleFromCStrings - build a HeapTuple given user data in C string form. 
+ * values is an array of C strings, one for each attribute of the return tuple. 
+ * A NULL string pointer indicates we want to create a NULL field. 
+ */ 
+</span><a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> 
+<a name="LN1114"></a><span class='Declare_Function'>BuildTupleFromCStrings</span><span class='Parentheses'>(</span><a href="../../include/funcapi.h.html#LN34"><span class='Ref_to_Struct'>AttInMetadata</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>attinmeta</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>values</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1116"></a>    <a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a>   <span class='Declare_Local'>tupdesc</span> <span class='Operator'>= </span><a href="execTuples.c.html#LN1114"><span class='Ref_to_Parameter'>attinmeta</span></a><span class='Operator'>-&GT;</span><a href="../../include/funcapi.h.html#LN37"><span class='Ref_to_Member'>tupdesc</span></a><span class='Delimiter'>; 
+</span><a name="LN1117"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>natts</span> <span class='Operator'>= </span><a href="execTuples.c.html#LN1116"><span class='Ref_To_Local'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN72"><span class='Ref_to_Member'>natts</span></a><span class='Delimiter'>; 
+</span><a name="LN1118"></a>    <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>dvalues</span><span class='Delimiter'>; 
+</span><a name="LN1119"></a>    <span class='Keyword'>bool</span>       <span class='Operator'>*</span><span class='Declare_Local'>nulls</span><span class='Delimiter'>; 
+</span><a name="LN1120"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN1121"></a>    <a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>tuple</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN1118"><span class='Ref_To_Local'>dvalues</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1117"><span class='Ref_To_Local'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN1119"><span class='Ref_To_Local'>nulls</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1117"><span class='Ref_To_Local'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>bool</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Call the "in" function for each non-dropped attribute */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execTuples.c.html#LN1117"><span class='Ref_To_Local'>natts</span></a><span class='Delimiter'>; </span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execTuples.c.html#LN1116"><span class='Ref_To_Local'>tupdesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN73"><span class='Ref_to_Member'>attrs</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span>attisdropped<span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Non-dropped attributes */ 
+</span>            <a href="execTuples.c.html#LN1118"><span class='Ref_To_Local'>dvalues</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN642"><span class='Ref_to_Proto'>InputFunctionCall</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execTuples.c.html#LN1114"><span class='Ref_to_Parameter'>attinmeta</span></a><span class='Operator'>-&GT;</span><a href="../../include/funcapi.h.html#LN40"><span class='Ref_to_Member'>attinfuncs</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                                           <a href="execTuples.c.html#LN1114"><span class='Ref_to_Parameter'>values</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                                           <a href="execTuples.c.html#LN1114"><span class='Ref_to_Parameter'>attinmeta</span></a><span class='Operator'>-&GT;</span><a href="../../include/funcapi.h.html#LN43"><span class='Ref_to_Member'>attioparams</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                                           <a href="execTuples.c.html#LN1114"><span class='Ref_to_Parameter'>attinmeta</span></a><span class='Operator'>-&GT;</span><a href="../../include/funcapi.h.html#LN46"><span class='Ref_to_Member'>atttypmods</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN1114"><span class='Ref_to_Parameter'>values</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>                <a href="execTuples.c.html#LN1119"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="execTuples.c.html#LN1119"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Handle dropped attributes by setting to NULL */ 
+</span>            <a href="execTuples.c.html#LN1118"><span class='Ref_To_Local'>dvalues</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>) </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <a href="execTuples.c.html#LN1119"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><a href="execTuples.c.html#LN1120"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;natts;i++ &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Form a tuple 
+     */ 
+</span>    <a href="execTuples.c.html#LN1121"><span class='Ref_To_Local'>tuple</span></a> <span class='Operator'>= </span><a href="../access/common/heaptuple.c.html#LN690"><span class='Ref_to_Func'>heap_form_tuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1116"><span class='Ref_To_Local'>tupdesc</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1118"><span class='Ref_To_Local'>dvalues</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1119"><span class='Ref_To_Local'>nulls</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Release locally palloc'd space.  XXX would probably be good to pfree 
+     * values of pass-by-reference datums, as well. 
+     */ 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1118"><span class='Ref_To_Local'>dvalues</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1119"><span class='Ref_To_Local'>nulls</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN1121"><span class='Ref_To_Local'>tuple</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end BuildTupleFromCStrings &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * HeapTupleHeaderGetDatum - convert a HeapTupleHeader pointer to a Datum. 
+ * 
+ * This must *not* get applied to an on-disk tuple; the tuple should be 
+ * freshly made by heap_form_tuple or some wrapper routine for it (such as 
+ * BuildTupleFromCStrings).  Be sure also that the tupledesc used to build 
+ * the tuple has a properly "blessed" rowtype. 
+ * 
+ * Formerly this was a macro equivalent to PointerGetDatum, relying on the 
+ * fact that heap_form_tuple fills in the appropriate tuple header fields 
+ * for a composite Datum.  However, we now require that composite Datums not 
+ * contain any external TOAST pointers.  We do not want heap_form_tuple itself 
+ * to enforce that; more specifically, the rule applies only to actual Datums 
+ * and not to HeapTuple structures.  Therefore, HeapTupleHeaderGetDatum is 
+ * now a function that detects whether there are externally-toasted fields 
+ * and constructs a new tuple with inlined fields if so.  We still need 
+ * heap_form_tuple to insert the Datum header fields, because otherwise this 
+ * code would have no way to obtain a tupledesc for the tuple. 
+ * 
+ * Note that if we do build a new tuple, it's palloc'd in the current 
+ * memory context.  Beware of code that changes context between the initial 
+ * heap_form_tuple/etc call and calling HeapTuple(Header)GetDatum. 
+ * 
+ * For performance-critical callers, it could be worthwhile to take extra 
+ * steps to ensure that there aren't TOAST pointers in the output of 
+ * heap_form_tuple to begin with.  It's likely however that the costs of the 
+ * typcache lookup and tuple disassembly/reassembly are swamped by TOAST 
+ * dereference costs, so that the benefits of such extra effort would be 
+ * minimal. 
+ * 
+ * XXX it would likely be better to create wrapper functions that produce 
+ * a composite Datum from the field values in one step.  However, there's 
+ * enough code using the existing APIs that we couldn't get rid of this 
+ * hack anytime soon. 
+ */ 
+</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN1200"></a><span class='Declare_Function'>HeapTupleHeaderGetDatum</span><span class='Parentheses'>(</span><a href="../../include/access/htup.h.html#LN22"><span class='Ref_to_Typedef'>HeapTupleHeader</span></a> <span class='Declare_Parameter'>tuple</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1202"></a>    <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span><a name="LN1203"></a>    <a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a>   <span class='Declare_Local'>tupDesc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* No work if there are no external TOAST pointers in the tuple */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/access/htup_details.h.html#LN539"><span class='Ref_to_Macro'>HeapTupleHeaderHasExternal</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1200"><span class='Ref_to_Parameter'>tuple</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <a href="../../include/postgres.h.html#LN561"><span class='Ref_to_Macro'>PointerGetDatum</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1200"><span class='Ref_to_Parameter'>tuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Use the type data saved by heap_form_tuple to look up the rowtype */ 
+</span>    <a href="execTuples.c.html#LN1203"><span class='Ref_To_Local'>tupDesc</span></a> <span class='Operator'>= </span><a href="../../include/utils/typcache.h.html#LN151"><span class='Ref_to_Proto'>lookup_rowtype_tupdesc</span></a><span class='Parentheses'>(</span><a href="../../include/access/htup_details.h.html#LN444"><span class='Ref_to_Macro'>HeapTupleHeaderGetTypeId</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1200"><span class='Ref_to_Parameter'>tuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                     <a href="../../include/access/htup_details.h.html#LN454"><span class='Ref_to_Macro'>HeapTupleHeaderGetTypMod</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1200"><span class='Ref_to_Parameter'>tuple</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* And do the flattening */ 
+</span>    <a href="execTuples.c.html#LN1202"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/access/tuptoaster.h.html#LN191"><span class='Ref_to_Proto'>toast_flatten_tuple_to_datum</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1200"><span class='Ref_to_Parameter'>tuple</span></a><span class='Delimiter'>, 
+</span>                                        <a href="../../include/access/htup_details.h.html#LN438"><span class='Ref_to_Macro'>HeapTupleHeaderGetDatumLength</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1200"><span class='Ref_to_Parameter'>tuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                          <a href="execTuples.c.html#LN1203"><span class='Ref_To_Local'>tupDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/access/tupdesc.h.html#LN106"><span class='Ref_to_Macro'>ReleaseTupleDesc</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1203"><span class='Ref_To_Local'>tupDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN1202"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end HeapTupleHeaderGetDatum &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Functions for sending tuples to the frontend (or other specified destination) 
+ * as though it is a SELECT result. These are used by utility commands that 
+ * need to project directly to the destination and don't need or want full 
+ * table function capability. Currently used by EXPLAIN and SHOW ALL. 
+ */ 
+</span><a href="../../include/executor/executor.h.html#LN411"><span class='Ref_to_Struct'>TupOutputState</span></a> <span class='Operator'>* 
+</span><a name="LN1231"></a><span class='Declare_Function'>begin_tup_output_tupdesc</span><span class='Parentheses'>(</span><a href="../../include/tcop/dest.h.html#LN112"><span class='Ref_to_Typedef'>DestReceiver</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>dest</span><span class='Delimiter'>, </span><a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a> <span class='Declare_Parameter'>tupdesc</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1233"></a>    <a href="../../include/executor/executor.h.html#LN411"><span class='Ref_to_Struct'>TupOutputState</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tstate</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN1233"><span class='Ref_To_Local'>tstate</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/executor/executor.h.html#LN411"><span class='Ref_to_Struct'>TupOutputState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/executor/executor.h.html#LN411"><span class='Ref_to_Struct'>TupOutputState</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="execTuples.c.html#LN1233"><span class='Ref_To_Local'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN413"><span class='Ref_to_Member'>slot</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN144"><span class='Ref_to_Proto'>MakeSingleTupleTableSlot</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1231"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execTuples.c.html#LN1233"><span class='Ref_To_Local'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN414"><span class='Ref_to_Member'>dest</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN1231"><span class='Ref_to_Parameter'>dest</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="execTuples.c.html#LN1233"><span class='Ref_To_Local'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN414"><span class='Ref_to_Member'>dest</span></a><span class='Operator'>-&GT;</span><a href="../../include/tcop/dest.h.html#LN120"><span class='Ref_to_Member'>rStartup</span></a><span class='Parentheses'>) (</span><a href="execTuples.c.html#LN1233"><span class='Ref_To_Local'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN414"><span class='Ref_to_Member'>dest</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="../../include/nodes/nodes.h.html#LN650"><span class='Ref_to_EnumConst'>CMD_SELECT</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1231"><span class='Ref_to_Parameter'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execTuples.c.html#LN1233"><span class='Ref_To_Local'>tstate</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * write a single tuple 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN1249"></a><span class='Declare_Function'>do_tup_output</span><span class='Parentheses'>(</span><a href="../../include/executor/executor.h.html#LN411"><span class='Ref_to_Struct'>TupOutputState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>tstate</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>values</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>isnull</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1251"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= </span><a href="execTuples.c.html#LN1249"><span class='Ref_to_Parameter'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN413"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>; 
+</span><a name="LN1252"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>natts</span> <span class='Operator'>= </span><a href="execTuples.c.html#LN1251"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN120"><span class='Ref_to_Member'>tts_tupleDescriptor</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/tupdesc.h.html#LN72"><span class='Ref_to_Member'>natts</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* make sure the slot is clear */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1251"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* insert data */ 
+</span>    memcpy<span class='Parentheses'>(</span><a href="execTuples.c.html#LN1251"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN124"><span class='Ref_to_Member'>tts_values</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1249"><span class='Ref_to_Parameter'>values</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1252"><span class='Ref_To_Local'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    memcpy<span class='Parentheses'>(</span><a href="execTuples.c.html#LN1251"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN125"><span class='Ref_to_Member'>tts_isnull</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1249"><span class='Ref_to_Parameter'>isnull</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1252"><span class='Ref_To_Local'>natts</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>bool</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* mark slot as containing a virtual tuple */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN155"><span class='Ref_to_Proto'>ExecStoreVirtualTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1251"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* send the tuple to the receiver */ 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) (</span><span class='Operator'>*</span><a href="execTuples.c.html#LN1249"><span class='Ref_to_Parameter'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN414"><span class='Ref_to_Member'>dest</span></a><span class='Operator'>-&GT;</span><a href="../../include/tcop/dest.h.html#LN117"><span class='Ref_to_Member'>receiveSlot</span></a><span class='Parentheses'>) (</span><a href="execTuples.c.html#LN1251"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1249"><span class='Ref_to_Parameter'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN414"><span class='Ref_to_Member'>dest</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* clean up */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1251"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end do_tup_output &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * write a chunk of text, breaking at newline characters 
+ * 
+ * Should only be used with a single-TEXT-attribute tupdesc. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN1277"></a><span class='Declare_Function'>do_text_output_multiline</span><span class='Parentheses'>(</span><a href="../../include/executor/executor.h.html#LN411"><span class='Ref_to_Struct'>TupOutputState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>tstate</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>txt</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1279"></a>    <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Local'>values</span><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span><a name="LN1280"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>isnull</span><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Delimiter'>{</span><span class='Boolean'>false</span><span class='Delimiter'>}; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="execTuples.c.html#LN1277"><span class='Ref_to_Parameter'>txt</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN1284"></a>        <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>eol</span><span class='Delimiter'>; 
+</span><a name="LN1285"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>len</span><span class='Delimiter'>; 
+</span> 
+        <a href="execTuples.c.html#LN1284"><span class='Ref_To_Local'>eol</span></a> <span class='Operator'>= </span>strchr<span class='Parentheses'>(</span><a href="execTuples.c.html#LN1277"><span class='Ref_to_Parameter'>txt</span></a><span class='Delimiter'>, </span><span class='String'>'\n'</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execTuples.c.html#LN1284"><span class='Ref_To_Local'>eol</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="execTuples.c.html#LN1285"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN1284"><span class='Ref_To_Local'>eol</span></a> <span class='Operator'>- </span><a href="execTuples.c.html#LN1277"><span class='Ref_to_Parameter'>txt</span></a><span class='Delimiter'>; 
+</span>            <a href="execTuples.c.html#LN1284"><span class='Ref_To_Local'>eol</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="execTuples.c.html#LN1285"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>= </span>strlen<span class='Parentheses'>(</span><a href="execTuples.c.html#LN1277"><span class='Ref_to_Parameter'>txt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="execTuples.c.html#LN1284"><span class='Ref_To_Local'>eol</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN1277"><span class='Ref_to_Parameter'>txt</span></a> <span class='Operator'>+ </span><a href="execTuples.c.html#LN1285"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="execTuples.c.html#LN1279"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../include/postgres.h.html#LN561"><span class='Ref_to_Macro'>PointerGetDatum</span></a><span class='Parentheses'>(</span><a href="../../include/utils/builtins.h.html#LN86"><span class='Ref_to_Proto'>cstring_to_text_with_len</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1277"><span class='Ref_to_Parameter'>txt</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1285"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="../../include/executor/executor.h.html#LN419"><span class='Ref_to_Proto'>do_tup_output</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1277"><span class='Ref_to_Parameter'>tstate</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1279"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>, </span><a href="execTuples.c.html#LN1280"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN554"><span class='Ref_to_Macro'>DatumGetPointer</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1279"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="execTuples.c.html#LN1277"><span class='Ref_to_Parameter'>txt</span></a> <span class='Operator'>= </span><a href="execTuples.c.html#LN1284"><span class='Ref_To_Local'>eol</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while *txt &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end do_text_output_multiline &raquo; </span> 
+ 
+<span class='Keyword'>void 
+</span><a name="LN1307"></a><span class='Declare_Function'>end_tup_output</span><span class='Parentheses'>(</span><a href="../../include/executor/executor.h.html#LN411"><span class='Ref_to_Struct'>TupOutputState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>tstate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="execTuples.c.html#LN1307"><span class='Ref_to_Parameter'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN414"><span class='Ref_to_Member'>dest</span></a><span class='Operator'>-&GT;</span><a href="../../include/tcop/dest.h.html#LN123"><span class='Ref_to_Member'>rShutdown</span></a><span class='Parentheses'>) (</span><a href="execTuples.c.html#LN1307"><span class='Ref_to_Parameter'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN414"><span class='Ref_to_Member'>dest</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* note that destroying the dest is not ours to do */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN145"><span class='Ref_to_Proto'>ExecDropSingleTupleTableSlot</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1307"><span class='Ref_to_Parameter'>tstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/executor.h.html#LN413"><span class='Ref_to_Member'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execTuples.c.html#LN1307"><span class='Ref_to_Parameter'>tstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

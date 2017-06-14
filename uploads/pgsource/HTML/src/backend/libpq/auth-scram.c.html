@@ -1,0 +1,1172 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\libpq\auth-scram.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\libpq\auth-scram.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:40 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * auth-scram.c 
+ *    Server-side implementation of the SASL SCRAM-SHA-256 mechanism. 
+ * 
+ * See the following RFCs for more details: 
+ * - RFC 5802: https://tools.ietf.org/html/rfc5802 
+ * - RFC 5803: https://tools.ietf.org/html/rfc5803 
+ * - RFC 7677: https://tools.ietf.org/html/rfc7677 
+ * 
+ * Here are some differences: 
+ * 
+ * - Username from the authentication exchange is not used. The client 
+ *   should send an empty string as the username. 
+ * 
+ * - If the password isn't valid UTF-8, or contains characters prohibited 
+ *   by the SASLprep profile, we skip the SASLprep pre-processing and use 
+ *   the raw bytes in calculating the hash. 
+ * 
+ * - Channel binding is not supported yet. 
+ * 
+ * 
+ * The password stored in pg_authid consists of the iteration count, salt, 
+ * StoredKey and ServerKey. 
+ * 
+ * SASLprep usage 
+ * -------------- 
+ * 
+ * One notable difference to the SCRAM specification is that while the 
+ * specification dictates that the password is in UTF-8, and prohibits 
+ * certain characters, we are more lenient.  If the password isn't a valid 
+ * UTF-8 string, or contains prohibited characters, the raw bytes are used 
+ * to calculate the hash instead, without SASLprep processing.  This is 
+ * because PostgreSQL supports other encodings too, and the encoding being 
+ * used during authentication is undefined (client_encoding isn't set until 
+ * after authentication).  In effect, we try to interpret the password as 
+ * UTF-8 and apply SASLprep processing, but if it looks invalid, we assume 
+ * that it's in some other encoding. 
+ * 
+ * In the worst case, we misinterpret a password that's in a different 
+ * encoding as being Unicode, because it happens to consists entirely of 
+ * valid UTF-8 bytes, and we apply Unicode normalization to it.  As long 
+ * as we do that consistently, that will not lead to failed logins. 
+ * Fortunately, the UTF-8 byte sequences that are ignored by SASLprep 
+ * don't correspond to any commonly used characters in any of the other 
+ * supported encodings, so it should not lead to any significant loss in 
+ * entropy, even if the normalization is incorrectly applied to a 
+ * non-UTF-8 password. 
+ * 
+ * Error handling 
+ * -------------- 
+ * 
+ * Don't reveal user information to an unauthenticated client.  We don't 
+ * want an attacker to be able to probe whether a particular username is 
+ * valid.  In SCRAM, the server has to read the salt and iteration count 
+ * from the user's password verifier, and send it to the client.  To avoid 
+ * revealing whether a user exists, when the client tries to authenticate 
+ * with a username that doesn't exist, or doesn't have a valid SCRAM 
+ * verifier in pg_authid, we create a fake salt and iteration count 
+ * on-the-fly, and proceed with the authentication with that.  In the end, 
+ * we'll reject the attempt, as if an incorrect password was given.  When 
+ * we are performing a "mock" authentication, the 'doomed' flag in 
+ * scram_state is set. 
+ * 
+ * In the error messages, avoid printing strings from the client, unless 
+ * you check that they are pure ASCII.  We don't want an unauthenticated 
+ * attacker to be able to spam the logs with characters that are not valid 
+ * to the encoding being used, whatever that is.  We cannot avoid that in 
+ * general, after logging in, but let's do what we can here. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * src/backend/libpq/auth-scram.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_authid.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_control.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"common/base64.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"common/saslprep.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"common/scram-common.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"common/sha2.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"libpq/auth.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"libpq/crypt.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"libpq/scram.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/backend_random.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/builtins.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/timestamp.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Status data for a SCRAM authentication exchange.  This should be kept 
+ * internal to this file. 
+ */ 
+</span><span class='Control'>typedef</span> <span class='Control'>enum</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN103"></a>    <span class='Declare_Enum_Const'>SCRAM_AUTH_INIT</span><span class='Delimiter'>, 
+</span><a name="LN104"></a>    <span class='Declare_Enum_Const'>SCRAM_AUTH_SALT_SENT</span><span class='Delimiter'>, 
+</span><a name="LN105"></a>    <span class='Declare_Enum_Const'>SCRAM_AUTH_FINISHED</span> 
+<a name="LN106"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>scram_state_enum</span><span class='Delimiter'>; 
+</span> 
+<span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN110"></a>    <a href="auth-scram.c.html#LN101"><span class='Ref_to_Typedef'>scram_state_enum</span></a> <span class='Declare_Member'>state</span><span class='Delimiter'>; 
+</span> 
+<a name="LN112"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Member'>username</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* username from startup packet */ 
+</span> 
+<a name="LN114"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>iterations</span><span class='Delimiter'>; 
+</span><a name="LN115"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>salt</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* base64-encoded */ 
+</span><a name="LN116"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Member'>StoredKey</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN117"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Member'>ServerKey</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Fields of the first message from client */ 
+</span><a name="LN120"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>client_first_message_bare</span><span class='Delimiter'>; 
+</span><a name="LN121"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>client_username</span><span class='Delimiter'>; 
+</span><a name="LN122"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>client_nonce</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Fields from the last message from client */ 
+</span><a name="LN125"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>client_final_message_without_proof</span><span class='Delimiter'>; 
+</span><a name="LN126"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>client_final_nonce</span><span class='Delimiter'>; 
+</span><a name="LN127"></a>    <span class='Keyword'>char</span>        <span class='Declare_Member'>ClientProof</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Fields generated in the server */ 
+</span><a name="LN130"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>server_first_message</span><span class='Delimiter'>; 
+</span><a name="LN131"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>server_nonce</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If something goes wrong during the authentication, or we are performing 
+     * a "mock" authentication (see comments at top of file), the 'doomed' 
+     * flag is set.  A reason for the failure, for the server log, is put in 
+     * 'logdetail'. 
+     */ 
+</span><a name="LN139"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>doomed</span><span class='Delimiter'>; 
+</span><a name="LN140"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Member'>logdetail</span><span class='Delimiter'>; 
+</span><a name="LN141"></a>}<span class='Auto_Annotations'> &laquo; end {anonscram_state} &raquo; </span> <span class='Declare_Typedef'>scram_state</span><span class='Delimiter'>; 
+</span> 
+<a name="LN143"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>read_client_first_message</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>input</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN144"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>read_client_final_message</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>input</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN145"></a><span class='Keyword'>static char </span><span class='Operator'>*</span><span class='Declare_Prototype'>build_server_first_message</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN146"></a><span class='Keyword'>static char </span><span class='Operator'>*</span><span class='Declare_Prototype'>build_server_final_message</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN147"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>verify_client_proof</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN148"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>verify_final_nonce</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN149"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>parse_scram_verifier</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>verifier</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>iterations</span><span class='Delimiter'>, 
+</span><a name="LN150"></a>                     <span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>salt</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>stored_key</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>server_key</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN151"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>mock_scram_verifier</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>username</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>iterations</span><span class='Delimiter'>, 
+</span><a name="LN152"></a>                    <span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>salt</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>stored_key</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>server_key</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN153"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>is_scram_printable</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>p</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN154"></a><span class='Keyword'>static char </span><span class='Operator'>*</span><span class='Declare_Prototype'>sanitize_char</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Declare_Parameter'>c</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN155"></a><span class='Keyword'>static char </span><span class='Operator'>*</span><span class='Declare_Prototype'>scram_mock_salt</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>username</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * pg_be_scram_init 
+ * 
+ * Initialize a new SCRAM authentication exchange status tracker.  This 
+ * needs to be called before doing any exchange.  It will be filled later 
+ * after the beginning of the exchange with verifier data. 
+ * 
+ * 'username' is the username provided by the client in the startup message. 
+ * 'shadow_pass' is the role's password verifier, from pg_authid.rolpassword. 
+ * If 'shadow_pass' is NULL, we still perform an authentication exchange, but 
+ * it will fail, as if an incorrect password was given. 
+ */ 
+</span><span class='Keyword'>void </span><span class='Operator'>* 
+</span><a name="LN170"></a><span class='Declare_Function'>pg_be_scram_init</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>username</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>shadow_pass</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN172"></a>    <a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN173"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>got_verifier</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN110"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN103"><span class='Ref_to_EnumConst'>SCRAM_AUTH_INIT</span></a><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN112"><span class='Ref_to_Member'>username</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN170"><span class='Ref_to_Parameter'>username</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Parse the stored password verifier. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN170"><span class='Ref_to_Parameter'>shadow_pass</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN184"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>password_type</span> <span class='Operator'>= </span><a href="../../include/libpq/crypt.h.html#LN33"><span class='Ref_to_Proto'>get_password_type</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN170"><span class='Ref_to_Parameter'>shadow_pass</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN184"><span class='Ref_To_Local'>password_type</span></a> <span class='Operator'>== </span><a href="../../include/libpq/crypt.h.html#LN30"><span class='Ref_to_EnumConst'>PASSWORD_TYPE_SCRAM_SHA_256</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN149"><span class='Ref_to_Proto'>parse_scram_verifier</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN170"><span class='Ref_to_Parameter'>shadow_pass</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN114"><span class='Ref_to_Member'>iterations</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN115"><span class='Ref_to_Member'>salt</span></a><span class='Delimiter'>, 
+</span>                                     <a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN116"><span class='Ref_to_Member'>StoredKey</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN117"><span class='Ref_to_Member'>ServerKey</span></a><span class='Parentheses'>))</span> 
+                <a href="auth-scram.c.html#LN173"><span class='Ref_To_Local'>got_verifier</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * The password looked like a SCRAM verifier, but could not be 
+                 * parsed. 
+                 */ 
+</span>                <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid SCRAM verifier for user \"%s\""</span><span class='Delimiter'>, 
+</span>                                <a href="auth-scram.c.html#LN170"><span class='Ref_to_Parameter'>username</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                <a href="auth-scram.c.html#LN173"><span class='Ref_To_Local'>got_verifier</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * The user doesn't have SCRAM verifier. (You cannot do SCRAM 
+             * authentication with an MD5 hash.) 
+             */ 
+</span>            <a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN140"><span class='Ref_to_Member'>logdetail</span></a> <span class='Operator'>= </span><a href="../../common/psprintf.c.html#LN44"><span class='Ref_to_Func'>psprintf</span></a><span class='Parentheses'>(</span>_<span class='Parentheses'>(</span><span class='String'>"User \"%s\" does not have a valid SCRAM verifier."</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                        <a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN112"><span class='Ref_to_Member'>username</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="auth-scram.c.html#LN173"><span class='Ref_To_Local'>got_verifier</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if shadow_pass &raquo; </span> 
+    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * The caller requested us to perform a dummy authentication.  This is 
+         * considered normal, since the caller requested it, so don't set log 
+         * detail. 
+         */ 
+</span>        <a href="auth-scram.c.html#LN173"><span class='Ref_To_Local'>got_verifier</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the user did not have a valid SCRAM verifier, we still go through 
+     * the motions with a mock one, and fail as if the client supplied an 
+     * incorrect password.  This is to avoid revealing information to an 
+     * attacker. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="auth-scram.c.html#LN173"><span class='Ref_To_Local'>got_verifier</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="auth-scram.c.html#LN151"><span class='Ref_to_Proto'>mock_scram_verifier</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN170"><span class='Ref_to_Parameter'>username</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN114"><span class='Ref_to_Member'>iterations</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN115"><span class='Ref_to_Member'>salt</span></a><span class='Delimiter'>, 
+</span>                            <a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN116"><span class='Ref_to_Member'>StoredKey</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN117"><span class='Ref_to_Member'>ServerKey</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN139"><span class='Ref_to_Member'>doomed</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="auth-scram.c.html#LN172"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pg_be_scram_init &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Continue a SCRAM authentication exchange. 
+ * 
+ * 'input' is the SCRAM payload sent by the client.  On the first call, 
+ * 'input' contains the "Initial Client Response" that the client sent as 
+ * part of the SASLInitialResponse message, or NULL if no Initial Client 
+ * Response was given.  (The SASL specification distinguishes between an 
+ * empty response and non-existing one.)  On subsequent calls, 'input' 
+ * cannot be NULL.  For convenience in this function, the caller must 
+ * ensure that there is a null terminator at input[inputlen]. 
+ * 
+ * The next message to send to client is saved in 'output', for a length 
+ * of 'outputlen'.  In the case of an error, optionally store a palloc'd 
+ * string at *logdetail that will be sent to the postmaster log (but not 
+ * the client). 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN257"></a><span class='Declare_Function'>pg_be_scram_exchange</span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>opaq</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>input</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>inputlen</span><span class='Delimiter'>, 
+</span><a name="LN258"></a>                     <span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>output</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>outputlen</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>logdetail</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN260"></a>    <a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Local'>state</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="auth-scram.c.html#LN257"><span class='Ref_to_Parameter'>opaq</span></a><span class='Delimiter'>; 
+</span><a name="LN261"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>output</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the client didn't include an "Initial Client Response" in the 
+     * SASLInitialResponse message, send an empty challenge, to which the 
+     * client will respond with the same data that usually comes in the 
+     * Initial Client Response. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN257"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN110"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>== </span><a href="auth-scram.c.html#LN103"><span class='Ref_to_EnumConst'>SCRAM_AUTH_INIT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Operator'>*</span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>output</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><span class='String'>""</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>outputlen</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <a href="../../include/libpq/scram.h.html#LN19"><span class='Ref_to_Const'>SASL_EXCHANGE_CONTINUE</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check that the input length agrees with the string length of the input. 
+     * We can ignore inputlen after this. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN257"><span class='Ref_to_Parameter'>inputlen</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The message is empty."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN257"><span class='Ref_to_Parameter'>inputlen</span></a> <span class='Operator'>!= </span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN257"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>))</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Message length does not match input length."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN110"><span class='Ref_to_Member'>state</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="auth-scram.c.html#LN103"><span class='Ref_to_EnumConst'>SCRAM_AUTH_INIT</span></a><span class='Operator'>: 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Initialization phase.  Receive the first message from client 
+             * and be sure that it parsed correctly.  Then send the challenge 
+             * to the client. 
+             */ 
+</span>            <a href="auth-scram.c.html#LN143"><span class='Ref_to_Proto'>read_client_first_message</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN257"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* prepare message to send challenge */ 
+</span>            <span class='Operator'>*</span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>output</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN145"><span class='Ref_to_Proto'>build_server_first_message</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN110"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN104"><span class='Ref_to_EnumConst'>SCRAM_AUTH_SALT_SENT</span></a><span class='Delimiter'>; 
+</span>            <a href="auth-scram.c.html#LN261"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/libpq/scram.h.html#LN19"><span class='Ref_to_Const'>SASL_EXCHANGE_CONTINUE</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="auth-scram.c.html#LN104"><span class='Ref_to_EnumConst'>SCRAM_AUTH_SALT_SENT</span></a><span class='Operator'>: 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Final phase for the server.  Receive the response to the 
+             * challenge previously sent, verify, and let the client know that 
+             * everything went well (or not). 
+             */ 
+</span>            <a href="auth-scram.c.html#LN144"><span class='Ref_to_Proto'>read_client_final_message</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN257"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="auth-scram.c.html#LN148"><span class='Ref_to_Proto'>verify_final_nonce</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>))</span> 
+                <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                         <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid SCRAM response"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                         <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Nonce does not match."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Now check the final nonce and the client proof. 
+             * 
+             * If we performed a "mock" authentication that we knew would fail 
+             * from the get go, this is where we fail. 
+             * 
+             * The SCRAM specification includes an error code, 
+             * "invalid-proof", for authentication failure, but it also allows 
+             * erroring out in an application-specific way.  We choose to do 
+             * the latter, so that the error message for invalid password is 
+             * the same for all authentication methods.  The caller will call 
+             * ereport(), when we return SASL_EXCHANGE_FAILURE with no output. 
+             * 
+             * NB: the order of these checks is intentional.  We calculate the 
+             * client proof even in a mock authentication, even though it's 
+             * bound to fail, to thwart timing attacks to determine if a role 
+             * with the given name exists or not. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="auth-scram.c.html#LN147"><span class='Ref_to_Proto'>verify_client_proof</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>) </span><span class='Operator'>|| </span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN139"><span class='Ref_to_Member'>doomed</span></a><span class='Parentheses'>)</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="auth-scram.c.html#LN261"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/libpq/scram.h.html#LN21"><span class='Ref_to_Const'>SASL_EXCHANGE_FAILURE</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* Build final message for client */ 
+</span>            <span class='Operator'>*</span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>output</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN146"><span class='Ref_to_Proto'>build_server_final_message</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Success! */ 
+</span>            <a href="auth-scram.c.html#LN261"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/libpq/scram.h.html#LN20"><span class='Ref_to_Const'>SASL_EXCHANGE_SUCCESS</span></a><span class='Delimiter'>; 
+</span>            <a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN110"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN105"><span class='Ref_to_EnumConst'>SCRAM_AUTH_FINISHED</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"invalid SCRAM exchange state"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="auth-scram.c.html#LN261"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/libpq/scram.h.html#LN21"><span class='Ref_to_Const'>SASL_EXCHANGE_FAILURE</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch state-&GT;state &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN261"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>== </span><a href="../../include/libpq/scram.h.html#LN21"><span class='Ref_to_Const'>SASL_EXCHANGE_FAILURE</span></a> <span class='Operator'>&& </span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN140"><span class='Ref_to_Member'>logdetail</span></a> <span class='Operator'>&& </span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>logdetail</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>logdetail</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN260"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN140"><span class='Ref_to_Member'>logdetail</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>output</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>outputlen</span></a> <span class='Operator'>= </span>strlen<span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN258"><span class='Ref_to_Parameter'>output</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="auth-scram.c.html#LN261"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pg_be_scram_exchange &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Construct a verifier string for SCRAM, stored in pg_authid.rolpassword. 
+ * 
+ * The result is palloc'd, so caller is responsible for freeing it. 
+ */ 
+</span><span class='Keyword'>char </span><span class='Operator'>* 
+</span><a name="LN380"></a><span class='Declare_Function'>pg_be_scram_build_verifier</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>password</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN382"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>prep_password</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN383"></a>    <a href="../../include/common/saslprep.h.html#LN19"><span class='Ref_to_Typedef'>pg_saslprep_rc</span></a> <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span><a name="LN384"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>saltbuf</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN31"><span class='Ref_to_Const'>SCRAM_DEFAULT_SALT_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN385"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Normalize the password with SASLprep.  If that doesn't work, because 
+     * the password isn't valid UTF-8 or contains prohibited characters, just 
+     * proceed with the original password.  (See comments at top of file.) 
+     */ 
+</span>    <a href="auth-scram.c.html#LN383"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../include/common/saslprep.h.html#LN27"><span class='Ref_to_Proto'>pg_saslprep</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN380"><span class='Ref_to_Parameter'>password</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN382"><span class='Ref_To_Local'>prep_password</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN383"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>== </span><a href="../../include/common/saslprep.h.html#LN21"><span class='Ref_to_EnumConst'>SASLPREP_SUCCESS</span></a><span class='Parentheses'>) 
+</span>        <a href="auth-scram.c.html#LN380"><span class='Ref_to_Parameter'>password</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="auth-scram.c.html#LN382"><span class='Ref_To_Local'>prep_password</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Generate random salt */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/utils/backend_random.h.html#LN16"><span class='Ref_to_Proto'>pg_backend_random</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN384"><span class='Ref_To_Local'>saltbuf</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN31"><span class='Ref_to_Const'>SCRAM_DEFAULT_SALT_LEN</span></a><span class='Parentheses'>))</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INTERNAL_ERROR<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not generate random salt"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN385"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/common/scram-common.h.html#LN55"><span class='Ref_to_Proto'>scram_build_verifier</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN384"><span class='Ref_To_Local'>saltbuf</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN31"><span class='Ref_to_Const'>SCRAM_DEFAULT_SALT_LEN</span></a><span class='Delimiter'>, 
+</span>                                  <a href="../../include/common/scram-common.h.html#LN34"><span class='Ref_to_Const'>SCRAM_DEFAULT_ITERATIONS</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN380"><span class='Ref_to_Parameter'>password</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN382"><span class='Ref_To_Local'>prep_password</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN382"><span class='Ref_To_Local'>prep_password</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="auth-scram.c.html#LN385"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pg_be_scram_build_verifier &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Verify a plaintext password against a SCRAM verifier.  This is used when 
+ * performing plaintext password authentication for a user that has a SCRAM 
+ * verifier stored in pg_authid. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN417"></a><span class='Declare_Function'>scram_verify_plain_password</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>username</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>password</span><span class='Delimiter'>, 
+</span><a name="LN418"></a>                            <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>verifier</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN420"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>encoded_salt</span><span class='Delimiter'>; 
+</span><a name="LN421"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>salt</span><span class='Delimiter'>; 
+</span><a name="LN422"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>saltlen</span><span class='Delimiter'>; 
+</span><a name="LN423"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>iterations</span><span class='Delimiter'>; 
+</span><a name="LN424"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>salted_password</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN425"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>stored_key</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN426"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>server_key</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN427"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>computed_key</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN428"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>prep_password</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN429"></a>    <a href="../../include/common/saslprep.h.html#LN19"><span class='Ref_to_Typedef'>pg_saslprep_rc</span></a> <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="auth-scram.c.html#LN149"><span class='Ref_to_Proto'>parse_scram_verifier</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN418"><span class='Ref_to_Parameter'>verifier</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN423"><span class='Ref_To_Local'>iterations</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN420"><span class='Ref_To_Local'>encoded_salt</span></a><span class='Delimiter'>, 
+</span>                              <a href="auth-scram.c.html#LN425"><span class='Ref_To_Local'>stored_key</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN426"><span class='Ref_To_Local'>server_key</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * The password looked like a SCRAM verifier, but could not be parsed. 
+         */ 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid SCRAM verifier for user \"%s\""</span><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN417"><span class='Ref_to_Parameter'>username</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="auth-scram.c.html#LN421"><span class='Ref_To_Local'>salt</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="../../include/common/base64.h.html#LN16"><span class='Ref_to_Proto'>pg_b64_dec_len</span></a><span class='Parentheses'>(</span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN420"><span class='Ref_To_Local'>encoded_salt</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN422"><span class='Ref_To_Local'>saltlen</span></a> <span class='Operator'>= </span><a href="../../include/common/base64.h.html#LN14"><span class='Ref_to_Proto'>pg_b64_decode</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN420"><span class='Ref_To_Local'>encoded_salt</span></a><span class='Delimiter'>, </span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN420"><span class='Ref_To_Local'>encoded_salt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN421"><span class='Ref_To_Local'>salt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN422"><span class='Ref_To_Local'>saltlen</span></a> <span class='Operator'>== -</span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid SCRAM verifier for user \"%s\""</span><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN417"><span class='Ref_to_Parameter'>username</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Normalize the password */ 
+</span>    <a href="auth-scram.c.html#LN429"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../include/common/saslprep.h.html#LN27"><span class='Ref_to_Proto'>pg_saslprep</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN417"><span class='Ref_to_Parameter'>password</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN428"><span class='Ref_To_Local'>prep_password</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN429"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>== </span><a href="../../include/common/saslprep.h.html#LN21"><span class='Ref_to_EnumConst'>SASLPREP_SUCCESS</span></a><span class='Parentheses'>) 
+</span>        <a href="auth-scram.c.html#LN417"><span class='Ref_to_Parameter'>password</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN428"><span class='Ref_To_Local'>prep_password</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Compute Server Key based on the user-supplied plaintext password */ 
+</span>    <a href="../../include/common/scram-common.h.html#LN49"><span class='Ref_to_Proto'>scram_SaltedPassword</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN417"><span class='Ref_to_Parameter'>password</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN421"><span class='Ref_To_Local'>salt</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN422"><span class='Ref_To_Local'>saltlen</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN423"><span class='Ref_To_Local'>iterations</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN424"><span class='Ref_To_Local'>salted_password</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN53"><span class='Ref_to_Proto'>scram_ServerKey</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN424"><span class='Ref_To_Local'>salted_password</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN427"><span class='Ref_To_Local'>computed_key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN428"><span class='Ref_To_Local'>prep_password</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN428"><span class='Ref_To_Local'>prep_password</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Compare the verifier's Server Key with the one computed from the 
+     * user-supplied password. 
+     */ 
+</span>    <span class='Control'>return</span> memcmp<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN427"><span class='Ref_To_Local'>computed_key</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN426"><span class='Ref_To_Local'>server_key</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end scram_verify_plain_password &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Parse and validate format of given SCRAM verifier. 
+ * 
+ * Returns true if the SCRAM verifier has been parsed, and false otherwise. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN477"></a><span class='Declare_Function'>parse_scram_verifier</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>verifier</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>iterations</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>salt</span><span class='Delimiter'>, 
+</span><a name="LN478"></a>                     <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>stored_key</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>server_key</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN480"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>v</span><span class='Delimiter'>; 
+</span><a name="LN481"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>p</span><span class='Delimiter'>; 
+</span><a name="LN482"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>scheme_str</span><span class='Delimiter'>; 
+</span><a name="LN483"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>salt_str</span><span class='Delimiter'>; 
+</span><a name="LN484"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>iterations_str</span><span class='Delimiter'>; 
+</span><a name="LN485"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>storedkey_str</span><span class='Delimiter'>; 
+</span><a name="LN486"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>serverkey_str</span><span class='Delimiter'>; 
+</span><a name="LN487"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>decoded_len</span><span class='Delimiter'>; 
+</span><a name="LN488"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>decoded_salt_buf</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The verifier is of form: 
+     * 
+     * SCRAM-SHA-256$&LT;iterations&GT;:&LT;salt&GT;$&LT;storedkey&GT;:&LT;serverkey&GT; 
+     */ 
+</span>    <a href="auth-scram.c.html#LN480"><span class='Ref_To_Local'>v</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN477"><span class='Ref_to_Parameter'>verifier</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="auth-scram.c.html#LN482"><span class='Ref_To_Local'>scheme_str</span></a> <span class='Operator'>= </span>strtok<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN480"><span class='Ref_To_Local'>v</span></a><span class='Delimiter'>, </span><span class='String'>"$"</span><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="auth-scram.c.html#LN484"><span class='Ref_To_Local'>iterations_str</span></a> <span class='Operator'>= </span>strtok<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='String'>":"</span><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="auth-scram.c.html#LN483"><span class='Ref_To_Local'>salt_str</span></a> <span class='Operator'>= </span>strtok<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='String'>"$"</span><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="auth-scram.c.html#LN485"><span class='Ref_To_Local'>storedkey_str</span></a> <span class='Operator'>= </span>strtok<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='String'>":"</span><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="auth-scram.c.html#LN486"><span class='Ref_To_Local'>serverkey_str</span></a> <span class='Operator'>= </span>strtok<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='String'>""</span><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Parse the fields */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN482"><span class='Ref_To_Local'>scheme_str</span></a><span class='Delimiter'>, </span><span class='String'>"SCRAM-SHA-256"</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="auth-scram.c.html#LN477"><span class='Ref_to_Parameter'>iterations</span></a> <span class='Operator'>= </span>strtol<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN484"><span class='Ref_To_Local'>iterations_str</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN481"><span class='Ref_To_Local'>p</span></a><span class='Delimiter'>, </span><span class='Number'>10</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN481"><span class='Ref_To_Local'>p</span></a> <span class='Operator'>|| </span>errno <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Verify that the salt is in Base64-encoded format, by decoding it, 
+     * although we return the encoded version to the caller. 
+     */ 
+</span>    <a href="auth-scram.c.html#LN488"><span class='Ref_To_Local'>decoded_salt_buf</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="../../include/common/base64.h.html#LN16"><span class='Ref_to_Proto'>pg_b64_dec_len</span></a><span class='Parentheses'>(</span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN483"><span class='Ref_To_Local'>salt_str</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN487"><span class='Ref_To_Local'>decoded_len</span></a> <span class='Operator'>= </span><a href="../../include/common/base64.h.html#LN14"><span class='Ref_to_Proto'>pg_b64_decode</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN483"><span class='Ref_To_Local'>salt_str</span></a><span class='Delimiter'>, </span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN483"><span class='Ref_To_Local'>salt_str</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN488"><span class='Ref_To_Local'>decoded_salt_buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN487"><span class='Ref_To_Local'>decoded_len</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="auth-scram.c.html#LN477"><span class='Ref_to_Parameter'>salt</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN483"><span class='Ref_To_Local'>salt_str</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Decode StoredKey and ServerKey. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/common/base64.h.html#LN16"><span class='Ref_to_Proto'>pg_b64_dec_len</span></a><span class='Parentheses'>(</span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN485"><span class='Ref_To_Local'>storedkey_str</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN487"><span class='Ref_To_Local'>decoded_len</span></a> <span class='Operator'>= </span><a href="../../include/common/base64.h.html#LN14"><span class='Ref_to_Proto'>pg_b64_decode</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN485"><span class='Ref_To_Local'>storedkey_str</span></a><span class='Delimiter'>, </span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN485"><span class='Ref_To_Local'>storedkey_str</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                <span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="auth-scram.c.html#LN478"><span class='Ref_to_Parameter'>stored_key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN487"><span class='Ref_To_Local'>decoded_len</span></a> <span class='Operator'>!= </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/common/base64.h.html#LN16"><span class='Ref_to_Proto'>pg_b64_dec_len</span></a><span class='Parentheses'>(</span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN486"><span class='Ref_To_Local'>serverkey_str</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN487"><span class='Ref_To_Local'>decoded_len</span></a> <span class='Operator'>= </span><a href="../../include/common/base64.h.html#LN14"><span class='Ref_to_Proto'>pg_b64_decode</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN486"><span class='Ref_To_Local'>serverkey_str</span></a><span class='Delimiter'>, </span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN486"><span class='Ref_To_Local'>serverkey_str</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                <span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="auth-scram.c.html#LN478"><span class='Ref_to_Parameter'>server_key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN487"><span class='Ref_To_Local'>decoded_len</span></a> <span class='Operator'>!= </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="auth-scram.c.html#LN545"><span class='Ref_to_Label'>invalid_verifier</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+<a name="LN545"></a><span class='Label'>invalid_verifier</span><span class='Operator'>: 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN480"><span class='Ref_To_Local'>v</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="auth-scram.c.html#LN477"><span class='Ref_to_Parameter'>salt</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end parse_scram_verifier &raquo; </span> 
+ 
+<span class='Keyword'>static void 
+</span><a name="LN552"></a><span class='Declare_Function'>mock_scram_verifier</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>username</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>iterations</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>salt</span><span class='Delimiter'>, 
+</span><a name="LN553"></a>                    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>stored_key</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>server_key</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN555"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>raw_salt</span><span class='Delimiter'>; 
+</span><a name="LN556"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>encoded_salt</span><span class='Delimiter'>; 
+</span><a name="LN557"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>encoded_len</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Generate deterministic salt */ 
+</span>    <a href="auth-scram.c.html#LN555"><span class='Ref_To_Local'>raw_salt</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN155"><span class='Ref_to_Proto'>scram_mock_salt</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN552"><span class='Ref_to_Parameter'>username</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN556"><span class='Ref_To_Local'>encoded_salt</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="../../include/common/base64.h.html#LN15"><span class='Ref_to_Proto'>pg_b64_enc_len</span></a><span class='Parentheses'>(</span><a href="../../include/common/scram-common.h.html#LN31"><span class='Ref_to_Const'>SCRAM_DEFAULT_SALT_LEN</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN557"><span class='Ref_To_Local'>encoded_len</span></a> <span class='Operator'>= </span><a href="../../include/common/base64.h.html#LN13"><span class='Ref_to_Proto'>pg_b64_encode</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN555"><span class='Ref_To_Local'>raw_salt</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN31"><span class='Ref_to_Const'>SCRAM_DEFAULT_SALT_LEN</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN556"><span class='Ref_To_Local'>encoded_salt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN556"><span class='Ref_To_Local'>encoded_salt</span></a><span class='Delimiter'>[</span><a href="auth-scram.c.html#LN557"><span class='Ref_To_Local'>encoded_len</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="auth-scram.c.html#LN552"><span class='Ref_to_Parameter'>salt</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN556"><span class='Ref_To_Local'>encoded_salt</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="auth-scram.c.html#LN552"><span class='Ref_to_Parameter'>iterations</span></a> <span class='Operator'>= </span><a href="../../include/common/scram-common.h.html#LN34"><span class='Ref_to_Const'>SCRAM_DEFAULT_ITERATIONS</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* StoredKey and ServerKey are not used in a doomed authentication */ 
+</span>    memset<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN553"><span class='Ref_to_Parameter'>stored_key</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    memset<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN553"><span class='Ref_to_Parameter'>server_key</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end mock_scram_verifier &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Read the value in a given SASL exchange message for given attribute. 
+ */ 
+</span><span class='Keyword'>static char </span><span class='Operator'>* 
+</span><a name="LN578"></a><span class='Declare_Function'>read_attr_value</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>input</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Declare_Parameter'>attr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN580"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>begin</span> <span class='Operator'>= *</span><a href="auth-scram.c.html#LN578"><span class='Ref_to_Parameter'>input</span></a><span class='Delimiter'>; 
+</span><a name="LN581"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>end</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN580"><span class='Ref_To_Local'>begin</span></a> <span class='Operator'>!= </span><a href="auth-scram.c.html#LN578"><span class='Ref_to_Parameter'>attr</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Expected attribute '%c' but found %s."</span><span class='Delimiter'>, 
+</span>                           <a href="auth-scram.c.html#LN578"><span class='Ref_to_Parameter'>attr</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN154"><span class='Ref_to_Proto'>sanitize_char</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN580"><span class='Ref_To_Local'>begin</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN580"><span class='Ref_To_Local'>begin</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN580"><span class='Ref_To_Local'>begin</span></a> <span class='Operator'>!= </span><span class='String'>'='</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Expected character = for attribute %c."</span><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN578"><span class='Ref_to_Parameter'>attr</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN580"><span class='Ref_To_Local'>begin</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN581"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN580"><span class='Ref_To_Local'>begin</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN581"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>&& *</span><a href="auth-scram.c.html#LN581"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>!= </span><span class='String'>','</span><span class='Parentheses'>) 
+</span>        <a href="auth-scram.c.html#LN581"><span class='Ref_To_Local'>end</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN581"><span class='Ref_To_Local'>end</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="auth-scram.c.html#LN581"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="auth-scram.c.html#LN578"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN581"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <span class='Operator'>*</span><a href="auth-scram.c.html#LN578"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN581"><span class='Ref_To_Local'>end</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="auth-scram.c.html#LN580"><span class='Ref_To_Local'>begin</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end read_attr_value &raquo; </span> 
+ 
+<span class='Keyword'>static bool 
+</span><a name="LN614"></a><span class='Declare_Function'>is_scram_printable</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>p</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/*------ 
+     * Printable characters, as defined by SCRAM spec: (RFC 5802) 
+     * 
+     *  printable       = %x21-2B / %x2D-7E 
+     *                    ;; Printable ASCII except ",". 
+     *                    ;; Note that any "printable" is also 
+     *                    ;; a valid "value". 
+     *------ 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>; </span><span class='Operator'>*</span><a href="auth-scram.c.html#LN614"><span class='Ref_to_Parameter'>p</span></a><span class='Delimiter'>; </span><a href="auth-scram.c.html#LN614"><span class='Ref_to_Parameter'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN614"><span class='Ref_to_Parameter'>p</span></a> <span class='Operator'>&LT; </span><span class='Number'>0x21</span> <span class='Operator'>|| *</span><a href="auth-scram.c.html#LN614"><span class='Ref_to_Parameter'>p</span></a> <span class='Operator'>&GT; </span><span class='Number'>0x7E</span> <span class='Operator'>|| *</span><a href="auth-scram.c.html#LN614"><span class='Ref_to_Parameter'>p</span></a> <span class='Operator'>== </span><span class='Number'>0x2C</span> <span class='Comment_Multi_Line'>/* comma */ </span><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Convert an arbitrary byte to printable form.  For error messages. 
+ * 
+ * If it's a printable ASCII character, print it as a single character. 
+ * otherwise, print it in hex. 
+ * 
+ * The returned pointer points to a static buffer. 
+ */ 
+</span><span class='Keyword'>static char </span><span class='Operator'>* 
+</span><a name="LN642"></a><span class='Declare_Function'>sanitize_char</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Declare_Parameter'>c</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN644"></a>    <span class='Keyword'>static char </span><span class='Declare_Local'>buf</span><span class='Delimiter'>[</span><span class='Number'>5</span><span class='Delimiter'>]; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN642"><span class='Ref_to_Parameter'>c</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0x21</span> <span class='Operator'>&& </span><a href="auth-scram.c.html#LN642"><span class='Ref_to_Parameter'>c</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0x7E</span><span class='Parentheses'>) 
+</span>        <a href="../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN644"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN644"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"'%c'"</span><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN642"><span class='Ref_to_Parameter'>c</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN644"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN644"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"0x%02x"</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>unsigned char</span><span class='Parentheses'>) </span><a href="auth-scram.c.html#LN642"><span class='Ref_to_Parameter'>c</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="auth-scram.c.html#LN644"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Read the next attribute and value in a SASL exchange message. 
+ * 
+ * Returns NULL if there is attribute. 
+ */ 
+</span><span class='Keyword'>static char </span><span class='Operator'>* 
+</span><a name="LN659"></a><span class='Declare_Function'>read_any_attr</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>input</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>attr_p</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN661"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>begin</span> <span class='Operator'>= *</span><a href="auth-scram.c.html#LN659"><span class='Ref_to_Parameter'>input</span></a><span class='Delimiter'>; 
+</span><a name="LN662"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>end</span><span class='Delimiter'>; 
+</span><a name="LN663"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>attr</span> <span class='Operator'>= *</span><a href="auth-scram.c.html#LN661"><span class='Ref_To_Local'>begin</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/*------ 
+     * attr-val        = ALPHA "=" value 
+     *                   ;; Generic syntax of any attribute sent 
+     *                   ;; by server or client 
+     *------ 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>((</span><a href="auth-scram.c.html#LN663"><span class='Ref_To_Local'>attr</span></a> <span class='Operator'>&GT;= </span><span class='String'>'A'</span> <span class='Operator'>&& </span><a href="auth-scram.c.html#LN663"><span class='Ref_To_Local'>attr</span></a> <span class='Operator'>&LT;= </span><span class='String'>'Z'</span><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>          <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN663"><span class='Ref_To_Local'>attr</span></a> <span class='Operator'>&GT;= </span><span class='String'>'a'</span> <span class='Operator'>&& </span><a href="auth-scram.c.html#LN663"><span class='Ref_To_Local'>attr</span></a> <span class='Operator'>&LT;= </span><span class='String'>'z'</span><span class='Parentheses'>)))</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Attribute expected, but found invalid character %s."</span><span class='Delimiter'>, 
+</span>                       <a href="auth-scram.c.html#LN154"><span class='Ref_to_Proto'>sanitize_char</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN663"><span class='Ref_To_Local'>attr</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN659"><span class='Ref_to_Parameter'>attr_p</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="auth-scram.c.html#LN659"><span class='Ref_to_Parameter'>attr_p</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN663"><span class='Ref_To_Local'>attr</span></a><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN661"><span class='Ref_To_Local'>begin</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN661"><span class='Ref_To_Local'>begin</span></a> <span class='Operator'>!= </span><span class='String'>'='</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Expected character = for attribute %c."</span><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN663"><span class='Ref_To_Local'>attr</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN661"><span class='Ref_To_Local'>begin</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN662"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN661"><span class='Ref_To_Local'>begin</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN662"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>&& *</span><a href="auth-scram.c.html#LN662"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>!= </span><span class='String'>','</span><span class='Parentheses'>) 
+</span>        <a href="auth-scram.c.html#LN662"><span class='Ref_To_Local'>end</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN662"><span class='Ref_To_Local'>end</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="auth-scram.c.html#LN662"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="auth-scram.c.html#LN659"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN662"><span class='Ref_To_Local'>end</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <span class='Operator'>*</span><a href="auth-scram.c.html#LN659"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN662"><span class='Ref_To_Local'>end</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="auth-scram.c.html#LN661"><span class='Ref_To_Local'>begin</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end read_any_attr &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Read and parse the first message from client in the context of a SASL 
+ * authentication exchange message. 
+ * 
+ * At this stage, any errors will be reported directly with ereport(ERROR). 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN711"></a><span class='Declare_Function'>read_client_first_message</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>input</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/*------ 
+     * The syntax for the client-first-message is: (RFC 5802) 
+     * 
+     * saslname        = 1*(value-safe-char / "=2C" / "=3D") 
+     *                   ;; Conforms to &LT;value&GT;. 
+     * 
+     * authzid         = "a=" saslname 
+     *                   ;; Protocol specific. 
+     * 
+     * cb-name         = 1*(ALPHA / DIGIT / "." / "-") 
+     *                    ;; See RFC 5056, Section 7. 
+     *                    ;; E.g., "tls-server-end-point" or 
+     *                    ;; "tls-unique". 
+     * 
+     * gs2-cbind-flag  = ("p=" cb-name) / "n" / "y" 
+     *                   ;; "n" -&GT; client doesn't support channel binding. 
+     *                   ;; "y" -&GT; client does support channel binding 
+     *                   ;;        but thinks the server does not. 
+     *                   ;; "p" -&GT; client requires channel binding. 
+     *                   ;; The selected channel binding follows "p=". 
+     * 
+     * gs2-header      = gs2-cbind-flag "," [ authzid ] "," 
+     *                   ;; GS2 header for SCRAM 
+     *                   ;; (the actual GS2 header includes an optional 
+     *                   ;; flag to indicate that the GSS mechanism is not 
+     *                   ;; "standard", but since SCRAM is "standard", we 
+     *                   ;; don't include that flag). 
+     * 
+     * username        = "n=" saslname 
+     *                   ;; Usernames are prepared using SASLprep. 
+     * 
+     * reserved-mext  = "m=" 1*(value-char) 
+     *                   ;; Reserved for signaling mandatory extensions. 
+     *                   ;; The exact syntax will be defined in 
+     *                   ;; the future. 
+     * 
+     * nonce           = "r=" c-nonce [s-nonce] 
+     *                   ;; Second part provided by server. 
+     * 
+     * c-nonce         = printable 
+     * 
+     * client-first-message-bare = 
+     *                   [reserved-mext ","] 
+     *                   username "," nonce ["," extensions] 
+     * 
+     * client-first-message = 
+     *                   gs2-header client-first-message-bare 
+     * 
+     * For example: 
+     * n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL 
+     * 
+     * The "n,," in the beginning means that the client doesn't support 
+     * channel binding, and no authzid is given.  "n=user" is the username. 
+     * However, in PostgreSQL the username is sent in the startup packet, and 
+     * the username in the SCRAM exchange is ignored.  libpq always sends it 
+     * as an empty string.  The last part, "r=fyko+d2lbbFgONRv9qkxdawL" is 
+     * the client nonce. 
+     *------ 
+     */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* read gs2-cbind-flag */ 
+</span>    <span class='Control'>switch</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <span class='String'>'n'</span><span class='Operator'>: 
+</span>            <span class='Comment_Multi_Line'>/* Client does not support channel binding */ 
+</span>            <a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <span class='String'>'y'</span><span class='Operator'>: 
+</span>            <span class='Comment_Multi_Line'>/* Client supports channel binding, but we're not doing it today */ 
+</span>            <a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <span class='String'>'p'</span><span class='Operator'>: 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Client requires channel binding.  We don't support it. 
+             * 
+             * RFC 5802 specifies a particular error code, 
+             * e=server-does-support-channel-binding, for this.  But it can 
+             * only be sent in the server-final message, and we don't want to 
+             * go through the motions of the authentication, knowing it will 
+             * fail, just to send that error message. 
+             */ 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"client requires SCRAM channel binding, but it is not supported"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Unexpected channel-binding flag %s."</span><span class='Delimiter'>, 
+</span>                               <a href="auth-scram.c.html#LN154"><span class='Ref_to_Proto'>sanitize_char</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch *input &raquo; </span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>!= </span><span class='String'>','</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Comma expected, but found character %s."</span><span class='Delimiter'>, 
+</span>                           <a href="auth-scram.c.html#LN154"><span class='Ref_to_Proto'>sanitize_char</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Forbid optional authzid (authorization identity).  We don't support it. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>== </span><span class='String'>'a'</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"client uses authorization identity, but it is not supported"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>!= </span><span class='String'>','</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Unexpected attribute %s in client-first-message."</span><span class='Delimiter'>, 
+</span>                           <a href="auth-scram.c.html#LN154"><span class='Ref_to_Proto'>sanitize_char</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN120"><span class='Ref_to_Member'>client_first_message_bare</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Any mandatory extensions would go here.  We don't support any. 
+     * 
+     * RFC 5802 specifies error code "e=extensions-not-supported" for this, 
+     * but it can only be sent in the server-final message.  We prefer to fail 
+     * immediately (which the RFC also allows). 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>== </span><span class='String'>'m'</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"client requires an unsupported SCRAM extension"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Read username.  Note: this is ignored.  We use the username from the 
+     * startup message instead, still it is kept around if provided as it 
+     * proves to be useful for debugging purposes. 
+     */ 
+</span>    <a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN121"><span class='Ref_to_Member'>client_username</span></a> <span class='Operator'>= </span><a href="../../interfaces/libpq/fe-auth-scram.c.html#LN253"><span class='Ref_to_Func'>read_attr_value</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Delimiter'>, </span><span class='String'>'n'</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* read nonce and check that it is made of only printable characters */ 
+</span>    <a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN122"><span class='Ref_to_Member'>client_nonce</span></a> <span class='Operator'>= </span><a href="../../interfaces/libpq/fe-auth-scram.c.html#LN253"><span class='Ref_to_Func'>read_attr_value</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Delimiter'>, </span><span class='String'>'r'</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="auth-scram.c.html#LN153"><span class='Ref_to_Proto'>is_scram_printable</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN122"><span class='Ref_to_Member'>client_nonce</span></a><span class='Parentheses'>))</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"non-printable characters in SCRAM nonce"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * There can be any number of optional extensions after this.  We don't 
+     * support any extensions, so ignore them. 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a> <span class='Operator'>!= </span><span class='String'>'\0'</span><span class='Parentheses'>) 
+</span>        <a href="auth-scram.c.html#LN658"><span class='Ref_to_Func'>read_any_attr</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN711"><span class='Ref_to_Parameter'>input</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* success! */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end read_client_first_message &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Verify the final nonce contained in the last message received from 
+ * client in an exchange. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN873"></a><span class='Declare_Function'>verify_final_nonce</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN875"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>client_nonce_len</span> <span class='Operator'>= </span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN873"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN122"><span class='Ref_to_Member'>client_nonce</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN876"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>server_nonce_len</span> <span class='Operator'>= </span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN873"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN131"><span class='Ref_to_Member'>server_nonce</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN877"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>final_nonce_len</span> <span class='Operator'>= </span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN873"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN126"><span class='Ref_to_Member'>client_final_nonce</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN877"><span class='Ref_To_Local'>final_nonce_len</span></a> <span class='Operator'>!= </span><a href="auth-scram.c.html#LN875"><span class='Ref_To_Local'>client_nonce_len</span></a> <span class='Operator'>+ </span><a href="auth-scram.c.html#LN876"><span class='Ref_To_Local'>server_nonce_len</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>memcmp<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN873"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN126"><span class='Ref_to_Member'>client_final_nonce</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN873"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN122"><span class='Ref_to_Member'>client_nonce</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN875"><span class='Ref_To_Local'>client_nonce_len</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>memcmp<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN873"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN126"><span class='Ref_to_Member'>client_final_nonce</span></a> <span class='Operator'>+ </span><a href="auth-scram.c.html#LN875"><span class='Ref_To_Local'>client_nonce_len</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN873"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN131"><span class='Ref_to_Member'>server_nonce</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN876"><span class='Ref_To_Local'>server_nonce_len</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Verify the client proof contained in the last message received from 
+ * client in an exchange. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN894"></a><span class='Declare_Function'>verify_client_proof</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN896"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>ClientSignature</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN897"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>ClientKey</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN898"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>client_StoredKey</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN899"></a>    <a href="../../include/common/scram-common.h.html#LN39"><span class='Ref_to_Typedef'>scram_HMAC_ctx</span></a> <span class='Declare_Local'>ctx</span><span class='Delimiter'>; 
+</span><a name="LN900"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* calculate ClientSignature */ 
+</span>    <a href="../../common/scram-common.c.html#LN36"><span class='Ref_to_Func'>scram_HMAC_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN899"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN894"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN116"><span class='Ref_to_Member'>StoredKey</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN899"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, 
+</span>                      <a href="auth-scram.c.html#LN894"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN120"><span class='Ref_to_Member'>client_first_message_bare</span></a><span class='Delimiter'>, 
+</span>                      strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN894"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN120"><span class='Ref_to_Member'>client_first_message_bare</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN899"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><span class='String'>","</span><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN899"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, 
+</span>                      <a href="auth-scram.c.html#LN894"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN130"><span class='Ref_to_Member'>server_first_message</span></a><span class='Delimiter'>, 
+</span>                      strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN894"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN130"><span class='Ref_to_Member'>server_first_message</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN899"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><span class='String'>","</span><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN899"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, 
+</span>                      <a href="auth-scram.c.html#LN894"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN125"><span class='Ref_to_Member'>client_final_message_without_proof</span></a><span class='Delimiter'>, 
+</span>                      strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN894"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN125"><span class='Ref_to_Member'>client_final_message_without_proof</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN47"><span class='Ref_to_Proto'>scram_HMAC_final</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN896"><span class='Ref_To_Local'>ClientSignature</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN899"><span class='Ref_To_Local'>ctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Extract the ClientKey that the client calculated from the proof */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN900"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="auth-scram.c.html#LN900"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>; </span><a href="auth-scram.c.html#LN900"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <a href="auth-scram.c.html#LN897"><span class='Ref_To_Local'>ClientKey</span></a><span class='Delimiter'>[</span><a href="auth-scram.c.html#LN900"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="auth-scram.c.html#LN894"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN127"><span class='Ref_to_Member'>ClientProof</span></a><span class='Delimiter'>[</span><a href="auth-scram.c.html#LN900"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>^ </span><a href="auth-scram.c.html#LN896"><span class='Ref_To_Local'>ClientSignature</span></a><span class='Delimiter'>[</span><a href="auth-scram.c.html#LN900"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Hash it one more time, and compare with StoredKey */ 
+</span>    <a href="../../include/common/scram-common.h.html#LN51"><span class='Ref_to_Proto'>scram_H</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN897"><span class='Ref_To_Local'>ClientKey</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN898"><span class='Ref_To_Local'>client_StoredKey</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span>memcmp<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN898"><span class='Ref_To_Local'>client_StoredKey</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN894"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN116"><span class='Ref_to_Member'>StoredKey</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end verify_client_proof &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Build the first server-side message sent to the client in a SASL 
+ * communication exchange. 
+ */ 
+</span><span class='Keyword'>static char </span><span class='Operator'>* 
+</span><a name="LN935"></a><span class='Declare_Function'>build_server_first_message</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/*------ 
+     * The syntax for the server-first-message is: (RFC 5802) 
+     * 
+     * server-first-message = 
+     *                   [reserved-mext ","] nonce "," salt "," 
+     *                   iteration-count ["," extensions] 
+     * 
+     * nonce           = "r=" c-nonce [s-nonce] 
+     *                   ;; Second part provided by server. 
+     * 
+     * c-nonce         = printable 
+     * 
+     * s-nonce         = printable 
+     * 
+     * salt            = "s=" base64 
+     * 
+     * iteration-count = "i=" posit-number 
+     *                   ;; A positive number. 
+     * 
+     * Example: 
+     * 
+     * r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096 
+     *------ 
+     */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Per the spec, the nonce may consist of any printable ASCII characters. 
+     * For convenience, however, we don't use the whole range available, 
+     * rather, we generate some random bytes, and base64 encode them. 
+     */ 
+</span><a name="LN967"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>raw_nonce</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN28"><span class='Ref_to_Const'>SCRAM_RAW_NONCE_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN968"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>encoded_len</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/utils/backend_random.h.html#LN16"><span class='Ref_to_Proto'>pg_backend_random</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN967"><span class='Ref_To_Local'>raw_nonce</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN28"><span class='Ref_to_Const'>SCRAM_RAW_NONCE_LEN</span></a><span class='Parentheses'>))</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INTERNAL_ERROR<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not generate random nonce"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN935"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN131"><span class='Ref_to_Member'>server_nonce</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="../../include/common/base64.h.html#LN15"><span class='Ref_to_Proto'>pg_b64_enc_len</span></a><span class='Parentheses'>(</span><a href="../../include/common/scram-common.h.html#LN28"><span class='Ref_to_Const'>SCRAM_RAW_NONCE_LEN</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN968"><span class='Ref_To_Local'>encoded_len</span></a> <span class='Operator'>= </span><a href="../../include/common/base64.h.html#LN13"><span class='Ref_to_Proto'>pg_b64_encode</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN967"><span class='Ref_To_Local'>raw_nonce</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN28"><span class='Ref_to_Const'>SCRAM_RAW_NONCE_LEN</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN935"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN131"><span class='Ref_to_Member'>server_nonce</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN935"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN131"><span class='Ref_to_Member'>server_nonce</span></a><span class='Delimiter'>[</span><a href="auth-scram.c.html#LN968"><span class='Ref_To_Local'>encoded_len</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN935"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN130"><span class='Ref_to_Member'>server_first_message</span></a> <span class='Operator'>= 
+</span>        <a href="../../common/psprintf.c.html#LN44"><span class='Ref_to_Func'>psprintf</span></a><span class='Parentheses'>(</span><span class='String'>"r=%s%s,s=%s,i=%u"</span><span class='Delimiter'>, 
+</span>                 <a href="auth-scram.c.html#LN935"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN122"><span class='Ref_to_Member'>client_nonce</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN935"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN131"><span class='Ref_to_Member'>server_nonce</span></a><span class='Delimiter'>, 
+</span>                 <a href="auth-scram.c.html#LN935"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN115"><span class='Ref_to_Member'>salt</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN935"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN114"><span class='Ref_to_Member'>iterations</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN935"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN130"><span class='Ref_to_Member'>server_first_message</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end build_server_first_message &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Read and parse the final message received from client. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN992"></a><span class='Declare_Function'>read_client_final_message</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>input</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN994"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>attr</span><span class='Delimiter'>; 
+</span><a name="LN995"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>channel_binding</span><span class='Delimiter'>; 
+</span><a name="LN996"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>value</span><span class='Delimiter'>; 
+</span><a name="LN997"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>begin</span><span class='Delimiter'>, 
+</span><a name="LN998"></a>               <span class='Operator'>*</span><span class='Declare_Local'>proof</span><span class='Delimiter'>; 
+</span><a name="LN999"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>p</span><span class='Delimiter'>; 
+</span><a name="LN1000"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>client_proof</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN997"><span class='Ref_To_Local'>begin</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN999"><span class='Ref_To_Local'>p</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN992"><span class='Ref_to_Parameter'>input</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/*------ 
+     * The syntax for the server-first-message is: (RFC 5802) 
+     * 
+     * gs2-header      = gs2-cbind-flag "," [ authzid ] "," 
+     *                   ;; GS2 header for SCRAM 
+     *                   ;; (the actual GS2 header includes an optional 
+     *                   ;; flag to indicate that the GSS mechanism is not 
+     *                   ;; "standard", but since SCRAM is "standard", we 
+     *                   ;; don't include that flag). 
+     * 
+     * cbind-input   = gs2-header [ cbind-data ] 
+     *                   ;; cbind-data MUST be present for 
+     *                   ;; gs2-cbind-flag of "p" and MUST be absent 
+     *                   ;; for "y" or "n". 
+     * 
+     * channel-binding = "c=" base64 
+     *                   ;; base64 encoding of cbind-input. 
+     * 
+     * proof           = "p=" base64 
+     * 
+     * client-final-message-without-proof = 
+     *                   channel-binding "," nonce ["," 
+     *                   extensions] 
+     * 
+     * client-final-message = 
+     *                   client-final-message-without-proof "," proof 
+     *------ 
+     */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Read channel-binding.  We don't support channel binding, so it's 
+     * expected to always be "biws", which is "n,,", base64-encoded. 
+     */ 
+</span>    <a href="auth-scram.c.html#LN995"><span class='Ref_To_Local'>channel_binding</span></a> <span class='Operator'>= </span><a href="../../interfaces/libpq/fe-auth-scram.c.html#LN253"><span class='Ref_to_Func'>read_attr_value</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN999"><span class='Ref_To_Local'>p</span></a><span class='Delimiter'>, </span><span class='String'>'c'</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN995"><span class='Ref_To_Local'>channel_binding</span></a><span class='Delimiter'>, </span><span class='String'>"biws"</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"unexpected SCRAM channel-binding attribute in client-final-message"</span><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN992"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN126"><span class='Ref_to_Member'>client_final_nonce</span></a> <span class='Operator'>= </span><a href="../../interfaces/libpq/fe-auth-scram.c.html#LN253"><span class='Ref_to_Func'>read_attr_value</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN999"><span class='Ref_To_Local'>p</span></a><span class='Delimiter'>, </span><span class='String'>'r'</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* ignore optional extensions */ 
+</span>    <span class='Control'>do</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="auth-scram.c.html#LN998"><span class='Ref_To_Local'>proof</span></a> <span class='Operator'>= </span><a href="auth-scram.c.html#LN999"><span class='Ref_To_Local'>p</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>        <span class='Keyword'>value </span><span class='Operator'>= </span><a href="auth-scram.c.html#LN658"><span class='Ref_to_Func'>read_any_attr</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN999"><span class='Ref_To_Local'>p</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN994"><span class='Ref_To_Local'>attr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} </span><span class='Control'>while</span> <span class='Parentheses'>(</span><a href="auth-scram.c.html#LN994"><span class='Ref_To_Local'>attr</span></a> <span class='Operator'>!= </span><span class='String'>'p'</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN1000"><span class='Ref_To_Local'>client_proof</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="../../include/common/base64.h.html#LN16"><span class='Ref_to_Proto'>pg_b64_dec_len</span></a><span class='Parentheses'>(</span>strlen<span class='Parentheses'>(</span><span class='Keyword'>value</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/common/base64.h.html#LN14"><span class='Ref_to_Proto'>pg_b64_decode</span></a><span class='Parentheses'>(</span><span class='Keyword'>value</span><span class='Delimiter'>, </span>strlen<span class='Parentheses'>(</span><span class='Keyword'>value</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN1000"><span class='Ref_To_Local'>client_proof</span></a><span class='Parentheses'>)</span> <span class='Operator'>!= </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>)</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Malformed proof in client-final-message."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    memcpy<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN992"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN127"><span class='Ref_to_Member'>ClientProof</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN1000"><span class='Ref_To_Local'>client_proof</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN1000"><span class='Ref_To_Local'>client_proof</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="auth-scram.c.html#LN999"><span class='Ref_To_Local'>p</span></a> <span class='Operator'>!= </span><span class='String'>'\0'</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROTOCOL_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"malformed SCRAM message"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>            <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Garbage found at the end of client-final-message."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN992"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN125"><span class='Ref_to_Member'>client_final_message_without_proof</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN998"><span class='Ref_To_Local'>proof</span></a> <span class='Operator'>- </span><a href="auth-scram.c.html#LN997"><span class='Ref_To_Local'>begin</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    memcpy<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN992"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN125"><span class='Ref_to_Member'>client_final_message_without_proof</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN992"><span class='Ref_to_Parameter'>input</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN998"><span class='Ref_To_Local'>proof</span></a> <span class='Operator'>- </span><a href="auth-scram.c.html#LN997"><span class='Ref_To_Local'>begin</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN992"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN125"><span class='Ref_to_Member'>client_final_message_without_proof</span></a><span class='Delimiter'>[</span><a href="auth-scram.c.html#LN998"><span class='Ref_To_Local'>proof</span></a> <span class='Operator'>- </span><a href="auth-scram.c.html#LN997"><span class='Ref_To_Local'>begin</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end read_client_final_message &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Build the final server-side message of an exchange. 
+ */ 
+</span><span class='Keyword'>static char </span><span class='Operator'>* 
+</span><a name="LN1075"></a><span class='Declare_Function'>build_server_final_message</span><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN108"><span class='Ref_to_Typedef'>scram_state</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1077"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>ServerSignature</span><span class='Delimiter'>[</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>]; 
+</span><a name="LN1078"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>server_signature_base64</span><span class='Delimiter'>; 
+</span><a name="LN1079"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>siglen</span><span class='Delimiter'>; 
+</span><a name="LN1080"></a>    <a href="../../include/common/scram-common.h.html#LN39"><span class='Ref_to_Typedef'>scram_HMAC_ctx</span></a> <span class='Declare_Local'>ctx</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* calculate ServerSignature */ 
+</span>    <a href="../../common/scram-common.c.html#LN36"><span class='Ref_to_Func'>scram_HMAC_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1080"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN1075"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN117"><span class='Ref_to_Member'>ServerKey</span></a><span class='Delimiter'>, </span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1080"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, 
+</span>                      <a href="auth-scram.c.html#LN1075"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN120"><span class='Ref_to_Member'>client_first_message_bare</span></a><span class='Delimiter'>, 
+</span>                      strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN1075"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN120"><span class='Ref_to_Member'>client_first_message_bare</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1080"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><span class='String'>","</span><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1080"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, 
+</span>                      <a href="auth-scram.c.html#LN1075"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN130"><span class='Ref_to_Member'>server_first_message</span></a><span class='Delimiter'>, 
+</span>                      strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN1075"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN130"><span class='Ref_to_Member'>server_first_message</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1080"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><span class='String'>","</span><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN46"><span class='Ref_to_Proto'>scram_HMAC_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1080"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, 
+</span>                      <a href="auth-scram.c.html#LN1075"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN125"><span class='Ref_to_Member'>client_final_message_without_proof</span></a><span class='Delimiter'>, 
+</span>                      strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN1075"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="auth-scram.c.html#LN125"><span class='Ref_to_Member'>client_final_message_without_proof</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/scram-common.h.html#LN47"><span class='Ref_to_Proto'>scram_HMAC_final</span></a><span class='Parentheses'>(</span><a href="auth-scram.c.html#LN1077"><span class='Ref_To_Local'>ServerSignature</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1080"><span class='Ref_To_Local'>ctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="auth-scram.c.html#LN1078"><span class='Ref_To_Local'>server_signature_base64</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="../../include/common/base64.h.html#LN15"><span class='Ref_to_Proto'>pg_b64_enc_len</span></a><span class='Parentheses'>(</span><a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN1079"><span class='Ref_To_Local'>siglen</span></a> <span class='Operator'>= </span><a href="../../include/common/base64.h.html#LN13"><span class='Ref_to_Proto'>pg_b64_encode</span></a><span class='Parentheses'>((</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="auth-scram.c.html#LN1077"><span class='Ref_To_Local'>ServerSignature</span></a><span class='Delimiter'>, 
+</span>                           <a href="../../include/common/scram-common.h.html#LN18"><span class='Ref_to_Const'>SCRAM_KEY_LEN</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN1078"><span class='Ref_To_Local'>server_signature_base64</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="auth-scram.c.html#LN1078"><span class='Ref_To_Local'>server_signature_base64</span></a><span class='Delimiter'>[</span><a href="auth-scram.c.html#LN1079"><span class='Ref_To_Local'>siglen</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/*------ 
+     * The syntax for the server-final-message is: (RFC 5802) 
+     * 
+     * verifier        = "v=" base64 
+     *                   ;; base-64 encoded ServerSignature. 
+     * 
+     * server-final-message = (server-error / verifier) 
+     *                   ["," extensions] 
+     * 
+     *------ 
+     */ 
+</span>    <span class='Control'>return</span> <a href="../../common/psprintf.c.html#LN44"><span class='Ref_to_Func'>psprintf</span></a><span class='Parentheses'>(</span><span class='String'>"v=%s"</span><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN1078"><span class='Ref_To_Local'>server_signature_base64</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end build_server_final_message &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Determinisitcally generate salt for mock authentication, using a SHA256 
+ * hash based on the username and a cluster-level secret key.  Returns a 
+ * pointer to a static buffer of size SCRAM_DEFAULT_SALT_LEN. 
+ */ 
+</span><span class='Keyword'>static char </span><span class='Operator'>* 
+</span><a name="LN1123"></a><span class='Declare_Function'>scram_mock_salt</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>username</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1125"></a>    <a href="../../include/common/sha2.h.html#LN77"><span class='Ref_to_Struct'>pg_sha256_ctx</span></a> <span class='Declare_Local'>ctx</span><span class='Delimiter'>; 
+</span><a name="LN1126"></a>    <span class='Keyword'>static </span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Local'>sha_digest</span><span class='Delimiter'>[</span><a href="../../include/common/sha2.h.html#LN61"><span class='Ref_to_Const'>PG_SHA256_DIGEST_LENGTH</span></a><span class='Delimiter'>]; 
+</span><a name="LN1127"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>mock_auth_nonce</span> <span class='Operator'>= </span><a href="../../include/access/xlog.h.html#LN258"><span class='Ref_to_Proto'>GetMockAuthenticationNonce</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Generate salt using a SHA256 hash of the username and the cluster's 
+     * mock authentication nonce.  (This works as long as the salt length is 
+     * not larger the SHA256 digest length. If the salt is smaller, the caller 
+     * will just ignore the extra data.) 
+     */ 
+</span>    <a href="../../include/c.h.html#LN751"><span class='Ref_to_Macro'>StaticAssertStmt</span></a><span class='Parentheses'>(</span><a href="../../include/common/sha2.h.html#LN61"><span class='Ref_to_Const'>PG_SHA256_DIGEST_LENGTH</span></a> <span class='Operator'>&GT;= </span><a href="../../include/common/scram-common.h.html#LN31"><span class='Ref_to_Const'>SCRAM_DEFAULT_SALT_LEN</span></a><span class='Delimiter'>, 
+</span>                     <span class='String'>"salt length greater than SHA256 digest length"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../common/sha2_openssl.c.html#LN28"><span class='Ref_to_Func'>pg_sha256_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1125"><span class='Ref_To_Local'>ctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../common/sha2_openssl.c.html#LN34"><span class='Ref_to_Func'>pg_sha256_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1125"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="auth-scram.c.html#LN1123"><span class='Ref_to_Parameter'>username</span></a><span class='Delimiter'>, </span>strlen<span class='Parentheses'>(</span><a href="auth-scram.c.html#LN1123"><span class='Ref_to_Parameter'>username</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../common/sha2_openssl.c.html#LN34"><span class='Ref_to_Func'>pg_sha256_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1125"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="auth-scram.c.html#LN1127"><span class='Ref_To_Local'>mock_auth_nonce</span></a><span class='Delimiter'>, </span><a href="../../include/catalog/pg_control.h.html#LN22"><span class='Ref_to_Const'>MOCK_AUTH_NONCE_LEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../common/sha2_openssl.c.html#LN40"><span class='Ref_to_Func'>pg_sha256_final</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="auth-scram.c.html#LN1125"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><a href="auth-scram.c.html#LN1126"><span class='Ref_To_Local'>sha_digest</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="auth-scram.c.html#LN1126"><span class='Ref_To_Local'>sha_digest</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end scram_mock_salt &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

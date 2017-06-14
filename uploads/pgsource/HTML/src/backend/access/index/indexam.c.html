@@ -1,0 +1,926 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\index\indexam.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\index\indexam.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:29 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * indexam.c 
+ *    general index access method routines 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/access/index/indexam.c 
+ * 
+ * INTERFACE ROUTINES 
+ *      index_open      - open an index relation by relation OID 
+ *      index_close     - close an index relation 
+ *      index_beginscan - start a scan of an index with amgettuple 
+ *      index_beginscan_bitmap - start a scan of an index with amgetbitmap 
+ *      index_rescan    - restart a scan of an index 
+ *      index_endscan   - end a scan 
+ *      index_insert    - insert an index tuple into a relation 
+ *      index_markpos   - mark a scan position 
+ *      index_restrpos  - restore a scan position 
+ *      index_parallelscan_estimate - estimate shared memory for parallel scan 
+ *      index_parallelscan_initialize - initialize parallel scan 
+ *      index_parallelrescan  - (re)start a parallel scan of an index 
+ *      index_beginscan_parallel - join parallel index scan 
+ *      index_getnext_tid   - get the next TID from a scan 
+ *      index_fetch_heap        - get the scan's next heap tuple 
+ *      index_getnext   - get the next heap tuple from a scan 
+ *      index_getbitmap - get all tuples from a scan 
+ *      index_bulk_delete   - bulk deletion of index tuples 
+ *      index_vacuum_cleanup    - post-deletion cleanup of an index 
+ *      index_can_return    - does index support index-only scans? 
+ *      index_getprocid - get a support procedure OID 
+ *      index_getprocinfo - get a support procedure's lookup info 
+ * 
+ * NOTES 
+ *      This file contains the index_ routines which used 
+ *      to be a scattered collection of stuff in access/genam. 
+ * 
+ * 
+ * old comments 
+ *      Scans are implemented as follows: 
+ * 
+ *      `0' represents an invalid item pointer. 
+ *      `-' represents an unknown item pointer. 
+ *      `X' represents a known item pointers. 
+ *      `+' represents known or invalid item pointers. 
+ *      `*' represents any item pointers. 
+ * 
+ *      State is represented by a triple of these symbols in the order of 
+ *      previous, current, next.  Note that the case of reverse scans works 
+ *      identically. 
+ * 
+ *              State   Result 
+ *      (1)     + + -   + 0 0           (if the next item pointer is invalid) 
+ *      (2)             + X -           (otherwise) 
+ *      (3)     * 0 0   * 0 0           (no change) 
+ *      (4)     + X 0   X 0 0           (shift) 
+ *      (5)     * + X   + X -           (shift, add unknown) 
+ * 
+ *      All other states cannot occur. 
+ * 
+ *      Note: It would be possible to cache the status of the previous and 
+ *            next item pointer using the flags. 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/amapi.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/relscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/transam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/catalog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/index.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/bufmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/predicate.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/snapmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/tqual.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *                  macros used in index_ routines 
+ * 
+ * Note: the ReindexIsProcessingIndex() check in RELATION_CHECKS is there 
+ * to check that we don't try to scan or do retail insertions into an index 
+ * that is currently being rebuilt or pending rebuild.  This helps to catch 
+ * things that don't work when reindexing system catalogs.  The assertion 
+ * doesn't prevent the actual rebuild because we don't use RELATION_CHECKS 
+ * when calling the index AM's ambuild routine, and there is no reason for 
+ * ambuild to call its subsidiary routines through this file. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a name="LN97"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>RELATION_CHECKS</span> <span class='Operator'>\ 
+</span><span class='Parentheses'>(</span> <span class='Operator'>\ 
+</span>    <a href="../../../include/c.h.html#LN675"><span class='Ref_to_Macro'>AssertMacro</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN389"><span class='Ref_to_Macro'>RelationIsValid</span></a><span class='Parentheses'>(</span>indexRelation<span class='Parentheses'>))</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>    <a href="../../../include/c.h.html#LN675"><span class='Ref_to_Macro'>AssertMacro</span></a><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN525"><span class='Ref_to_Macro'>PointerIsValid</span></a><span class='Parentheses'>(</span>indexRelation<span class='Operator'>-&GT;</span>rd_amroutine<span class='Parentheses'>))</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>    <a href="../../../include/c.h.html#LN675"><span class='Ref_to_Macro'>AssertMacro</span></a><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/catalog/index.h.html#LN130"><span class='Ref_to_Proto'>ReindexIsProcessingIndex</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN416"><span class='Ref_to_Macro'>RelationGetRelid</span></a><span class='Parentheses'>(</span>indexRelation<span class='Parentheses'>)))</span> <span class='Operator'>\ 
+</span><span class='Parentheses'>)</span> 
+ 
+<a name="LN104"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>SCAN_CHECKS</span> <span class='Operator'>\ 
+</span><span class='Parentheses'>(</span> <span class='Operator'>\ 
+</span>    <a href="../../../include/c.h.html#LN675"><span class='Ref_to_Macro'>AssertMacro</span></a><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN127"><span class='Ref_to_Macro'>IndexScanIsValid</span></a><span class='Parentheses'>(</span>scan<span class='Parentheses'>))</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>    <a href="../../../include/c.h.html#LN675"><span class='Ref_to_Macro'>AssertMacro</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN389"><span class='Ref_to_Macro'>RelationIsValid</span></a><span class='Parentheses'>(</span>scan<span class='Operator'>-&GT;</span>indexRelation<span class='Parentheses'>))</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>    <a href="../../../include/c.h.html#LN675"><span class='Ref_to_Macro'>AssertMacro</span></a><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN525"><span class='Ref_to_Macro'>PointerIsValid</span></a><span class='Parentheses'>(</span>scan<span class='Operator'>-&GT;</span>indexRelation<span class='Operator'>-&GT;</span>rd_amroutine<span class='Parentheses'>))</span> <span class='Operator'>\ 
+</span><span class='Parentheses'>)</span> 
+ 
+<a name="LN111"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>CHECK_REL_PROCEDURE</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>pname</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span><span class='Control'>do</span> <span class='Delimiter'>{ </span><span class='Operator'>\ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>indexRelation<span class='Operator'>-&GT;</span>rd_amroutine<span class='Operator'>-&GT;</span>pname <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"function %s is not defined for index %s"</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>             <a href="../../../include/c.h.html#LN160"><span class='Ref_to_Macro'>CppAsString</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN111"><span class='Ref_to_Parameter'>pname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span>indexRelation<span class='Parentheses'>))</span><span class='Delimiter'>; </span><span class='Operator'>\ 
+</span><span class='Delimiter'>} </span><span class='Control'>while</span><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>) 
+</span> 
+<a name="LN118"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>CHECK_SCAN_PROCEDURE</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>pname</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span><span class='Control'>do</span> <span class='Delimiter'>{ </span><span class='Operator'>\ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>scan<span class='Operator'>-&GT;</span>indexRelation<span class='Operator'>-&GT;</span>rd_amroutine<span class='Operator'>-&GT;</span>pname <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"function %s is not defined for index %s"</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>             <a href="../../../include/c.h.html#LN160"><span class='Ref_to_Macro'>CppAsString</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN118"><span class='Ref_to_Parameter'>pname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span>scan<span class='Operator'>-&GT;</span>indexRelation<span class='Parentheses'>))</span><span class='Delimiter'>; </span><span class='Operator'>\ 
+</span><span class='Delimiter'>} </span><span class='Control'>while</span><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>) 
+</span> 
+<a name="LN125"></a><span class='Keyword'>static </span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Prototype'>index_beginscan_internal</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>indexRelation</span><span class='Delimiter'>, 
+</span><a name="LN126"></a>                         <span class='Keyword'>int </span><span class='Declare_Parameter'>nkeys</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>norderbys</span><span class='Delimiter'>, </span><a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a> <span class='Declare_Parameter'>snapshot</span><span class='Delimiter'>, 
+</span><a name="LN127"></a>                         <a href="../../../include/access/genam.h.html#LN88"><span class='Ref_to_Typedef'>ParallelIndexScanDesc</span></a> <span class='Declare_Parameter'>pscan</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>temp_snap</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *                 index_ interface functions 
+ * ---------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_open - open an index relation by relation OID 
+ * 
+ *      If lockmode is not "NoLock", the specified kind of lock is 
+ *      obtained on the index.  (Generally, NoLock should only be 
+ *      used if the caller knows it has some appropriate lock on the 
+ *      index already.) 
+ * 
+ *      An error is raised if the index does not exist. 
+ * 
+ *      This is a convenience routine adapted for indexscan use. 
+ *      Some callers may prefer to use relation_open directly. 
+ * ---------------- 
+ */ 
+</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> 
+<a name="LN150"></a><span class='Declare_Function'>index_open</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relationId</span><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN25"><span class='Ref_to_Typedef'>LOCKMODE</span></a> <span class='Declare_Parameter'>lockmode</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN152"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>r</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN152"><span class='Ref_To_Local'>r</span></a> <span class='Operator'>= </span><a href="../../../include/access/heapam.h.html#LN84"><span class='Ref_to_Proto'>relation_open</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN150"><span class='Ref_to_Parameter'>relationId</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN150"><span class='Ref_to_Parameter'>lockmode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN152"><span class='Ref_To_Local'>r</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN113"><span class='Ref_to_Member'>rd_rel</span></a><span class='Operator'>-&GT;</span>relkind <span class='Operator'>!= </span><a href="../../../include/catalog/pg_class.h.html#LN160"><span class='Ref_to_Const'>RELKIND_INDEX</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_WRONG_OBJECT_TYPE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"\"%s\" is not an index"</span><span class='Delimiter'>, 
+</span>                        <a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN152"><span class='Ref_To_Local'>r</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN152"><span class='Ref_To_Local'>r</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_close - close an index relation 
+ * 
+ *      If lockmode is not "NoLock", we then release the specified lock. 
+ * 
+ *      Note that it is often sensible to hold a lock beyond index_close; 
+ *      in that case, the lock is released automatically at xact end. 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN175"></a><span class='Declare_Function'>index_close</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>relation</span><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN25"><span class='Ref_to_Typedef'>LOCKMODE</span></a> <span class='Declare_Parameter'>lockmode</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN177"></a>    <a href="../../../include/utils/rel.h.html#LN35"><span class='Ref_to_Struct'>LockRelId</span></a>   <span class='Declare_Local'>relid</span> <span class='Operator'>= </span><a href="indexam.c.html#LN175"><span class='Ref_to_Parameter'>relation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN116"><span class='Ref_to_Member'>rd_lockInfo</span></a><span class='Operator'>.</span><a href="../../../include/utils/rel.h.html#LN43"><span class='Ref_to_Member'>lockRelId</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN175"><span class='Ref_to_Parameter'>lockmode</span></a> <span class='Operator'>&GT;= </span><a href="../../../include/storage/lockdefs.h.html#LN33"><span class='Ref_to_Const'>NoLock</span></a> <span class='Operator'>&& </span><a href="indexam.c.html#LN175"><span class='Ref_to_Parameter'>lockmode</span></a> <span class='Operator'>&LT; </span><a href="../../../include/storage/lock.h.html#LN85"><span class='Ref_to_Const'>MAX_LOCKMODES</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* The relcache does the real work... */ 
+</span>    <a href="../../../include/utils/relcache.h.html#LN34"><span class='Ref_to_Proto'>RelationClose</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN175"><span class='Ref_to_Parameter'>relation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN175"><span class='Ref_to_Parameter'>lockmode</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/lockdefs.h.html#LN33"><span class='Ref_to_Const'>NoLock</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/lmgr.h.html#LN41"><span class='Ref_to_Proto'>UnlockRelationId</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="indexam.c.html#LN177"><span class='Ref_To_Local'>relid</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN175"><span class='Ref_to_Parameter'>lockmode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_insert - insert an index tuple into a relation 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN193"></a><span class='Declare_Function'>index_insert</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>indexRelation</span><span class='Delimiter'>, 
+</span><a name="LN194"></a>             <a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>values</span><span class='Delimiter'>, 
+</span><a name="LN195"></a>             <span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>isnull</span><span class='Delimiter'>, 
+</span><a name="LN196"></a>             <a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>heap_t_ctid</span><span class='Delimiter'>, 
+</span><a name="LN197"></a>             <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>heapRelation</span><span class='Delimiter'>, 
+</span><a name="LN198"></a>             <a href="../../../include/access/genam.h.html#LN110"><span class='Ref_to_Enum'>IndexUniqueCheck</span></a> <span class='Declare_Parameter'>checkUnique</span><span class='Delimiter'>, 
+</span><a name="LN199"></a>             <a href="../../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>indexInfo</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="indexam.c.html#LN97"><span class='Ref_to_Const'>RELATION_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN111"><span class='Ref_to_Macro'>CHECK_REL_PROCEDURE</span></a><span class='Parentheses'>(</span>aminsert<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN193"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN190"><span class='Ref_to_Member'>ampredlocks</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/storage/predicate.h.html#LN61"><span class='Ref_to_Proto'>CheckForSerializableConflictIn</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN193"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Delimiter'>, 
+</span>                                       <span class='Parentheses'>(</span><a href="../../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a><span class='Parentheses'>) </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, 
+</span>                                       <a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN193"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN199"><span class='Ref_to_Member'>aminsert</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN193"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN194"><span class='Ref_to_Parameter'>values</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN195"><span class='Ref_to_Parameter'>isnull</span></a><span class='Delimiter'>, 
+</span>                                                 <a href="indexam.c.html#LN196"><span class='Ref_to_Parameter'>heap_t_ctid</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN197"><span class='Ref_to_Parameter'>heapRelation</span></a><span class='Delimiter'>, 
+</span>                                                 <a href="indexam.c.html#LN198"><span class='Ref_to_Parameter'>checkUnique</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN199"><span class='Ref_to_Parameter'>indexInfo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_insert &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * index_beginscan - start a scan of an index with amgettuple 
+ * 
+ * Caller must be holding suitable locks on the heap and the index. 
+ */ 
+</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> 
+<a name="LN220"></a><span class='Declare_Function'>index_beginscan</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>heapRelation</span><span class='Delimiter'>, 
+</span><a name="LN221"></a>                <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>indexRelation</span><span class='Delimiter'>, 
+</span><a name="LN222"></a>                <a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a> <span class='Declare_Parameter'>snapshot</span><span class='Delimiter'>, 
+</span><a name="LN223"></a>                <span class='Keyword'>int </span><span class='Declare_Parameter'>nkeys</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>norderbys</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN225"></a>    <a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Local'>scan</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN225"><span class='Ref_To_Local'>scan</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN125"><span class='Ref_to_Proto'>index_beginscan_internal</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN221"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN223"><span class='Ref_to_Parameter'>nkeys</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN223"><span class='Ref_to_Parameter'>norderbys</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN222"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Save additional parameters into the scandesc.  Everything else was set 
+     * up by RelationGetIndexScan. 
+     */ 
+</span>    <a href="indexam.c.html#LN225"><span class='Ref_To_Local'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN87"><span class='Ref_to_Member'>heapRelation</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN220"><span class='Ref_to_Parameter'>heapRelation</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN225"><span class='Ref_To_Local'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN89"><span class='Ref_to_Member'>xs_snapshot</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN222"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN225"><span class='Ref_To_Local'>scan</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * index_beginscan_bitmap - start a scan of an index with amgetbitmap 
+ * 
+ * As above, caller had better be holding some lock on the parent heap 
+ * relation, even though it's not explicitly mentioned here. 
+ */ 
+</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> 
+<a name="LN246"></a><span class='Declare_Function'>index_beginscan_bitmap</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>indexRelation</span><span class='Delimiter'>, 
+</span><a name="LN247"></a>                       <a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a> <span class='Declare_Parameter'>snapshot</span><span class='Delimiter'>, 
+</span><a name="LN248"></a>                       <span class='Keyword'>int </span><span class='Declare_Parameter'>nkeys</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN250"></a>    <a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Local'>scan</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN250"><span class='Ref_To_Local'>scan</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN125"><span class='Ref_to_Proto'>index_beginscan_internal</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN246"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN248"><span class='Ref_to_Parameter'>nkeys</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="indexam.c.html#LN247"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Save additional parameters into the scandesc.  Everything else was set 
+     * up by RelationGetIndexScan. 
+     */ 
+</span>    <a href="indexam.c.html#LN250"><span class='Ref_To_Local'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN89"><span class='Ref_to_Member'>xs_snapshot</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN247"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN250"><span class='Ref_To_Local'>scan</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * index_beginscan_internal --- common code for index_beginscan variants 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> 
+<a name="LN267"></a><span class='Declare_Function'>index_beginscan_internal</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>indexRelation</span><span class='Delimiter'>, 
+</span><a name="LN268"></a>                         <span class='Keyword'>int </span><span class='Declare_Parameter'>nkeys</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>norderbys</span><span class='Delimiter'>, </span><a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a> <span class='Declare_Parameter'>snapshot</span><span class='Delimiter'>, 
+</span><a name="LN269"></a>                         <a href="../../../include/access/genam.h.html#LN88"><span class='Ref_to_Typedef'>ParallelIndexScanDesc</span></a> <span class='Declare_Parameter'>pscan</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>temp_snap</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN271"></a>    <a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Local'>scan</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN97"><span class='Ref_to_Const'>RELATION_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN111"><span class='Ref_to_Macro'>CHECK_REL_PROCEDURE</span></a><span class='Parentheses'>(</span>ambeginscan<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN267"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN190"><span class='Ref_to_Member'>ampredlocks</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/storage/predicate.h.html#LN50"><span class='Ref_to_Proto'>PredicateLockRelation</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN267"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN268"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We hold a reference count to the relcache entry throughout the scan. 
+     */ 
+</span>    <a href="../../../include/utils/rel.h.html#LN635"><span class='Ref_to_Proto'>RelationIncrementReferenceCount</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN267"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Tell the AM to open a scan. 
+     */ 
+</span>    <a href="indexam.c.html#LN271"><span class='Ref_To_Local'>scan</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN267"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN207"><span class='Ref_to_Member'>ambeginscan</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN267"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN268"><span class='Ref_to_Parameter'>nkeys</span></a><span class='Delimiter'>, 
+</span>                                                    <a href="indexam.c.html#LN268"><span class='Ref_to_Parameter'>norderbys</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* Initialize information for parallel scan. */ 
+</span>    <a href="indexam.c.html#LN271"><span class='Ref_To_Local'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN138"><span class='Ref_to_Member'>parallel_scan</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN269"><span class='Ref_to_Parameter'>pscan</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN271"><span class='Ref_To_Local'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN95"><span class='Ref_to_Member'>xs_temp_snap</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN269"><span class='Ref_to_Parameter'>temp_snap</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN271"><span class='Ref_To_Local'>scan</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_beginscan_internal &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_rescan  - (re)start a scan of an index 
+ * 
+ * During a restart, the caller may specify a new set of scankeys and/or 
+ * orderbykeys; but the number of keys cannot differ from what index_beginscan 
+ * was told.  (Later we might relax that to "must not exceed", but currently 
+ * the index AMs tend to assume that scan-&GT;numberOfKeys is what to believe.) 
+ * To restart the scan without changing keys, pass NULL for the key arrays. 
+ * (Of course, keys *must* be passed on the first call, unless 
+ * scan-&GT;numberOfKeys is zero.) 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN309"></a><span class='Declare_Function'>index_rescan</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Parameter'>scan</span><span class='Delimiter'>, 
+</span><a name="LN310"></a>             <a href="../../../include/access/skey.h.html#LN74"><span class='Ref_to_Typedef'>ScanKey</span></a> <span class='Declare_Parameter'>keys</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nkeys</span><span class='Delimiter'>, 
+</span><a name="LN311"></a>             <a href="../../../include/access/skey.h.html#LN74"><span class='Ref_to_Typedef'>ScanKey</span></a> <span class='Declare_Parameter'>orderbys</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>norderbys</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="indexam.c.html#LN104"><span class='Ref_to_Const'>SCAN_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN118"><span class='Ref_to_Macro'>CHECK_SCAN_PROCEDURE</span></a><span class='Parentheses'>(</span>amrescan<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN310"><span class='Ref_to_Parameter'>nkeys</span></a> <span class='Operator'>== </span><a href="indexam.c.html#LN309"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN90"><span class='Ref_to_Member'>numberOfKeys</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN311"><span class='Ref_to_Parameter'>norderbys</span></a> <span class='Operator'>== </span><a href="indexam.c.html#LN309"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN91"><span class='Ref_to_Member'>numberOfOrderBys</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Release any held pin on a heap page */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN309"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN309"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="indexam.c.html#LN309"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="indexam.c.html#LN309"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN135"><span class='Ref_to_Member'>xs_continue_hot</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN309"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN98"><span class='Ref_to_Member'>kill_prior_tuple</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* for safety */ 
+</span> 
+    <a href="indexam.c.html#LN309"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN208"><span class='Ref_to_Member'>amrescan</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN309"><span class='Ref_to_Parameter'>scan</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN310"><span class='Ref_to_Parameter'>keys</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN310"><span class='Ref_to_Parameter'>nkeys</span></a><span class='Delimiter'>, 
+</span>                                                <a href="indexam.c.html#LN311"><span class='Ref_to_Parameter'>orderbys</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN311"><span class='Ref_to_Parameter'>norderbys</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_rescan &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_endscan - end a scan 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN339"></a><span class='Declare_Function'>index_endscan</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Parameter'>scan</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="indexam.c.html#LN104"><span class='Ref_to_Const'>SCAN_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN118"><span class='Ref_to_Macro'>CHECK_SCAN_PROCEDURE</span></a><span class='Parentheses'>(</span>amendscan<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Release any held pin on a heap page */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN339"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN339"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="indexam.c.html#LN339"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* End the AM's scan */ 
+</span>    <a href="indexam.c.html#LN339"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN211"><span class='Ref_to_Member'>amendscan</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN339"><span class='Ref_to_Parameter'>scan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Release index refcount acquired by index_beginscan */ 
+</span>    <a href="../../../include/utils/rel.h.html#LN636"><span class='Ref_to_Proto'>RelationDecrementReferenceCount</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN339"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN339"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN95"><span class='Ref_to_Member'>xs_temp_snap</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/snapmgr.h.html#LN81"><span class='Ref_to_Proto'>UnregisterSnapshot</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN339"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN89"><span class='Ref_to_Member'>xs_snapshot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Release the scan data structure itself */ 
+</span>    <a href="genam.c.html#LN144"><span class='Ref_to_Func'>IndexScanEnd</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN339"><span class='Ref_to_Parameter'>scan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_endscan &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_markpos  - mark a scan position 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN369"></a><span class='Declare_Function'>index_markpos</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Parameter'>scan</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="indexam.c.html#LN104"><span class='Ref_to_Const'>SCAN_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN118"><span class='Ref_to_Macro'>CHECK_SCAN_PROCEDURE</span></a><span class='Parentheses'>(</span>ammarkpos<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN369"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN212"><span class='Ref_to_Member'>ammarkpos</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN369"><span class='Ref_to_Parameter'>scan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_restrpos  - restore a scan position 
+ * 
+ * NOTE: this only restores the internal scan state of the index AM. 
+ * The current result tuple (scan-&GT;xs_ctup) doesn't change.  See comments 
+ * for ExecRestrPos(). 
+ * 
+ * NOTE: in the presence of HOT chains, mark/restore only works correctly 
+ * if the scan's snapshot is MVCC-safe; that ensures that there's at most one 
+ * returnable tuple in each HOT chain, and so restoring the prior state at the 
+ * granularity of the index AM is sufficient.  Since the only current user 
+ * of mark/restore functionality is nodeMergejoin.c, this effectively means 
+ * that merge-join plans only work for MVCC snapshots.  This could be fixed 
+ * if necessary, but for now it seems unimportant. 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN394"></a><span class='Declare_Function'>index_restrpos</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Parameter'>scan</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/utils/tqual.h.html#LN30"><span class='Ref_to_Macro'>IsMVCCSnapshot</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN394"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN89"><span class='Ref_to_Member'>xs_snapshot</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN104"><span class='Ref_to_Const'>SCAN_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN118"><span class='Ref_to_Macro'>CHECK_SCAN_PROCEDURE</span></a><span class='Parentheses'>(</span>amrestrpos<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN394"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN135"><span class='Ref_to_Member'>xs_continue_hot</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN394"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN98"><span class='Ref_to_Member'>kill_prior_tuple</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* for safety */ 
+</span> 
+    <a href="indexam.c.html#LN394"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN213"><span class='Ref_to_Member'>amrestrpos</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN394"><span class='Ref_to_Parameter'>scan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * index_parallelscan_estimate - estimate shared memory for parallel scan 
+ * 
+ * Currently, we don't pass any information to the AM-specific estimator, 
+ * so it can probably only return a constant.  In the future, we might need 
+ * to pass more information. 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN416"></a><span class='Declare_Function'>index_parallelscan_estimate</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>indexRelation</span><span class='Delimiter'>, </span><a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a> <span class='Declare_Parameter'>snapshot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN418"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>nbytes</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN97"><span class='Ref_to_Const'>RELATION_CHECKS</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN418"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../../include/access/relscan.h.html#LN142"><span class='Ref_to_Struct'>ParallelIndexScanDescData</span></a><span class='Delimiter'>, </span>ps_snapshot_data<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN418"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN44"><span class='Ref_to_Proto'>add_size</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN418"><span class='Ref_To_Local'>nbytes</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/snapmgr.h.html#LN107"><span class='Ref_to_Proto'>EstimateSnapshotSpace</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN416"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN418"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN418"><span class='Ref_To_Local'>nbytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If amestimateparallelscan is not provided, assume there is no 
+     * AM-specific data needed.  (It's hard to believe that could work, but 
+     * it's easy enough to cater to it here.) 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN416"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN216"><span class='Ref_to_Member'>amestimateparallelscan</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="indexam.c.html#LN418"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN44"><span class='Ref_to_Proto'>add_size</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN418"><span class='Ref_To_Local'>nbytes</span></a><span class='Delimiter'>, 
+</span>                      <a href="indexam.c.html#LN416"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN216"><span class='Ref_to_Member'>amestimateparallelscan</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN418"><span class='Ref_To_Local'>nbytes</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_parallelscan_estimate &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * index_parallelscan_initialize - initialize parallel scan 
+ * 
+ * We initialize both the ParallelIndexScanDesc proper and the AM-specific 
+ * information which follows it. 
+ * 
+ * This function calls access method specific initialization routine to 
+ * initialize am specific information.  Call this just once in the leader 
+ * process; then, individual workers attach via index_beginscan_parallel. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN449"></a><span class='Declare_Function'>index_parallelscan_initialize</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>heapRelation</span><span class='Delimiter'>, </span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>indexRelation</span><span class='Delimiter'>, 
+</span><a name="LN450"></a>                              <a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a> <span class='Declare_Parameter'>snapshot</span><span class='Delimiter'>, </span><a href="../../../include/access/genam.h.html#LN88"><span class='Ref_to_Typedef'>ParallelIndexScanDesc</span></a> <span class='Declare_Parameter'>target</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN452"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>offset</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN97"><span class='Ref_to_Const'>RELATION_CHECKS</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN452"><span class='Ref_To_Local'>offset</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN44"><span class='Ref_to_Proto'>add_size</span></a><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../../include/access/relscan.h.html#LN142"><span class='Ref_to_Struct'>ParallelIndexScanDescData</span></a><span class='Delimiter'>, </span>ps_snapshot_data<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                      <a href="../../../include/utils/snapmgr.h.html#LN107"><span class='Ref_to_Proto'>EstimateSnapshotSpace</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN450"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN452"><span class='Ref_To_Local'>offset</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN452"><span class='Ref_To_Local'>offset</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN450"><span class='Ref_to_Parameter'>target</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN144"><span class='Ref_to_Member'>ps_relid</span></a> <span class='Operator'>= </span><a href="../../../include/utils/rel.h.html#LN416"><span class='Ref_to_Macro'>RelationGetRelid</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN449"><span class='Ref_to_Parameter'>heapRelation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN450"><span class='Ref_to_Parameter'>target</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN145"><span class='Ref_to_Member'>ps_indexid</span></a> <span class='Operator'>= </span><a href="../../../include/utils/rel.h.html#LN416"><span class='Ref_to_Macro'>RelationGetRelid</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN449"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN450"><span class='Ref_to_Parameter'>target</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN146"><span class='Ref_to_Member'>ps_offset</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN452"><span class='Ref_To_Local'>offset</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/snapmgr.h.html#LN108"><span class='Ref_to_Proto'>SerializeSnapshot</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN450"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN450"><span class='Ref_to_Parameter'>target</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN147"><span class='Ref_to_Member'>ps_snapshot_data</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* aminitparallelscan is optional; assume no-op if not provided by AM */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN449"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN217"><span class='Ref_to_Member'>aminitparallelscan</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN468"></a>        <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>amtarget</span><span class='Delimiter'>; 
+</span> 
+        <a href="indexam.c.html#LN468"><span class='Ref_To_Local'>amtarget</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN534"><span class='Ref_to_Macro'>OffsetToPointer</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN450"><span class='Ref_to_Parameter'>target</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN452"><span class='Ref_To_Local'>offset</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="indexam.c.html#LN449"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN217"><span class='Ref_to_Member'>aminitparallelscan</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN468"><span class='Ref_To_Local'>amtarget</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end index_parallelscan_initialize &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_parallelrescan  - (re)start a parallel scan of an index 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN480"></a><span class='Declare_Function'>index_parallelrescan</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Parameter'>scan</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="indexam.c.html#LN104"><span class='Ref_to_Const'>SCAN_CHECKS</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* amparallelrescan is optional; assume no-op if not provided by AM */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN480"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN218"><span class='Ref_to_Member'>amparallelrescan</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="indexam.c.html#LN480"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN218"><span class='Ref_to_Member'>amparallelrescan</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN480"><span class='Ref_to_Parameter'>scan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * index_beginscan_parallel - join parallel index scan 
+ * 
+ * Caller must be holding suitable locks on the heap and the index. 
+ */ 
+</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> 
+<a name="LN495"></a><span class='Declare_Function'>index_beginscan_parallel</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>heaprel</span><span class='Delimiter'>, </span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>indexrel</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nkeys</span><span class='Delimiter'>, 
+</span><a name="LN496"></a>                         <span class='Keyword'>int </span><span class='Declare_Parameter'>norderbys</span><span class='Delimiter'>, </span><a href="../../../include/access/genam.h.html#LN88"><span class='Ref_to_Typedef'>ParallelIndexScanDesc</span></a> <span class='Declare_Parameter'>pscan</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN498"></a>    <a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a>    <span class='Declare_Local'>snapshot</span><span class='Delimiter'>; 
+</span><a name="LN499"></a>    <a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Local'>scan</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN416"><span class='Ref_to_Macro'>RelationGetRelid</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN495"><span class='Ref_to_Parameter'>heaprel</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="indexam.c.html#LN496"><span class='Ref_to_Parameter'>pscan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN144"><span class='Ref_to_Member'>ps_relid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN498"><span class='Ref_To_Local'>snapshot</span></a> <span class='Operator'>= </span><a href="../../../include/utils/snapmgr.h.html#LN109"><span class='Ref_to_Proto'>RestoreSnapshot</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN496"><span class='Ref_to_Parameter'>pscan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN147"><span class='Ref_to_Member'>ps_snapshot_data</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/snapmgr.h.html#LN80"><span class='Ref_to_Proto'>RegisterSnapshot</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN498"><span class='Ref_To_Local'>snapshot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN499"><span class='Ref_To_Local'>scan</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN125"><span class='Ref_to_Proto'>index_beginscan_internal</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN495"><span class='Ref_to_Parameter'>indexrel</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN495"><span class='Ref_to_Parameter'>nkeys</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN496"><span class='Ref_to_Parameter'>norderbys</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN498"><span class='Ref_To_Local'>snapshot</span></a><span class='Delimiter'>, 
+</span>                                    <a href="indexam.c.html#LN496"><span class='Ref_to_Parameter'>pscan</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Save additional parameters into the scandesc.  Everything else was set 
+     * up by index_beginscan_internal. 
+     */ 
+</span>    <a href="indexam.c.html#LN499"><span class='Ref_To_Local'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN87"><span class='Ref_to_Member'>heapRelation</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN495"><span class='Ref_to_Parameter'>heaprel</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN499"><span class='Ref_To_Local'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN89"><span class='Ref_to_Member'>xs_snapshot</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN498"><span class='Ref_To_Local'>snapshot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN499"><span class='Ref_To_Local'>scan</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_beginscan_parallel &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ * index_getnext_tid - get the next TID from a scan 
+ * 
+ * The result is the next TID satisfying the scan keys, 
+ * or NULL if no more matching tuples exist. 
+ * ---------------- 
+ */ 
+</span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> 
+<a name="LN525"></a><span class='Declare_Function'>index_getnext_tid</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Parameter'>scan</span><span class='Delimiter'>, </span><a href="../../../include/access/sdir.h.html#LN21"><span class='Ref_to_Enum'>ScanDirection</span></a> <span class='Declare_Parameter'>direction</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN527"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN104"><span class='Ref_to_Const'>SCAN_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN118"><span class='Ref_to_Macro'>CHECK_SCAN_PROCEDURE</span></a><span class='Parentheses'>(</span>amgettuple<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="../../utils/time/snapmgr.c.html#LN165"><span class='Ref_to_Global_Var'>RecentGlobalXmin</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The AM's amgettuple proc finds the next index entry matching the scan 
+     * keys, and puts the TID into scan-&GT;xs_ctup.t_self.  It should also set 
+     * scan-&GT;xs_recheck and possibly scan-&GT;xs_itup/scan-&GT;xs_hitup, though we 
+     * pay no attention to those fields here. 
+     */ 
+</span>    <a href="indexam.c.html#LN527"><span class='Ref_To_Local'>found</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN525"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN209"><span class='Ref_to_Member'>amgettuple</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN525"><span class='Ref_to_Parameter'>scan</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN525"><span class='Ref_to_Parameter'>direction</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Reset kill flag immediately for safety */ 
+</span>    <a href="indexam.c.html#LN525"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN98"><span class='Ref_to_Member'>kill_prior_tuple</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If we're out of index entries, we're done */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="indexam.c.html#LN527"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* ... but first, release any held pin on a heap page */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN525"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN525"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="indexam.c.html#LN525"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/pgstat.h.html#LN1267"><span class='Ref_to_Macro'>pgstat_count_index_tuples</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN525"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Return the TID of the tuple we found. */ 
+</span>    <span class='Control'>return</span> <span class='Operator'>&</span><a href="indexam.c.html#LN525"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN118"><span class='Ref_to_Member'>xs_ctup</span></a><span class='Operator'>.</span><a href="../../../include/access/htup.h.html#LN64"><span class='Ref_to_Member'>t_self</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_getnext_tid &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_fetch_heap - get the scan's next heap tuple 
+ * 
+ * The result is a visible heap tuple associated with the index TID most 
+ * recently fetched by index_getnext_tid, or NULL if no more matching tuples 
+ * exist.  (There can be more than one matching tuple because of HOT chains, 
+ * although when using an MVCC snapshot it should be impossible for more than 
+ * one such tuple to exist.) 
+ * 
+ * On success, the buffer containing the heap tup is pinned (the pin will be 
+ * dropped in a future index_getnext_tid, index_fetch_heap or index_endscan 
+ * call). 
+ * 
+ * Note: caller must check scan-&GT;xs_recheck, and perform rechecking of the 
+ * scan keys if required.  We do not do that here because we don't have 
+ * enough information to do it efficiently in the general case. 
+ * ---------------- 
+ */ 
+</span><a href="../../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> 
+<a name="LN582"></a><span class='Declare_Function'>index_fetch_heap</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Parameter'>scan</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN584"></a>    <a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Local'>tid</span> <span class='Operator'>= &</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN118"><span class='Ref_to_Member'>xs_ctup</span></a><span class='Operator'>.</span><a href="../../../include/access/htup.h.html#LN64"><span class='Ref_to_Member'>t_self</span></a><span class='Delimiter'>; 
+</span><a name="LN585"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>all_dead</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN586"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>got_heap_tuple</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We can skip the buffer-switching logic if we're in mid-HOT chain. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN135"><span class='Ref_to_Member'>xs_continue_hot</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Switch to correct buffer if we don't have it already */ 
+</span><a name="LN592"></a>        <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>prev_buf</span> <span class='Operator'>= </span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN178"><span class='Ref_to_Proto'>ReleaseAndReadBuffer</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Delimiter'>, 
+</span>                                             <a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN87"><span class='Ref_to_Member'>heapRelation</span></a><span class='Delimiter'>, 
+</span>                                             <a href="../../../include/storage/itemptr.h.html#LN74"><span class='Ref_to_Macro'>ItemPointerGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN584"><span class='Ref_To_Local'>tid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Prune page, but only if we weren't already on this page 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN592"><span class='Ref_To_Local'>prev_buf</span></a> <span class='Operator'>!= </span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>) 
+</span>            <a href="../heap/pruneheap.c.html#LN73"><span class='Ref_to_Func'>heap_page_prune_opt</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN87"><span class='Ref_to_Member'>heapRelation</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Obtain share-lock on the buffer so we can examine visibility */ 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN87"><span class='Ref_to_Const'>BUFFER_LOCK_SHARE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN586"><span class='Ref_To_Local'>got_heap_tuple</span></a> <span class='Operator'>= </span><a href="../../../include/access/heapam.h.html#LN137"><span class='Ref_to_Proto'>heap_hot_search_buffer</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN584"><span class='Ref_To_Local'>tid</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN87"><span class='Ref_to_Member'>heapRelation</span></a><span class='Delimiter'>, 
+</span>                                            <a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Delimiter'>, 
+</span>                                            <a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN89"><span class='Ref_to_Member'>xs_snapshot</span></a><span class='Delimiter'>, 
+</span>                                            <span class='Operator'>&</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN118"><span class='Ref_to_Member'>xs_ctup</span></a><span class='Delimiter'>, 
+</span>                                            <span class='Operator'>&</span><a href="indexam.c.html#LN585"><span class='Ref_To_Local'>all_dead</span></a><span class='Delimiter'>, 
+</span>                                            <span class='Operator'>!</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN135"><span class='Ref_to_Member'>xs_continue_hot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN586"><span class='Ref_To_Local'>got_heap_tuple</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Only in a non-MVCC snapshot can more than one member of the HOT 
+         * chain be visible. 
+         */ 
+</span>        <a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN135"><span class='Ref_to_Member'>xs_continue_hot</span></a> <span class='Operator'>= !</span><a href="../../../include/utils/tqual.h.html#LN30"><span class='Ref_to_Macro'>IsMVCCSnapshot</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN89"><span class='Ref_to_Member'>xs_snapshot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/pgstat.h.html#LN1257"><span class='Ref_to_Macro'>pgstat_count_heap_fetch</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Operator'>&</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN118"><span class='Ref_to_Member'>xs_ctup</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* We've reached the end of the HOT chain. */ 
+</span>    <a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN135"><span class='Ref_to_Member'>xs_continue_hot</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we scanned a whole HOT chain and found only dead tuples, tell index 
+     * AM to kill its entry for that TID (this will take effect in the next 
+     * amgettuple call, in index_getnext_tid).  We do not do this when in 
+     * recovery because it may violate MVCC to do so.  See comments in 
+     * RelationGetIndexScan(). 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN100"><span class='Ref_to_Member'>xactStartedInRecovery</span></a><span class='Parentheses'>) 
+</span>        <a href="indexam.c.html#LN582"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN98"><span class='Ref_to_Member'>kill_prior_tuple</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN585"><span class='Ref_To_Local'>all_dead</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_fetch_heap &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_getnext - get the next heap tuple from a scan 
+ * 
+ * The result is the next heap tuple satisfying the scan keys and the 
+ * snapshot, or NULL if no more matching tuples exist. 
+ * 
+ * On success, the buffer containing the heap tup is pinned (the pin will be 
+ * dropped in a future index_getnext_tid, index_fetch_heap or index_endscan 
+ * call). 
+ * 
+ * Note: caller must check scan-&GT;xs_recheck, and perform rechecking of the 
+ * scan keys if required.  We do not do that here because we don't have 
+ * enough information to do it efficiently in the general case. 
+ * ---------------- 
+ */ 
+</span><a href="../../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> 
+<a name="LN658"></a><span class='Declare_Function'>index_getnext</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Parameter'>scan</span><span class='Delimiter'>, </span><a href="../../../include/access/sdir.h.html#LN21"><span class='Ref_to_Enum'>ScanDirection</span></a> <span class='Declare_Parameter'>direction</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN660"></a>    <a href="../../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>heapTuple</span><span class='Delimiter'>; 
+</span><a name="LN661"></a>    <a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Local'>tid</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN658"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN135"><span class='Ref_to_Member'>xs_continue_hot</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * We are resuming scan of a HOT chain after having returned an 
+             * earlier member.  Must still hold pin on current heap page. 
+             */ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN658"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN74"><span class='Ref_to_Macro'>ItemPointerGetBlockNumber</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="indexam.c.html#LN658"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN118"><span class='Ref_to_Member'>xs_ctup</span></a><span class='Operator'>.</span><a href="../../../include/access/htup.h.html#LN64"><span class='Ref_to_Member'>t_self</span></a><span class='Parentheses'>) </span><span class='Operator'>== 
+</span>                   <a href="../../../include/storage/bufmgr.h.html#LN187"><span class='Ref_to_Proto'>BufferGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN658"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN119"><span class='Ref_to_Member'>xs_cbuf</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Time to fetch the next TID from the index */ 
+</span>            <a href="indexam.c.html#LN661"><span class='Ref_To_Local'>tid</span></a> <span class='Operator'>= </span><a href="../../../include/access/genam.h.html#LN159"><span class='Ref_to_Proto'>index_getnext_tid</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN658"><span class='Ref_to_Parameter'>scan</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN658"><span class='Ref_to_Parameter'>direction</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* If we're out of index entries, we're done */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN661"><span class='Ref_To_Local'>tid</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Fetch the next (or only) visible heap tuple for this index entry. 
+         * If we don't find anything, loop around and grab the next TID from 
+         * the index. 
+         */ 
+</span>        <a href="indexam.c.html#LN660"><span class='Ref_To_Local'>heapTuple</span></a> <span class='Operator'>= </span><a href="../../../include/access/genam.h.html#LN161"><span class='Ref_to_Proto'>index_fetch_heap</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN658"><span class='Ref_to_Parameter'>scan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN660"><span class='Ref_To_Local'>heapTuple</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <a href="indexam.c.html#LN660"><span class='Ref_To_Local'>heapTuple</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>;</span>                <span class='Comment_Single_Line'>/* failure exit */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end index_getnext &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_getbitmap - get all tuples at once from an index scan 
+ * 
+ * Adds the TIDs of all heap tuples satisfying the scan keys to a bitmap. 
+ * Since there's no interlock between the index scan and the eventual heap 
+ * access, this is only safe to use with MVCC-based snapshots: the heap 
+ * item slot could have been replaced by a newer tuple by the time we get 
+ * to it. 
+ * 
+ * Returns the number of matching tuples found.  (Note: this might be only 
+ * approximate, so it should only be used for statistical purposes.) 
+ * ---------------- 
+ */ 
+</span><a href="../../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a> 
+<a name="LN712"></a><span class='Declare_Function'>index_getbitmap</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Parameter'>scan</span><span class='Delimiter'>, </span><a href="../../nodes/tidbitmap.c.html#LN146"><span class='Ref_to_Struct'>TIDBitmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>bitmap</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN714"></a>    <a href="../../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>ntids</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN104"><span class='Ref_to_Const'>SCAN_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN118"><span class='Ref_to_Macro'>CHECK_SCAN_PROCEDURE</span></a><span class='Parentheses'>(</span>amgetbitmap<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* just make sure this is false... */ 
+</span>    <a href="indexam.c.html#LN712"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN98"><span class='Ref_to_Member'>kill_prior_tuple</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * have the am's getbitmap proc do all the work. 
+     */ 
+</span>    <a href="indexam.c.html#LN714"><span class='Ref_To_Local'>ntids</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN712"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN210"><span class='Ref_to_Member'>amgetbitmap</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN712"><span class='Ref_to_Parameter'>scan</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN712"><span class='Ref_to_Parameter'>bitmap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/pgstat.h.html#LN1267"><span class='Ref_to_Macro'>pgstat_count_index_tuples</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN712"><span class='Ref_to_Parameter'>scan</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/relscan.h.html#LN88"><span class='Ref_to_Member'>indexRelation</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN714"><span class='Ref_To_Local'>ntids</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN714"><span class='Ref_To_Local'>ntids</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_getbitmap &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_bulk_delete - do mass deletion of index entries 
+ * 
+ *      callback routine tells whether a given main-heap tuple is 
+ *      to be deleted 
+ * 
+ *      return value is an optional palloc'd struct of statistics 
+ * ---------------- 
+ */ 
+</span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>* 
+</span><a name="LN742"></a><span class='Declare_Function'>index_bulk_delete</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN43"><span class='Ref_to_Struct'>IndexVacuumInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>info</span><span class='Delimiter'>, 
+</span><a name="LN743"></a>                  <a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>stats</span><span class='Delimiter'>, 
+</span><a name="LN744"></a>                  <a href="../../../include/access/genam.h.html#LN82"><span class='Ref_to_Typedef'>IndexBulkDeleteCallback</span></a> <span class='Declare_Parameter'>callback</span><span class='Delimiter'>, 
+</span><a name="LN745"></a>                  <span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>callback_state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN747"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>indexRelation</span> <span class='Operator'>= </span><a href="indexam.c.html#LN742"><span class='Ref_to_Parameter'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN45"><span class='Ref_to_Member'>index</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN97"><span class='Ref_to_Const'>RELATION_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN111"><span class='Ref_to_Macro'>CHECK_REL_PROCEDURE</span></a><span class='Parentheses'>(</span>ambulkdelete<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN747"><span class='Ref_To_Local'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN200"><span class='Ref_to_Member'>ambulkdelete</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN742"><span class='Ref_to_Parameter'>info</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN743"><span class='Ref_to_Parameter'>stats</span></a><span class='Delimiter'>, 
+</span>                                                   <a href="indexam.c.html#LN744"><span class='Ref_to_Parameter'>callback</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN745"><span class='Ref_to_Parameter'>callback_state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_vacuum_cleanup - do post-deletion cleanup of an index 
+ * 
+ *      return value is an optional palloc'd struct of statistics 
+ * ---------------- 
+ */ 
+</span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>* 
+</span><a name="LN763"></a><span class='Declare_Function'>index_vacuum_cleanup</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN43"><span class='Ref_to_Struct'>IndexVacuumInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>info</span><span class='Delimiter'>, 
+</span><a name="LN764"></a>                     <a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>stats</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN766"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>indexRelation</span> <span class='Operator'>= </span><a href="indexam.c.html#LN763"><span class='Ref_to_Parameter'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN45"><span class='Ref_to_Member'>index</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN97"><span class='Ref_to_Const'>RELATION_CHECKS</span></a><span class='Delimiter'>; 
+</span>    <a href="indexam.c.html#LN111"><span class='Ref_to_Macro'>CHECK_REL_PROCEDURE</span></a><span class='Parentheses'>(</span>amvacuumcleanup<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN766"><span class='Ref_To_Local'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN201"><span class='Ref_to_Member'>amvacuumcleanup</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN763"><span class='Ref_to_Parameter'>info</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN764"><span class='Ref_to_Parameter'>stats</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_can_return 
+ * 
+ *      Does the index access method support index-only scans for the given 
+ *      column? 
+ * ---------------- 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN782"></a><span class='Declare_Function'>index_can_return</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>indexRelation</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>attno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="indexam.c.html#LN97"><span class='Ref_to_Const'>RELATION_CHECKS</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* amcanreturn is optional; assume FALSE if not provided by AM */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN782"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN202"><span class='Ref_to_Member'>amcanreturn</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN782"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN202"><span class='Ref_to_Member'>amcanreturn</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN782"><span class='Ref_to_Parameter'>indexRelation</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN782"><span class='Ref_to_Parameter'>attno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_getprocid 
+ * 
+ *      Index access methods typically require support routines that are 
+ *      not directly the implementation of any WHERE-clause query operator 
+ *      and so cannot be kept in pg_amop.  Instead, such routines are kept 
+ *      in pg_amproc.  These registered procedure OIDs are assigned numbers 
+ *      according to a convention established by the access method. 
+ *      The general index code doesn't know anything about the routines 
+ *      involved; it just builds an ordered list of them for 
+ *      each attribute on which an index is defined. 
+ * 
+ *      As of Postgres 8.3, support routines within an operator family 
+ *      are further subdivided by the "left type" and "right type" of the 
+ *      query operator(s) that they support.  The "default" functions for a 
+ *      particular indexed attribute are those with both types equal to 
+ *      the index opclass' opcintype (note that this is subtly different 
+ *      from the indexed attribute's own type: it may be a binary-compatible 
+ *      type instead).  Only the default functions are stored in relcache 
+ *      entries --- access methods can use the syscache to look up non-default 
+ *      functions. 
+ * 
+ *      This routine returns the requested default procedure OID for a 
+ *      particular indexed attribute. 
+ * ---------------- 
+ */ 
+</span><a href="../../../include/c.h.html#LN394"><span class='Ref_to_Typedef'>RegProcedure</span></a> 
+<a name="LN820"></a><span class='Declare_Function'>index_getprocid</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>irel</span><span class='Delimiter'>, 
+</span><a name="LN821"></a>                <a href="../../../include/access/attnum.h.html#LN20"><span class='Ref_to_Typedef'>AttrNumber</span></a> <span class='Declare_Parameter'>attnum</span><span class='Delimiter'>, 
+</span><a name="LN822"></a>                <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>procnum</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN824"></a>    <a href="../../../include/c.h.html#LN394"><span class='Ref_to_Typedef'>RegProcedure</span></a> <span class='Operator'>*</span><span class='Declare_Local'>loc</span><span class='Delimiter'>; 
+</span><a name="LN825"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nproc</span><span class='Delimiter'>; 
+</span><a name="LN826"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>procindex</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN825"><span class='Ref_To_Local'>nproc</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN820"><span class='Ref_to_Parameter'>irel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN168"><span class='Ref_to_Member'>amsupport</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN822"><span class='Ref_to_Parameter'>procnum</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="indexam.c.html#LN822"><span class='Ref_to_Parameter'>procnum</span></a> <span class='Operator'>&LT;= </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a><span class='Parentheses'>) </span><a href="indexam.c.html#LN825"><span class='Ref_To_Local'>nproc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN826"><span class='Ref_To_Local'>procindex</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="indexam.c.html#LN825"><span class='Ref_To_Local'>nproc</span></a> <span class='Operator'>* </span><span class='Parentheses'>(</span><a href="indexam.c.html#LN821"><span class='Ref_to_Parameter'>attnum</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>))</span> <span class='Operator'>+ </span><span class='Parentheses'>(</span><a href="indexam.c.html#LN822"><span class='Ref_to_Parameter'>procnum</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN824"><span class='Ref_To_Local'>loc</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN820"><span class='Ref_to_Parameter'>irel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN183"><span class='Ref_to_Member'>rd_support</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN824"><span class='Ref_To_Local'>loc</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN824"><span class='Ref_To_Local'>loc</span></a><span class='Delimiter'>[</span><a href="indexam.c.html#LN826"><span class='Ref_To_Local'>procindex</span></a><span class='Delimiter'>]; 
+}</span><span class='Auto_Annotations'> &laquo; end index_getprocid &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------- 
+ *      index_getprocinfo 
+ * 
+ *      This routine allows index AMs to keep fmgr lookup info for 
+ *      support procs in the relcache.  As above, only the "default" 
+ *      functions for any particular indexed attribute are cached. 
+ * 
+ * Note: the return value points into cached data that will be lost during 
+ * any relcache rebuild!  Therefore, either use the callinfo right away, 
+ * or save it only after having acquired some type of lock on the index rel. 
+ * ---------------- 
+ */ 
+</span><a href="../../../include/fmgr.h.html#LN55"><span class='Ref_to_Struct'>FmgrInfo</span></a> <span class='Operator'>* 
+</span><a name="LN854"></a><span class='Declare_Function'>index_getprocinfo</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>irel</span><span class='Delimiter'>, 
+</span><a name="LN855"></a>                  <a href="../../../include/access/attnum.h.html#LN20"><span class='Ref_to_Typedef'>AttrNumber</span></a> <span class='Declare_Parameter'>attnum</span><span class='Delimiter'>, 
+</span><a name="LN856"></a>                  <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>procnum</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN858"></a>    <a href="../../../include/fmgr.h.html#LN55"><span class='Ref_to_Struct'>FmgrInfo</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>locinfo</span><span class='Delimiter'>; 
+</span><a name="LN859"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nproc</span><span class='Delimiter'>; 
+</span><a name="LN860"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>procindex</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN859"><span class='Ref_To_Local'>nproc</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN854"><span class='Ref_to_Parameter'>irel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN180"><span class='Ref_to_Member'>rd_amroutine</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/amapi.h.html#LN168"><span class='Ref_to_Member'>amsupport</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN856"><span class='Ref_to_Parameter'>procnum</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="indexam.c.html#LN856"><span class='Ref_to_Parameter'>procnum</span></a> <span class='Operator'>&LT;= </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a><span class='Parentheses'>) </span><a href="indexam.c.html#LN859"><span class='Ref_To_Local'>nproc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN860"><span class='Ref_To_Local'>procindex</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="indexam.c.html#LN859"><span class='Ref_To_Local'>nproc</span></a> <span class='Operator'>* </span><span class='Parentheses'>(</span><a href="indexam.c.html#LN855"><span class='Ref_to_Parameter'>attnum</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>))</span> <span class='Operator'>+ </span><span class='Parentheses'>(</span><a href="indexam.c.html#LN856"><span class='Ref_to_Parameter'>procnum</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN858"><span class='Ref_To_Local'>locinfo</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN854"><span class='Ref_to_Parameter'>irel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN184"><span class='Ref_to_Member'>rd_supportinfo</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN858"><span class='Ref_To_Local'>locinfo</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="indexam.c.html#LN858"><span class='Ref_To_Local'>locinfo</span></a> <span class='Operator'>+= </span><a href="indexam.c.html#LN860"><span class='Ref_To_Local'>procindex</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize the lookup info if first time through */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="indexam.c.html#LN858"><span class='Ref_To_Local'>locinfo</span></a><span class='Operator'>-&GT;</span><a href="../../../include/fmgr.h.html#LN58"><span class='Ref_to_Member'>fn_oid</span></a> <span class='Operator'>== </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN877"></a>        <a href="../../../include/c.h.html#LN394"><span class='Ref_to_Typedef'>RegProcedure</span></a> <span class='Operator'>*</span><span class='Declare_Local'>loc</span> <span class='Operator'>= </span><a href="indexam.c.html#LN854"><span class='Ref_to_Parameter'>irel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN183"><span class='Ref_to_Member'>rd_support</span></a><span class='Delimiter'>; 
+</span><a name="LN878"></a>        <a href="../../../include/c.h.html#LN394"><span class='Ref_to_Typedef'>RegProcedure</span></a> <span class='Declare_Local'>procId</span><span class='Delimiter'>; 
+</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="indexam.c.html#LN877"><span class='Ref_To_Local'>loc</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="indexam.c.html#LN878"><span class='Ref_To_Local'>procId</span></a> <span class='Operator'>= </span><a href="indexam.c.html#LN877"><span class='Ref_To_Local'>loc</span></a><span class='Delimiter'>[</span><a href="indexam.c.html#LN860"><span class='Ref_To_Local'>procindex</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Complain if function was not found during IndexSupportInitialize. 
+         * This should not happen unless the system tables contain bogus 
+         * entries for the index opclass.  (If an AM wants to allow a support 
+         * function to be optional, it can use index_getprocid.) 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/c.h.html#LN539"><span class='Ref_to_Macro'>RegProcedureIsValid</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN878"><span class='Ref_To_Local'>procId</span></a><span class='Parentheses'>))</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"missing support function %d for attribute %d of index \"%s\""</span><span class='Delimiter'>, 
+</span>                 <a href="indexam.c.html#LN856"><span class='Ref_to_Parameter'>procnum</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN855"><span class='Ref_to_Parameter'>attnum</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN854"><span class='Ref_to_Parameter'>irel</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/fmgr.h.html#LN99"><span class='Ref_to_Proto'>fmgr_info_cxt</span></a><span class='Parentheses'>(</span><a href="indexam.c.html#LN878"><span class='Ref_To_Local'>procId</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN858"><span class='Ref_To_Local'>locinfo</span></a><span class='Delimiter'>, </span><a href="indexam.c.html#LN854"><span class='Ref_to_Parameter'>irel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN178"><span class='Ref_to_Member'>rd_indexcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if locinfo-&GT;fn_oid==Inva... &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="indexam.c.html#LN858"><span class='Ref_To_Local'>locinfo</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_getprocinfo &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

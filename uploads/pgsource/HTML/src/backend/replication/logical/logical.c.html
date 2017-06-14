@@ -1,0 +1,1022 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\replication\logical\logical.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\replication\logical\logical.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:46 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * logical.c 
+ *     PostgreSQL logical decoding coordination 
+ * 
+ * Copyright (c) 2012-2017, PostgreSQL Global Development Group 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/replication/logical/logical.c 
+ * 
+ * NOTES 
+ *    This file coordinates interaction between the various modules that 
+ *    together provide logical decoding, primarily by providing so 
+ *    called LogicalDecodingContexts. The goal is to encapsulate most of the 
+ *    internal complexity for consumers of logical decoding, so they can 
+ *    create and consume a changestream with a low amount of code. Builtin 
+ *    consumers are the walsender and SQL SRF interface, but it's possible to 
+ *    add further ones without changing core code, e.g. to consume changes in 
+ *    a bgworker. 
+ * 
+ *    The idea is that a consumer provides three callbacks, one to read WAL, 
+ *    one to prepare a data write, and a final one for actually writing since 
+ *    their implementation depends on the type of consumer.  Check 
+ *    logicalfuncs.c for an example implementation of a fairly simple consumer 
+ *    and an implementation of a WAL reading callback that's suitable for 
+ *    simple consumers. 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog_internal.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"replication/decode.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/logical.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/reorderbuffer.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/origin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/snapbuild.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/procarray.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* data for errcontext callback */ 
+</span><a name="LN47"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>LogicalErrorCallbackState</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN49"></a>    <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Member'>ctx</span><span class='Delimiter'>; 
+</span><a name="LN50"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Member'>callback_name</span><span class='Delimiter'>; 
+</span><a name="LN51"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Member'>report_location</span><span class='Delimiter'>; 
+</span><a name="LN52"></a>} <span class='Declare_Typedef'>LogicalErrorCallbackState</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* wrappers around output plugin callbacks */ 
+</span><a name="LN55"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>output_plugin_error_callback</span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>arg</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN56"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>startup_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Delimiter'>, </span><a href="../../../include/replication/output_plugin.h.html#LN25"><span class='Ref_to_Struct'>OutputPluginOptions</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>opt</span><span class='Delimiter'>, 
+</span><a name="LN57"></a>                   <span class='Keyword'>bool </span><span class='Declare_Parameter'>is_init</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN58"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>shutdown_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN59"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>begin_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/reorderbuffer.h.html#LN294"><span class='Ref_to_Struct'>ReorderBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cache</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN139"><span class='Ref_to_Struct'>ReorderBufferTXN</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>txn</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN60"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>commit_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/reorderbuffer.h.html#LN294"><span class='Ref_to_Struct'>ReorderBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cache</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN139"><span class='Ref_to_Struct'>ReorderBufferTXN</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>txn</span><span class='Delimiter'>, 
+</span><a name="LN61"></a>                  <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>commit_lsn</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN62"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>change_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/reorderbuffer.h.html#LN294"><span class='Ref_to_Struct'>ReorderBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cache</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN139"><span class='Ref_to_Struct'>ReorderBufferTXN</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>txn</span><span class='Delimiter'>, 
+</span><a name="LN63"></a>                  <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>relation</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN71"><span class='Ref_to_Struct'>ReorderBufferChange</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>change</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN64"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>message_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/reorderbuffer.h.html#LN294"><span class='Ref_to_Struct'>ReorderBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cache</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN139"><span class='Ref_to_Struct'>ReorderBufferTXN</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>txn</span><span class='Delimiter'>, 
+</span><a name="LN65"></a>                   <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>message_lsn</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>transactional</span><span class='Delimiter'>, 
+</span><a name="LN66"></a>                 <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>prefix</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>message_size</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>message</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN68"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>LoadOutputPlugin</span><span class='Parentheses'>(</span><a href="../../../include/replication/output_plugin.h.html#LN94"><span class='Ref_to_Struct'>OutputPluginCallbacks</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>callbacks</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>plugin</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Make sure the current settings & environment are capable of doing logical 
+ * decoding. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN75"></a><span class='Declare_Function'>CheckLogicalDecodingRequirements</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/replication/slot.h.html#LN184"><span class='Ref_to_Proto'>CheckSlotRequirements</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../access/transam/xlog.c.html#LN103"><span class='Ref_to_Global_Var'>wal_level</span></a> <span class='Operator'>&LT; </span><a href="../../../include/access/xlog.h.html#LN127"><span class='Ref_to_EnumConst'>WAL_LEVEL_LOGICAL</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"logical decoding requires wal_level &GT;= logical"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN76"><span class='Ref_to_Global_Var'>MyDatabaseId</span></a> <span class='Operator'>== </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"logical decoding requires a database connection"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* ---- 
+     * TODO: We got to change that someday soon... 
+     * 
+     * There's basically three things missing to allow this: 
+     * 1) We need to be able to correctly and quickly identify the timeline a 
+     *    LSN belongs to 
+     * 2) We need to force hot_standby_feedback to be enabled at all times so 
+     *    the primary cannot remove rows we need. 
+     * 3) support dropping replication slots referring to a database, in 
+     *    dbase_redo. There can't be any active ones due to HS recovery 
+     *    conflicts, so that should be relatively easy. 
+     * ---- 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/xlog.h.html#LN242"><span class='Ref_to_Proto'>RecoveryInProgress</span></a><span class='Parentheses'>())</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>               <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"logical decoding cannot be used while in recovery"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end CheckLogicalDecodingRequirements &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Helper function for CreateInitialDecodingContext() and 
+ * CreateDecodingContext() performing common tasks. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>* 
+</span><a name="LN113"></a><span class='Declare_Function'>StartupDecodingContext</span><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>output_plugin_options</span><span class='Delimiter'>, 
+</span><a name="LN114"></a>                       <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>start_lsn</span><span class='Delimiter'>, 
+</span><a name="LN115"></a>                       <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xmin_horizon</span><span class='Delimiter'>, 
+</span><a name="LN116"></a>                       <span class='Keyword'>bool </span><span class='Declare_Parameter'>need_full_snapshot</span><span class='Delimiter'>, 
+</span><a name="LN117"></a>                       <a href="../../../include/access/xlogreader.h.html#LN32"><span class='Ref_to_Typedef'>XLogPageReadCB</span></a> <span class='Declare_Parameter'>read_page</span><span class='Delimiter'>, 
+</span><a name="LN118"></a>                       <a href="../../../include/replication/logical.h.html#LN26"><span class='Ref_to_Typedef'>LogicalOutputPluginWriterPrepareWrite</span></a> <span class='Declare_Parameter'>prepare_write</span><span class='Delimiter'>, 
+</span><a name="LN119"></a>                       <a href="../../../include/replication/logical.h.html#LN19"><span class='Ref_to_Typedef'>LogicalOutputPluginWriterWrite</span></a> <span class='Declare_Parameter'>do_write</span><span class='Delimiter'>, 
+</span><a name="LN120"></a>                     <a href="../../../include/replication/logical.h.html#LN28"><span class='Ref_to_Typedef'>LogicalOutputPluginWriterUpdateProgress</span></a> <span class='Declare_Parameter'>update_progress</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN122"></a>    <a href="../../../include/replication/slot.h.html#LN84"><span class='Ref_to_Struct'>ReplicationSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN123"></a>    <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>context</span><span class='Delimiter'>, 
+</span><a name="LN124"></a>                <span class='Declare_Local'>old_context</span><span class='Delimiter'>; 
+</span><a name="LN125"></a>    <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>ctx</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* shorter lines... */ 
+</span>    <a href="logical.c.html#LN122"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN123"><span class='Ref_To_Local'>context</span></a> <span class='Operator'>= </span><a href="../../../include/utils/memutils.h.html#LN145"><span class='Ref_to_Proto'>AllocSetContextCreate</span></a><span class='Parentheses'>(</span><a href="../../utils/mmgr/mcxt.c.html#LN36"><span class='Ref_to_Global_Var'>CurrentMemoryContext</span></a><span class='Delimiter'>, 
+</span>                                    <span class='String'>"Logical decoding context"</span><span class='Delimiter'>, 
+</span>                                    <a href="../../../include/utils/memutils.h.html#LN164"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_SIZES</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN124"><span class='Ref_To_Local'>old_context</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN123"><span class='Ref_To_Local'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN37"><span class='Ref_to_Member'>context</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN123"><span class='Ref_To_Local'>context</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * (re-)load output plugins, so we detect a bad (removed) output plugin 
+     * now. 
+     */ 
+</span>    <a href="logical.c.html#LN68"><span class='Ref_to_Proto'>LoadOutputPlugin</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN122"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN78"><span class='Ref_to_Member'>plugin</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Now that the slot's xmin has been set, we can announce ourselves as a 
+     * logical decoding backend which doesn't need to be checked individually 
+     * when computing the xmin horizon because the xmin is enforced via 
+     * replication slots. 
+     * 
+     * We can only do so if we're outside of a transaction (i.e. the case when 
+     * streaming changes via walsender), otherwise an already setup 
+     * snapshot/xid would end up being ignored. That's not a particularly 
+     * bothersome restriction since the SQL interface can't be used for 
+     * streaming anyway. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xact.h.html#LN367"><span class='Ref_to_Proto'>IsTransactionOrTransactionBlock</span></a><span class='Parentheses'>())</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>ProcArrayLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../storage/lmgr/proc.c.html#LN67"><span class='Ref_to_Global_Var'>MyPgXact</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN217"><span class='Ref_to_Member'>vacuumFlags</span></a> <span class='Operator'>|= </span><a href="../../../include/storage/proc.h.html#LN55"><span class='Ref_to_Const'>PROC_IN_LOGICAL_DECODING</span></a><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>ProcArrayLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN40"><span class='Ref_to_Member'>slot</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN122"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN43"><span class='Ref_to_Member'>reader</span></a> <span class='Operator'>= </span><a href="../../access/transam/xlogreader.c.html#LN65"><span class='Ref_to_Func'>XLogReaderAllocate</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN117"><span class='Ref_to_Parameter'>read_page</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN43"><span class='Ref_to_Member'>reader</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OUT_OF_MEMORY<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"out of memory"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN43"><span class='Ref_to_Member'>reader</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN107"><span class='Ref_to_Member'>private_data</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN44"><span class='Ref_to_Member'>reorder</span></a> <span class='Operator'>= </span><a href="reorderbuffer.c.html#LN222"><span class='Ref_to_Func'>ReorderBufferAllocate</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN45"><span class='Ref_to_Member'>snapshot_builder</span></a> <span class='Operator'>= 
+</span>        <a href="../../../include/replication/snapbuild.h.html#LN61"><span class='Ref_to_Proto'>AllocateSnapshotBuilder</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN44"><span class='Ref_to_Member'>reorder</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN115"><span class='Ref_to_Parameter'>xmin_horizon</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN114"><span class='Ref_to_Parameter'>start_lsn</span></a><span class='Delimiter'>, 
+</span>                                <a href="logical.c.html#LN116"><span class='Ref_to_Parameter'>need_full_snapshot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN44"><span class='Ref_to_Member'>reorder</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN325"><span class='Ref_to_Member'>private_data</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* wrap output plugin callbacks, so we can add error context information */ 
+</span>    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN44"><span class='Ref_to_Member'>reorder</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN317"><span class='Ref_to_Member'>begin</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN59"><span class='Ref_to_Proto'>begin_cb_wrapper</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN44"><span class='Ref_to_Member'>reorder</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN318"><span class='Ref_to_Member'>apply_change</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN62"><span class='Ref_to_Proto'>change_cb_wrapper</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN44"><span class='Ref_to_Member'>reorder</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN319"><span class='Ref_to_Member'>commit</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN60"><span class='Ref_to_Proto'>commit_cb_wrapper</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN44"><span class='Ref_to_Member'>reorder</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN320"><span class='Ref_to_Member'>message</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN64"><span class='Ref_to_Proto'>message_cb_wrapper</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN65"><span class='Ref_to_Member'>out</span></a> <span class='Operator'>= </span><a href="../../lib/stringinfo.c.html#LN26"><span class='Ref_to_Func'>makeStringInfo</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN58"><span class='Ref_to_Member'>prepare_write</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN118"><span class='Ref_to_Parameter'>prepare_write</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN59"><span class='Ref_to_Member'>write</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN119"><span class='Ref_to_Parameter'>do_write</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN60"><span class='Ref_to_Member'>update_progress</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN120"><span class='Ref_to_Parameter'>update_progress</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN53"><span class='Ref_to_Member'>output_plugin_options</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN113"><span class='Ref_to_Parameter'>output_plugin_options</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN124"><span class='Ref_To_Local'>old_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="logical.c.html#LN125"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end StartupDecodingContext &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Create a new decoding context, for a new logical slot. 
+ * 
+ * plugin contains the name of the output plugin 
+ * output_plugin_options contains options passed to the output plugin 
+ * read_page, prepare_write, do_write, update_progress 
+ *      callbacks that have to be filled to perform the use-case dependent, 
+ *      actual, work. 
+ * 
+ * Needs to be called while in a memory context that's at least as long lived 
+ * as the decoding context because further memory contexts will be created 
+ * inside it. 
+ * 
+ * Returns an initialized decoding context after calling the output plugin's 
+ * startup function. 
+ */ 
+</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>* 
+</span><a name="LN215"></a><span class='Declare_Function'>CreateInitDecodingContext</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>plugin</span><span class='Delimiter'>, 
+</span><a name="LN216"></a>                          <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>output_plugin_options</span><span class='Delimiter'>, 
+</span><a name="LN217"></a>                          <span class='Keyword'>bool </span><span class='Declare_Parameter'>need_full_snapshot</span><span class='Delimiter'>, 
+</span><a name="LN218"></a>                          <a href="../../../include/access/xlogreader.h.html#LN32"><span class='Ref_to_Typedef'>XLogPageReadCB</span></a> <span class='Declare_Parameter'>read_page</span><span class='Delimiter'>, 
+</span><a name="LN219"></a>                          <a href="../../../include/replication/logical.h.html#LN26"><span class='Ref_to_Typedef'>LogicalOutputPluginWriterPrepareWrite</span></a> <span class='Declare_Parameter'>prepare_write</span><span class='Delimiter'>, 
+</span><a name="LN220"></a>                          <a href="../../../include/replication/logical.h.html#LN19"><span class='Ref_to_Typedef'>LogicalOutputPluginWriterWrite</span></a> <span class='Declare_Parameter'>do_write</span><span class='Delimiter'>, 
+</span><a name="LN221"></a>                     <a href="../../../include/replication/logical.h.html#LN28"><span class='Ref_to_Typedef'>LogicalOutputPluginWriterUpdateProgress</span></a> <span class='Declare_Parameter'>update_progress</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN223"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xmin_horizon</span> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span><a name="LN224"></a>    <a href="../../../include/replication/slot.h.html#LN84"><span class='Ref_to_Struct'>ReplicationSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN225"></a>    <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>ctx</span><span class='Delimiter'>; 
+</span><a name="LN226"></a>    <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>old_context</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* shorter lines... */ 
+</span>    <a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* first some sanity checks that are unlikely to be violated */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"cannot perform logical decoding without an acquired slot"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN215"><span class='Ref_to_Parameter'>plugin</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"cannot initialize logical decoding without a specified plugin"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Make sure the passed slot is suitable. These are user facing errors. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/replication/slot.h.html#LN132"><span class='Ref_to_Macro'>SlotIsPhysical</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>        <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"cannot use physical replication slot for logical decoding"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN43"><span class='Ref_to_Member'>database</span></a> <span class='Operator'>!= </span><a href="../../utils/init/globals.c.html#LN76"><span class='Ref_to_Global_Var'>MyDatabaseId</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>           <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"replication slot \"%s\" was not created in this database"</span><span class='Delimiter'>, 
+</span>                  <a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN40"><span class='Ref_to_Member'>name</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/xact.h.html#LN329"><span class='Ref_to_Proto'>IsTransactionState</span></a><span class='Parentheses'>() </span><span class='Operator'>&& 
+</span>        <a href="../../../include/access/xact.h.html#LN332"><span class='Ref_to_Proto'>GetTopTransactionIdIfAny</span></a><span class='Parentheses'>() </span><span class='Operator'>!= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Parentheses'>)</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_ACTIVE_SQL_TRANSACTION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"cannot create logical replication slot in transaction that has performed writes"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* register output plugin name with slot */ 
+</span>    <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/c.h.html#LN829"><span class='Ref_to_Macro'>StrNCpy</span></a><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN78"><span class='Ref_to_Member'>plugin</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="logical.c.html#LN215"><span class='Ref_to_Parameter'>plugin</span></a><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/sqlda-native.h.html#LN15"><span class='Ref_to_Const'>NAMEDATALEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/replication/slot.h.html#LN174"><span class='Ref_to_Proto'>ReplicationSlotReserveWal</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* ---- 
+     * This is a bit tricky: We need to determine a safe xmin horizon to start 
+     * decoding from, to avoid starting from a running xacts record referring 
+     * to xids whose rows have been vacuumed or pruned 
+     * already. GetOldestSafeDecodingTransactionId() returns such a value, but 
+     * without further interlock its return value might immediately be out of 
+     * date. 
+     * 
+     * So we have to acquire the ProcArrayLock to prevent computation of new 
+     * xmin horizons by other backends, get the safe decoding xid, and inform 
+     * the slot machinery about the new limit. Once that's done the 
+     * ProcArrayLock can be released as the slot machinery now is 
+     * protecting against vacuum. 
+     * 
+     * Note that, temporarily, the data, not just the catalog, xmin has to be 
+     * reserved if a data snapshot is to be exported.  Otherwise the initial 
+     * data snapshot created here is not guaranteed to be valid. After that 
+     * the data xmin doesn't need to be managed anymore and the global xmin 
+     * should be recomputed. As we are fine with losing the pegged data xmin 
+     * after crash - no chance a snapshot would get exported anymore - we can 
+     * get away with just setting the slot's 
+     * effective_xmin. ReplicationSlotRelease will reset it again. 
+     * 
+     * ---- 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>ProcArrayLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN223"><span class='Ref_To_Local'>xmin_horizon</span></a> <span class='Operator'>= </span><a href="../../../include/storage/procarray.h.html#LN93"><span class='Ref_to_Proto'>GetOldestSafeDecodingTransactionId</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN217"><span class='Ref_to_Parameter'>need_full_snapshot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN111"><span class='Ref_to_Member'>effective_catalog_xmin</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN223"><span class='Ref_To_Local'>xmin_horizon</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN64"><span class='Ref_to_Member'>catalog_xmin</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN223"><span class='Ref_To_Local'>xmin_horizon</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN217"><span class='Ref_to_Parameter'>need_full_snapshot</span></a><span class='Parentheses'>) 
+</span>        <a href="logical.c.html#LN224"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN110"><span class='Ref_to_Member'>effective_xmin</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN223"><span class='Ref_To_Local'>xmin_horizon</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/replication/slot.h.html#LN175"><span class='Ref_to_Proto'>ReplicationSlotsComputeRequiredXmin</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>ProcArrayLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/replication/slot.h.html#LN170"><span class='Ref_to_Proto'>ReplicationSlotMarkDirty</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/replication/slot.h.html#LN169"><span class='Ref_to_Proto'>ReplicationSlotSave</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN225"><span class='Ref_To_Local'>ctx</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN112"><span class='Ref_to_Func'>StartupDecodingContext</span></a><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN223"><span class='Ref_To_Local'>xmin_horizon</span></a><span class='Delimiter'>, 
+</span>                                 <a href="logical.c.html#LN217"><span class='Ref_to_Parameter'>need_full_snapshot</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN218"><span class='Ref_to_Parameter'>read_page</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN219"><span class='Ref_to_Parameter'>prepare_write</span></a><span class='Delimiter'>, 
+</span>                                 <a href="logical.c.html#LN220"><span class='Ref_to_Parameter'>do_write</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN221"><span class='Ref_to_Parameter'>update_progress</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* call output plugin initialization callback */ 
+</span>    <a href="logical.c.html#LN226"><span class='Ref_To_Local'>old_context</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN225"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN37"><span class='Ref_to_Member'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN225"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN96"><span class='Ref_to_Member'>startup_cb</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="logical.c.html#LN56"><span class='Ref_to_Proto'>startup_cb_wrapper</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN225"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="logical.c.html#LN225"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN48"><span class='Ref_to_Member'>options</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN226"><span class='Ref_To_Local'>old_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="logical.c.html#LN225"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end CreateInitDecodingContext &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Create a new decoding context, for a logical slot that has previously been 
+ * used already. 
+ * 
+ * start_lsn 
+ *      The LSN at which to start decoding.  If InvalidXLogRecPtr, restart 
+ *      from the slot's confirmed_flush; otherwise, start from the specified 
+ *      location (but move it forwards to confirmed_flush if it's older than 
+ *      that, see below). 
+ * 
+ * output_plugin_options 
+ *      contains options passed to the output plugin. 
+ * 
+ * read_page, prepare_write, do_write, update_progress 
+ *      callbacks that have to be filled to perform the use-case dependent, 
+ *      actual work. 
+ * 
+ * Needs to be called while in a memory context that's at least as long lived 
+ * as the decoding context because further memory contexts will be created 
+ * inside it. 
+ * 
+ * Returns an initialized decoding context after calling the output plugin's 
+ * startup function. 
+ */ 
+</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>* 
+</span><a name="LN342"></a><span class='Declare_Function'>CreateDecodingContext</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>start_lsn</span><span class='Delimiter'>, 
+</span><a name="LN343"></a>                      <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>output_plugin_options</span><span class='Delimiter'>, 
+</span><a name="LN344"></a>                      <a href="../../../include/access/xlogreader.h.html#LN32"><span class='Ref_to_Typedef'>XLogPageReadCB</span></a> <span class='Declare_Parameter'>read_page</span><span class='Delimiter'>, 
+</span><a name="LN345"></a>                      <a href="../../../include/replication/logical.h.html#LN26"><span class='Ref_to_Typedef'>LogicalOutputPluginWriterPrepareWrite</span></a> <span class='Declare_Parameter'>prepare_write</span><span class='Delimiter'>, 
+</span><a name="LN346"></a>                      <a href="../../../include/replication/logical.h.html#LN19"><span class='Ref_to_Typedef'>LogicalOutputPluginWriterWrite</span></a> <span class='Declare_Parameter'>do_write</span><span class='Delimiter'>, 
+</span><a name="LN347"></a>                      <a href="../../../include/replication/logical.h.html#LN28"><span class='Ref_to_Typedef'>LogicalOutputPluginWriterUpdateProgress</span></a> <span class='Declare_Parameter'>update_progress</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN349"></a>    <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>ctx</span><span class='Delimiter'>; 
+</span><a name="LN350"></a>    <a href="../../../include/replication/slot.h.html#LN84"><span class='Ref_to_Struct'>ReplicationSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN351"></a>    <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>old_context</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* shorter lines... */ 
+</span>    <a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* first some sanity checks that are unlikely to be violated */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"cannot perform logical decoding without an acquired slot"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* make sure the passed slot is suitable, these are user facing errors */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/replication/slot.h.html#LN132"><span class='Ref_to_Macro'>SlotIsPhysical</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"cannot use physical replication slot for logical decoding"</span><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN43"><span class='Ref_to_Member'>database</span></a> <span class='Operator'>!= </span><a href="../../utils/init/globals.c.html#LN76"><span class='Ref_to_Global_Var'>MyDatabaseId</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>          <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"replication slot \"%s\" was not created in this database"</span><span class='Delimiter'>, 
+</span>                  <a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN40"><span class='Ref_to_Member'>name</span></a><span class='Parentheses'>)))))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN342"><span class='Ref_to_Parameter'>start_lsn</span></a> <span class='Operator'>== </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* continue from last position */ 
+</span>        <a href="logical.c.html#LN342"><span class='Ref_to_Parameter'>start_lsn</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN342"><span class='Ref_to_Parameter'>start_lsn</span></a> <span class='Operator'>&LT; </span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * It might seem like we should error out in this case, but it's 
+         * pretty common for a client to acknowledge a LSN it doesn't have to 
+         * do anything for, and thus didn't store persistently, because the 
+         * xlog records didn't result in anything relevant for logical 
+         * decoding. Clients have to be able to do that to support synchronous 
+         * replication. 
+         */ 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><span class='String'>"cannot stream from %X/%X, minimum is %X/%X, forwarding"</span><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN342"><span class='Ref_to_Parameter'>start_lsn</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN342"><span class='Ref_to_Parameter'>start_lsn</span></a><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="logical.c.html#LN342"><span class='Ref_to_Parameter'>start_lsn</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="logical.c.html#LN349"><span class='Ref_To_Local'>ctx</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN112"><span class='Ref_to_Func'>StartupDecodingContext</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN343"><span class='Ref_to_Parameter'>output_plugin_options</span></a><span class='Delimiter'>, 
+</span>                                 <a href="logical.c.html#LN342"><span class='Ref_to_Parameter'>start_lsn</span></a><span class='Delimiter'>, </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, 
+</span>                                 <a href="logical.c.html#LN344"><span class='Ref_to_Parameter'>read_page</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN345"><span class='Ref_to_Parameter'>prepare_write</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN346"><span class='Ref_to_Parameter'>do_write</span></a><span class='Delimiter'>, 
+</span>                                 <a href="logical.c.html#LN347"><span class='Ref_to_Parameter'>update_progress</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* call output plugin initialization callback */ 
+</span>    <a href="logical.c.html#LN351"><span class='Ref_To_Local'>old_context</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN349"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN37"><span class='Ref_to_Member'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN349"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN96"><span class='Ref_to_Member'>startup_cb</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="logical.c.html#LN56"><span class='Ref_to_Proto'>startup_cb_wrapper</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN349"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="logical.c.html#LN349"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN48"><span class='Ref_to_Member'>options</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN351"><span class='Ref_To_Local'>old_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"starting logical decoding for slot \"%s\""</span><span class='Delimiter'>, 
+</span>                    <a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN40"><span class='Ref_to_Member'>name</span></a><span class='Parentheses'>))</span><span class='Delimiter'>, 
+</span>             <a href="../../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"streaming transactions committing after %X/%X, reading WAL from %X/%X"</span><span class='Delimiter'>, 
+</span>                       <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                       <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a><span class='Delimiter'>, 
+</span>                       <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN67"><span class='Ref_to_Member'>restart_lsn</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                       <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN350"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN67"><span class='Ref_to_Member'>restart_lsn</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="logical.c.html#LN349"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end CreateDecodingContext &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Returns true if a consistent initial decoding snapshot has been built. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN422"></a><span class='Declare_Function'>DecodingContextReady</span><span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="../../../include/replication/snapbuild.h.html#LN72"><span class='Ref_to_Proto'>SnapBuildCurrentState</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN422"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN45"><span class='Ref_to_Member'>snapshot_builder</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="../../../include/replication/snapbuild.h.html#LN45"><span class='Ref_to_EnumConst'>SNAPBUILD_CONSISTENT</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Read from the decoding slot, until it is ready to start extracting changes. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN431"></a><span class='Declare_Function'>DecodingContextFindStartpoint</span><span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN433"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>startptr</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize from where to start reading WAL. */ 
+</span>    <a href="logical.c.html#LN433"><span class='Ref_To_Local'>startptr</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN431"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN40"><span class='Ref_to_Member'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN67"><span class='Ref_to_Member'>restart_lsn</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><span class='String'>"searching for logical decoding starting point, starting at %X/%X"</span><span class='Delimiter'>, 
+</span>         <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN431"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN40"><span class='Ref_to_Member'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN67"><span class='Ref_to_Member'>restart_lsn</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>         <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN431"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN40"><span class='Ref_to_Member'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN67"><span class='Ref_to_Member'>restart_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Wait for a consistent starting point */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN445"></a>        <a href="../../../include/access/xlogrecord.h.html#LN40"><span class='Ref_to_Struct'>XLogRecord</span></a> <span class='Operator'>*</span><span class='Declare_Local'>record</span><span class='Delimiter'>; 
+</span><a name="LN446"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>err</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* the read_page callback waits for new WAL */ 
+</span>        <a href="logical.c.html#LN445"><span class='Ref_To_Local'>record</span></a> <span class='Operator'>= </span><a href="../../access/transam/xlogreader.c.html#LN191"><span class='Ref_to_Func'>XLogReadRecord</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN431"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN43"><span class='Ref_to_Member'>reader</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN433"><span class='Ref_To_Local'>startptr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="logical.c.html#LN446"><span class='Ref_To_Local'>err</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN446"><span class='Ref_To_Local'>err</span></a><span class='Parentheses'>) 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"%s"</span><span class='Delimiter'>, </span><a href="logical.c.html#LN446"><span class='Ref_To_Local'>err</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="logical.c.html#LN445"><span class='Ref_To_Local'>record</span></a><span class='Parentheses'>) 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"no record found"</span><span class='Parentheses'>)</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* shouldn't happen */ 
+</span> 
+        <a href="logical.c.html#LN433"><span class='Ref_To_Local'>startptr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/replication/decode.h.html#LN16"><span class='Ref_to_Proto'>LogicalDecodingProcessRecord</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN431"><span class='Ref_to_Parameter'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN431"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN43"><span class='Ref_to_Member'>reader</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* only continue till we found a consistent spot */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN104"><span class='Ref_to_Proto'>DecodingContextReady</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN431"><span class='Ref_to_Parameter'>ctx</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <a href="logical.c.html#LN431"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN40"><span class='Ref_to_Member'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN431"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN43"><span class='Ref_to_Member'>reader</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN114"><span class='Ref_to_Member'>EndRecPtr</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end DecodingContextFindStartpoint &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Free a previously allocated decoding context, invoking the shutdown 
+ * callback if necessary. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN474"></a><span class='Declare_Function'>FreeDecodingContext</span><span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN474"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN102"><span class='Ref_to_Member'>shutdown_cb</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="logical.c.html#LN58"><span class='Ref_to_Proto'>shutdown_cb_wrapper</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN474"><span class='Ref_to_Parameter'>ctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="reorderbuffer.c.html#LN277"><span class='Ref_to_Func'>ReorderBufferFree</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN474"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN44"><span class='Ref_to_Member'>reorder</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/replication/snapbuild.h.html#LN64"><span class='Ref_to_Proto'>FreeSnapshotBuilder</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN474"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN45"><span class='Ref_to_Member'>snapshot_builder</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../access/transam/xlogreader.c.html#LN123"><span class='Ref_to_Func'>XLogReaderFree</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN474"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN43"><span class='Ref_to_Member'>reader</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/memutils.h.html#LN74"><span class='Ref_to_Proto'>MemoryContextDelete</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN474"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN37"><span class='Ref_to_Member'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Prepare a write using the context's output routine. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN489"></a><span class='Declare_Function'>OutputPluginPrepareWrite</span><span class='Parentheses'>(</span><span class='Control'>struct</span> <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>last_write</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="logical.c.html#LN489"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN80"><span class='Ref_to_Member'>accept_writes</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"writes are only accepted in commit, begin and change callbacks"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN489"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN58"><span class='Ref_to_Member'>prepare_write</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN489"><span class='Ref_to_Parameter'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN489"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN82"><span class='Ref_to_Member'>write_location</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN489"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN83"><span class='Ref_to_Member'>write_xid</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN489"><span class='Ref_to_Parameter'>last_write</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN489"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN81"><span class='Ref_to_Member'>prepared_write</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Perform a write using the context's output routine. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN502"></a><span class='Declare_Function'>OutputPluginWrite</span><span class='Parentheses'>(</span><span class='Control'>struct</span> <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>last_write</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="logical.c.html#LN502"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN81"><span class='Ref_to_Member'>prepared_write</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"OutputPluginPrepareWrite needs to be called before OutputPluginWrite"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN502"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN59"><span class='Ref_to_Member'>write</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN502"><span class='Ref_to_Parameter'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN502"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN82"><span class='Ref_to_Member'>write_location</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN502"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN83"><span class='Ref_to_Member'>write_xid</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN502"><span class='Ref_to_Parameter'>last_write</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN502"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN81"><span class='Ref_to_Member'>prepared_write</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Update progress tracking (if supported). 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN515"></a><span class='Declare_Function'>OutputPluginUpdateProgress</span><span class='Parentheses'>(</span><span class='Control'>struct</span> <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="logical.c.html#LN515"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN60"><span class='Ref_to_Member'>update_progress</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN515"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN60"><span class='Ref_to_Member'>update_progress</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN515"><span class='Ref_to_Parameter'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN515"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN82"><span class='Ref_to_Member'>write_location</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN515"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN83"><span class='Ref_to_Member'>write_xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Load the output plugin, lookup its output plugin init function, and check 
+ * that it provides the required callbacks. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN528"></a><span class='Declare_Function'>LoadOutputPlugin</span><span class='Parentheses'>(</span><a href="../../../include/replication/output_plugin.h.html#LN94"><span class='Ref_to_Struct'>OutputPluginCallbacks</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>callbacks</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>plugin</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN530"></a>    <a href="../../../include/replication/output_plugin.h.html#LN34"><span class='Ref_to_Typedef'>LogicalOutputPluginInit</span></a> <span class='Declare_Local'>plugin_init</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN530"><span class='Ref_To_Local'>plugin_init</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/replication/output_plugin.h.html#LN34"><span class='Ref_to_Typedef'>LogicalOutputPluginInit</span></a><span class='Parentheses'>) 
+</span>        <a href="../../utils/fmgr/dfmgr.c.html#LN92"><span class='Ref_to_Func'>load_external_function</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN528"><span class='Ref_to_Parameter'>plugin</span></a><span class='Delimiter'>, </span><span class='String'>"_PG_output_plugin_init"</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN530"><span class='Ref_To_Local'>plugin_init</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"output plugins have to declare the _PG_output_plugin_init symbol"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* ask the output plugin to fill the callback struct */ 
+</span>    <a href="logical.c.html#LN530"><span class='Ref_To_Local'>plugin_init</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN528"><span class='Ref_to_Parameter'>callbacks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN528"><span class='Ref_to_Parameter'>callbacks</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/output_plugin.h.html#LN97"><span class='Ref_to_Member'>begin_cb</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"output plugins have to register a begin callback"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN528"><span class='Ref_to_Parameter'>callbacks</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/output_plugin.h.html#LN98"><span class='Ref_to_Member'>change_cb</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"output plugins have to register a change callback"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN528"><span class='Ref_to_Parameter'>callbacks</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/output_plugin.h.html#LN99"><span class='Ref_to_Member'>commit_cb</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"output plugins have to register a commit callback"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end LoadOutputPlugin &raquo; </span> 
+ 
+<span class='Keyword'>static void 
+</span><a name="LN550"></a><span class='Declare_Function'>output_plugin_error_callback</span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN552"></a>    <a href="logical.c.html#LN47"><span class='Ref_to_Struct'>LogicalErrorCallbackState</span></a> <span class='Operator'>*</span><span class='Declare_Local'>state</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="logical.c.html#LN47"><span class='Ref_to_Struct'>LogicalErrorCallbackState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="logical.c.html#LN550"><span class='Ref_to_Parameter'>arg</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* not all callbacks have an associated LSN  */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN552"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>) 
+</span>        errcontext<span class='Parentheses'>(</span><span class='String'>"slot \"%s\", output plugin \"%s\", in the %s callback, associated LSN %X/%X"</span><span class='Delimiter'>, 
+</span>                   <a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN552"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN40"><span class='Ref_to_Member'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN40"><span class='Ref_to_Member'>name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                   <a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN552"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN40"><span class='Ref_to_Member'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN78"><span class='Ref_to_Member'>plugin</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                   <a href="logical.c.html#LN552"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="logical.c.html#LN50"><span class='Ref_to_Member'>callback_name</span></a><span class='Delimiter'>, 
+</span>                   <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN552"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                   <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN552"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        errcontext<span class='Parentheses'>(</span><span class='String'>"slot \"%s\", output plugin \"%s\", in the %s callback"</span><span class='Delimiter'>, 
+</span>                   <a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN552"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN40"><span class='Ref_to_Member'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN40"><span class='Ref_to_Member'>name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                   <a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN552"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN40"><span class='Ref_to_Member'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN78"><span class='Ref_to_Member'>plugin</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                   <a href="logical.c.html#LN552"><span class='Ref_To_Local'>state</span></a><span class='Operator'>-&GT;</span><a href="logical.c.html#LN50"><span class='Ref_to_Member'>callback_name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>static void 
+</span><a name="LN570"></a><span class='Declare_Function'>startup_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Delimiter'>, </span><a href="../../../include/replication/output_plugin.h.html#LN25"><span class='Ref_to_Struct'>OutputPluginOptions</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>opt</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>is_init</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN572"></a>    <a href="logical.c.html#LN47"><span class='Ref_to_Struct'>LogicalErrorCallbackState</span></a> <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN573"></a>    ErrorContextCallback <span class='Declare_Local'>errcallback</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Push callback + info on the error context stack */ 
+</span>    <a href="logical.c.html#LN572"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN570"><span class='Ref_to_Parameter'>ctx</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN572"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN50"><span class='Ref_to_Member'>callback_name</span></a> <span class='Operator'>= </span><span class='String'>"startup"</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN572"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN573"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>callback <span class='Operator'>= </span><a href="logical.c.html#LN55"><span class='Ref_to_Proto'>output_plugin_error_callback</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN573"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>arg <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="logical.c.html#LN572"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN573"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous <span class='Operator'>= </span><a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a><span class='Delimiter'>; 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= &</span><a href="logical.c.html#LN573"><span class='Ref_To_Local'>errcallback</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set output state */ 
+</span>    <a href="logical.c.html#LN570"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN80"><span class='Ref_to_Member'>accept_writes</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* do the actual work: call callback */ 
+</span>    <a href="logical.c.html#LN570"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN96"><span class='Ref_to_Member'>startup_cb</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN570"><span class='Ref_to_Parameter'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN570"><span class='Ref_to_Parameter'>opt</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN570"><span class='Ref_to_Parameter'>is_init</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Pop the error context stack */ 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN573"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous<span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end startup_cb_wrapper &raquo; </span> 
+ 
+<span class='Keyword'>static void 
+</span><a name="LN595"></a><span class='Declare_Function'>shutdown_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN597"></a>    <a href="logical.c.html#LN47"><span class='Ref_to_Struct'>LogicalErrorCallbackState</span></a> <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN598"></a>    ErrorContextCallback <span class='Declare_Local'>errcallback</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Push callback + info on the error context stack */ 
+</span>    <a href="logical.c.html#LN597"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN595"><span class='Ref_to_Parameter'>ctx</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN597"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN50"><span class='Ref_to_Member'>callback_name</span></a> <span class='Operator'>= </span><span class='String'>"shutdown"</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN597"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN598"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>callback <span class='Operator'>= </span><a href="logical.c.html#LN55"><span class='Ref_to_Proto'>output_plugin_error_callback</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN598"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>arg <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="logical.c.html#LN597"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN598"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous <span class='Operator'>= </span><a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a><span class='Delimiter'>; 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= &</span><a href="logical.c.html#LN598"><span class='Ref_To_Local'>errcallback</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set output state */ 
+</span>    <a href="logical.c.html#LN595"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN80"><span class='Ref_to_Member'>accept_writes</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* do the actual work: call callback */ 
+</span>    <a href="logical.c.html#LN595"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN102"><span class='Ref_to_Member'>shutdown_cb</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN595"><span class='Ref_to_Parameter'>ctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Pop the error context stack */ 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN598"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous<span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end shutdown_cb_wrapper &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Callbacks for ReorderBuffer which add in some more information and then call 
+ * output_plugin.h plugins. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN625"></a><span class='Declare_Function'>begin_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/reorderbuffer.h.html#LN294"><span class='Ref_to_Struct'>ReorderBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cache</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN139"><span class='Ref_to_Struct'>ReorderBufferTXN</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>txn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN627"></a>    <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>ctx</span> <span class='Operator'>= </span><a href="logical.c.html#LN625"><span class='Ref_to_Parameter'>cache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN325"><span class='Ref_to_Member'>private_data</span></a><span class='Delimiter'>; 
+</span><a name="LN628"></a>    <a href="logical.c.html#LN47"><span class='Ref_to_Struct'>LogicalErrorCallbackState</span></a> <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN629"></a>    ErrorContextCallback <span class='Declare_Local'>errcallback</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Push callback + info on the error context stack */ 
+</span>    <a href="logical.c.html#LN628"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN627"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN628"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN50"><span class='Ref_to_Member'>callback_name</span></a> <span class='Operator'>= </span><span class='String'>"begin"</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN628"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN625"><span class='Ref_to_Parameter'>txn</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN159"><span class='Ref_to_Member'>first_lsn</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN629"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>callback <span class='Operator'>= </span><a href="logical.c.html#LN55"><span class='Ref_to_Proto'>output_plugin_error_callback</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN629"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>arg <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="logical.c.html#LN628"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN629"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous <span class='Operator'>= </span><a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a><span class='Delimiter'>; 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= &</span><a href="logical.c.html#LN629"><span class='Ref_To_Local'>errcallback</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set output state */ 
+</span>    <a href="logical.c.html#LN627"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN80"><span class='Ref_to_Member'>accept_writes</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN627"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN83"><span class='Ref_to_Member'>write_xid</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN625"><span class='Ref_to_Parameter'>txn</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN144"><span class='Ref_to_Member'>xid</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN627"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN82"><span class='Ref_to_Member'>write_location</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN625"><span class='Ref_to_Parameter'>txn</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN159"><span class='Ref_to_Member'>first_lsn</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* do the actual work: call callback */ 
+</span>    <a href="logical.c.html#LN627"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN97"><span class='Ref_to_Member'>begin_cb</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN627"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN625"><span class='Ref_to_Parameter'>txn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Pop the error context stack */ 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN629"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous<span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end begin_cb_wrapper &raquo; </span> 
+ 
+<span class='Keyword'>static void 
+</span><a name="LN653"></a><span class='Declare_Function'>commit_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/reorderbuffer.h.html#LN294"><span class='Ref_to_Struct'>ReorderBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cache</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN139"><span class='Ref_to_Struct'>ReorderBufferTXN</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>txn</span><span class='Delimiter'>, 
+</span><a name="LN654"></a>                  <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>commit_lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN656"></a>    <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>ctx</span> <span class='Operator'>= </span><a href="logical.c.html#LN653"><span class='Ref_to_Parameter'>cache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN325"><span class='Ref_to_Member'>private_data</span></a><span class='Delimiter'>; 
+</span><a name="LN657"></a>    <a href="logical.c.html#LN47"><span class='Ref_to_Struct'>LogicalErrorCallbackState</span></a> <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN658"></a>    ErrorContextCallback <span class='Declare_Local'>errcallback</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Push callback + info on the error context stack */ 
+</span>    <a href="logical.c.html#LN657"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN656"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN657"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN50"><span class='Ref_to_Member'>callback_name</span></a> <span class='Operator'>= </span><span class='String'>"commit"</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN657"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN653"><span class='Ref_to_Parameter'>txn</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN172"><span class='Ref_to_Member'>final_lsn</span></a><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* beginning of commit record */ 
+</span>    <a href="logical.c.html#LN658"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>callback <span class='Operator'>= </span><a href="logical.c.html#LN55"><span class='Ref_to_Proto'>output_plugin_error_callback</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN658"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>arg <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="logical.c.html#LN657"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN658"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous <span class='Operator'>= </span><a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a><span class='Delimiter'>; 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= &</span><a href="logical.c.html#LN658"><span class='Ref_To_Local'>errcallback</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set output state */ 
+</span>    <a href="logical.c.html#LN656"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN80"><span class='Ref_to_Member'>accept_writes</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN656"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN83"><span class='Ref_to_Member'>write_xid</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN653"><span class='Ref_to_Parameter'>txn</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN144"><span class='Ref_to_Member'>xid</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN656"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN82"><span class='Ref_to_Member'>write_location</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN653"><span class='Ref_to_Parameter'>txn</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN177"><span class='Ref_to_Member'>end_lsn</span></a><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* points to the end of the record */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* do the actual work: call callback */ 
+</span>    <a href="logical.c.html#LN656"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN99"><span class='Ref_to_Member'>commit_cb</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN656"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN653"><span class='Ref_to_Parameter'>txn</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN654"><span class='Ref_to_Parameter'>commit_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Pop the error context stack */ 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN658"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous<span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end commit_cb_wrapper &raquo; </span> 
+ 
+<span class='Keyword'>static void 
+</span><a name="LN682"></a><span class='Declare_Function'>change_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/reorderbuffer.h.html#LN294"><span class='Ref_to_Struct'>ReorderBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cache</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN139"><span class='Ref_to_Struct'>ReorderBufferTXN</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>txn</span><span class='Delimiter'>, 
+</span><a name="LN683"></a>                  <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>relation</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN71"><span class='Ref_to_Struct'>ReorderBufferChange</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>change</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN685"></a>    <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>ctx</span> <span class='Operator'>= </span><a href="logical.c.html#LN682"><span class='Ref_to_Parameter'>cache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN325"><span class='Ref_to_Member'>private_data</span></a><span class='Delimiter'>; 
+</span><a name="LN686"></a>    <a href="logical.c.html#LN47"><span class='Ref_to_Struct'>LogicalErrorCallbackState</span></a> <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN687"></a>    ErrorContextCallback <span class='Declare_Local'>errcallback</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Push callback + info on the error context stack */ 
+</span>    <a href="logical.c.html#LN686"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN685"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN686"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN50"><span class='Ref_to_Member'>callback_name</span></a> <span class='Operator'>= </span><span class='String'>"change"</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN686"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN683"><span class='Ref_to_Parameter'>change</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN73"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN687"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>callback <span class='Operator'>= </span><a href="logical.c.html#LN55"><span class='Ref_to_Proto'>output_plugin_error_callback</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN687"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>arg <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="logical.c.html#LN686"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN687"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous <span class='Operator'>= </span><a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a><span class='Delimiter'>; 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= &</span><a href="logical.c.html#LN687"><span class='Ref_To_Local'>errcallback</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set output state */ 
+</span>    <a href="logical.c.html#LN685"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN80"><span class='Ref_to_Member'>accept_writes</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN685"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN83"><span class='Ref_to_Member'>write_xid</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN682"><span class='Ref_to_Parameter'>txn</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN144"><span class='Ref_to_Member'>xid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * report this change's lsn so replies from clients can give an up2date 
+     * answer. This won't ever be enough (and shouldn't be!) to confirm 
+     * receipt of this transaction, but it might allow another transaction's 
+     * commit to be confirmed with one message. 
+     */ 
+</span>    <a href="logical.c.html#LN685"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN82"><span class='Ref_to_Member'>write_location</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN683"><span class='Ref_to_Parameter'>change</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN73"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN685"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN98"><span class='Ref_to_Member'>change_cb</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN685"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN682"><span class='Ref_to_Parameter'>txn</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN683"><span class='Ref_to_Parameter'>relation</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN683"><span class='Ref_to_Parameter'>change</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Pop the error context stack */ 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN687"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous<span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end change_cb_wrapper &raquo; </span> 
+ 
+<span class='Keyword'>bool 
+</span><a name="LN717"></a><span class='Declare_Function'>filter_by_origin_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ctx</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Declare_Parameter'>origin_id</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN719"></a>    <a href="logical.c.html#LN47"><span class='Ref_to_Struct'>LogicalErrorCallbackState</span></a> <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN720"></a>    ErrorContextCallback <span class='Declare_Local'>errcallback</span><span class='Delimiter'>; 
+</span><a name="LN721"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>ret</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Push callback + info on the error context stack */ 
+</span>    <a href="logical.c.html#LN719"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN717"><span class='Ref_to_Parameter'>ctx</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN719"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN50"><span class='Ref_to_Member'>callback_name</span></a> <span class='Operator'>= </span><span class='String'>"filter_by_origin"</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN719"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN720"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>callback <span class='Operator'>= </span><a href="logical.c.html#LN55"><span class='Ref_to_Proto'>output_plugin_error_callback</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN720"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>arg <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="logical.c.html#LN719"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN720"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous <span class='Operator'>= </span><a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a><span class='Delimiter'>; 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= &</span><a href="logical.c.html#LN720"><span class='Ref_To_Local'>errcallback</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set output state */ 
+</span>    <a href="logical.c.html#LN717"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN80"><span class='Ref_to_Member'>accept_writes</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* do the actual work: call callback */ 
+</span>    <a href="logical.c.html#LN721"><span class='Ref_To_Local'>ret</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN717"><span class='Ref_to_Parameter'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN101"><span class='Ref_to_Member'>filter_by_origin_cb</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN717"><span class='Ref_to_Parameter'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN717"><span class='Ref_to_Parameter'>origin_id</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Pop the error context stack */ 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN720"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous<span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="logical.c.html#LN721"><span class='Ref_To_Local'>ret</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end filter_by_origin_cb_wrapper &raquo; </span> 
+ 
+<span class='Keyword'>static void 
+</span><a name="LN745"></a><span class='Declare_Function'>message_cb_wrapper</span><span class='Parentheses'>(</span><a href="../../../include/replication/reorderbuffer.h.html#LN294"><span class='Ref_to_Struct'>ReorderBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cache</span><span class='Delimiter'>, </span><a href="../../../include/replication/reorderbuffer.h.html#LN139"><span class='Ref_to_Struct'>ReorderBufferTXN</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>txn</span><span class='Delimiter'>, 
+</span><a name="LN746"></a>                   <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>message_lsn</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>transactional</span><span class='Delimiter'>, 
+</span><a name="LN747"></a>                   <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>prefix</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>message_size</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>message</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN749"></a>    <a href="../../../include/replication/logical.h.html#LN34"><span class='Ref_to_Struct'>LogicalDecodingContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>ctx</span> <span class='Operator'>= </span><a href="logical.c.html#LN745"><span class='Ref_to_Parameter'>cache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN325"><span class='Ref_to_Member'>private_data</span></a><span class='Delimiter'>; 
+</span><a name="LN750"></a>    <a href="logical.c.html#LN47"><span class='Ref_to_Struct'>LogicalErrorCallbackState</span></a> <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span><a name="LN751"></a>    ErrorContextCallback <span class='Declare_Local'>errcallback</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN749"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN100"><span class='Ref_to_Member'>message_cb</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Push callback + info on the error context stack */ 
+</span>    <a href="logical.c.html#LN750"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN49"><span class='Ref_to_Member'>ctx</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN749"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN750"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN50"><span class='Ref_to_Member'>callback_name</span></a> <span class='Operator'>= </span><span class='String'>"message"</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN750"><span class='Ref_To_Local'>state</span></a><span class='Operator'>.</span><a href="logical.c.html#LN51"><span class='Ref_to_Member'>report_location</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN746"><span class='Ref_to_Parameter'>message_lsn</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN751"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>callback <span class='Operator'>= </span><a href="logical.c.html#LN55"><span class='Ref_to_Proto'>output_plugin_error_callback</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN751"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>arg <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="logical.c.html#LN750"><span class='Ref_To_Local'>state</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN751"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous <span class='Operator'>= </span><a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a><span class='Delimiter'>; 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= &</span><a href="logical.c.html#LN751"><span class='Ref_To_Local'>errcallback</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set output state */ 
+</span>    <a href="logical.c.html#LN749"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN80"><span class='Ref_to_Member'>accept_writes</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN749"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN83"><span class='Ref_to_Member'>write_xid</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN745"><span class='Ref_to_Parameter'>txn</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>? </span><a href="logical.c.html#LN745"><span class='Ref_to_Parameter'>txn</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/reorderbuffer.h.html#LN144"><span class='Ref_to_Member'>xid</span></a> <span class='Operator'>: </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span>    <a href="logical.c.html#LN749"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN82"><span class='Ref_to_Member'>write_location</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN746"><span class='Ref_to_Parameter'>message_lsn</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* do the actual work: call callback */ 
+</span>    <a href="logical.c.html#LN749"><span class='Ref_To_Local'>ctx</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logical.h.html#LN47"><span class='Ref_to_Member'>callbacks</span></a><span class='Operator'>.</span><a href="../../../include/replication/output_plugin.h.html#LN100"><span class='Ref_to_Member'>message_cb</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN749"><span class='Ref_To_Local'>ctx</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN745"><span class='Ref_to_Parameter'>txn</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN746"><span class='Ref_to_Parameter'>message_lsn</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN746"><span class='Ref_to_Parameter'>transactional</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN747"><span class='Ref_to_Parameter'>prefix</span></a><span class='Delimiter'>, 
+</span>                              <a href="logical.c.html#LN747"><span class='Ref_to_Parameter'>message_size</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN747"><span class='Ref_to_Parameter'>message</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Pop the error context stack */ 
+</span>    <a href="../../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN751"><span class='Ref_To_Local'>errcallback</span></a><span class='Operator'>.</span>previous<span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end message_cb_wrapper &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Set the required catalog xmin horizon for historic snapshots in the current 
+ * replication slot. 
+ * 
+ * Note that in the most cases, we won't be able to immediately use the xmin 
+ * to increase the xmin horizon: we need to wait till the client has confirmed 
+ * receiving current_lsn with LogicalConfirmReceivedLocation(). 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN787"></a><span class='Declare_Function'>LogicalIncreaseXminForSlot</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>current_lsn</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xmin</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN789"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>updated_xmin</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN790"></a>    <a href="../../../include/replication/slot.h.html#LN84"><span class='Ref_to_Struct'>ReplicationSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * don't overwrite if we already have a newer xmin. This can happen if we 
+     * restart decoding in a slot. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN169"><span class='Ref_to_Proto'>TransactionIdPrecedesOrEquals</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN787"><span class='Ref_to_Parameter'>xmin</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN64"><span class='Ref_to_Member'>catalog_xmin</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the client has already confirmed up to this lsn, we directly can 
+     * mark this as accepted. This can happen if we restart decoding in a 
+     * slot. 
+     */ 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN787"><span class='Ref_to_Parameter'>current_lsn</span></a> <span class='Operator'>&LT;= </span><a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN126"><span class='Ref_to_Member'>candidate_catalog_xmin</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN787"><span class='Ref_to_Parameter'>xmin</span></a><span class='Delimiter'>; 
+</span>        <a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN127"><span class='Ref_to_Member'>candidate_xmin_lsn</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN787"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* our candidate can directly be used */ 
+</span>        <a href="logical.c.html#LN789"><span class='Ref_To_Local'>updated_xmin</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Only increase if the previous values have been applied, otherwise we 
+     * might never end up updating if the receiver acks too slowly. 
+     */ 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN127"><span class='Ref_to_Member'>candidate_xmin_lsn</span></a> <span class='Operator'>== </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN126"><span class='Ref_to_Member'>candidate_catalog_xmin</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN787"><span class='Ref_to_Parameter'>xmin</span></a><span class='Delimiter'>; 
+</span>        <a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN127"><span class='Ref_to_Member'>candidate_xmin_lsn</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN787"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* candidate already valid with the current flush position, apply */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN789"><span class='Ref_To_Local'>updated_xmin</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/replication/logical.h.html#LN110"><span class='Ref_to_Proto'>LogicalConfirmReceivedLocation</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN790"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end LogicalIncreaseXminForSlot &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Mark the minimal LSN (restart_lsn) we need to read to replay all 
+ * transactions that have not yet committed at current_lsn. 
+ * 
+ * Just like IncreaseRestartDecodingForSlot this only takes effect when the 
+ * client has confirmed to have received current_lsn. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN844"></a><span class='Declare_Function'>LogicalIncreaseRestartDecodingForSlot</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>current_lsn</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>restart_lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN846"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>updated_lsn</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN847"></a>    <a href="../../../include/replication/slot.h.html#LN84"><span class='Ref_to_Struct'>ReplicationSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span> 
+    <a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>restart_lsn</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>current_lsn</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* don't overwrite if have a newer restart lsn */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>restart_lsn</span></a> <span class='Operator'>&LT;= </span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN67"><span class='Ref_to_Member'>restart_lsn</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We might have already flushed far enough to directly accept this lsn, 
+     * in this case there is no need to check for existing candidate LSNs 
+     */ 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>current_lsn</span></a> <span class='Operator'>&LT;= </span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN128"><span class='Ref_to_Member'>candidate_restart_valid</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Delimiter'>; 
+</span>        <a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN129"><span class='Ref_to_Member'>candidate_restart_lsn</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>restart_lsn</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* our candidate can directly be used */ 
+</span>        <a href="logical.c.html#LN846"><span class='Ref_To_Local'>updated_lsn</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Only increase if the previous values have been applied, otherwise we 
+     * might never end up updating if the receiver acks too slowly. A missed 
+     * value here will just cause some extra effort after reconnecting. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN128"><span class='Ref_to_Member'>candidate_restart_valid</span></a> <span class='Operator'>== </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN128"><span class='Ref_to_Member'>candidate_restart_valid</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Delimiter'>; 
+</span>        <a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN129"><span class='Ref_to_Member'>candidate_restart_lsn</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>restart_lsn</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><span class='String'>"got new restart lsn %X/%X at %X/%X"</span><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>restart_lsn</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>restart_lsn</span></a><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>current_lsn</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><span class='String'>"failed to increase restart lsn: proposed %X/%X, after %X/%X, current candidate %X/%X, current after %X/%X, flushed up to %X/%X"</span><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>restart_lsn</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>restart_lsn</span></a><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>current_lsn</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN844"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN129"><span class='Ref_to_Member'>candidate_restart_lsn</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN129"><span class='Ref_to_Member'>candidate_restart_lsn</span></a><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN128"><span class='Ref_to_Member'>candidate_restart_valid</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN128"><span class='Ref_to_Member'>candidate_restart_valid</span></a><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a> 
+            <span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* candidates are already valid with the current flush position, apply */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN846"><span class='Ref_To_Local'>updated_lsn</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/replication/logical.h.html#LN110"><span class='Ref_to_Proto'>LogicalConfirmReceivedLocation</span></a><span class='Parentheses'>(</span><a href="logical.c.html#LN847"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end LogicalIncreaseRestartDecodingForSlot &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Handle a consumer's confirmation having received all changes up to lsn. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN913"></a><span class='Declare_Function'>LogicalConfirmReceivedLocation</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="logical.c.html#LN913"><span class='Ref_to_Parameter'>lsn</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Do an unlocked check for candidate_lsn first. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN127"><span class='Ref_to_Member'>candidate_xmin_lsn</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a> <span class='Operator'>|| 
+</span>        <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN128"><span class='Ref_to_Member'>candidate_restart_valid</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN921"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>updated_xmin</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN922"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>updated_restart</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN913"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* if we're past the location required for bumping xmin, do so */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN127"><span class='Ref_to_Member'>candidate_xmin_lsn</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a> <span class='Operator'>&& 
+</span>            <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN127"><span class='Ref_to_Member'>candidate_xmin_lsn</span></a> <span class='Operator'>&LT;= </span><a href="logical.c.html#LN913"><span class='Ref_to_Parameter'>lsn</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * We have to write the changed xmin to disk *before* we change 
+             * the in-memory value, otherwise after a crash we wouldn't know 
+             * that some catalog tuples might have been removed already. 
+             * 
+             * Ensure that by first writing to -&GT;xmin and only update 
+             * -&GT;effective_xmin once the new state is synced to disk. After a 
+             * crash -&GT;effective_xmin is set to -&GT;xmin. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN126"><span class='Ref_to_Member'>candidate_catalog_xmin</span></a><span class='Parentheses'>) </span><span class='Operator'>&& 
+</span>                <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN64"><span class='Ref_to_Member'>catalog_xmin</span></a> <span class='Operator'>!= </span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN126"><span class='Ref_to_Member'>candidate_catalog_xmin</span></a><span class='Parentheses'>)</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN64"><span class='Ref_to_Member'>catalog_xmin</span></a> <span class='Operator'>= </span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN126"><span class='Ref_to_Member'>candidate_catalog_xmin</span></a><span class='Delimiter'>; 
+</span>                <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN126"><span class='Ref_to_Member'>candidate_catalog_xmin</span></a> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span>                <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN127"><span class='Ref_to_Member'>candidate_xmin_lsn</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>                <a href="logical.c.html#LN921"><span class='Ref_To_Local'>updated_xmin</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if MyReplicationSlot-&GT;ca... &raquo; </span> 
+ 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN128"><span class='Ref_to_Member'>candidate_restart_valid</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a> <span class='Operator'>&& 
+</span>            <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN128"><span class='Ref_to_Member'>candidate_restart_valid</span></a> <span class='Operator'>&LT;= </span><a href="logical.c.html#LN913"><span class='Ref_to_Parameter'>lsn</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN129"><span class='Ref_to_Member'>candidate_restart_lsn</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN67"><span class='Ref_to_Member'>restart_lsn</span></a> <span class='Operator'>= </span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN129"><span class='Ref_to_Member'>candidate_restart_lsn</span></a><span class='Delimiter'>; 
+</span>            <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN129"><span class='Ref_to_Member'>candidate_restart_lsn</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>            <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN128"><span class='Ref_to_Member'>candidate_restart_valid</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>            <a href="logical.c.html#LN922"><span class='Ref_To_Local'>updated_restart</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* first write new xmin to disk, so we know what's up after a crash */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN921"><span class='Ref_To_Local'>updated_xmin</span></a> <span class='Operator'>|| </span><a href="logical.c.html#LN922"><span class='Ref_To_Local'>updated_restart</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/replication/slot.h.html#LN170"><span class='Ref_to_Proto'>ReplicationSlotMarkDirty</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/replication/slot.h.html#LN169"><span class='Ref_to_Proto'>ReplicationSlotSave</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><span class='String'>"updated xmin: %u restart: %u"</span><span class='Delimiter'>, </span><a href="logical.c.html#LN921"><span class='Ref_To_Local'>updated_xmin</span></a><span class='Delimiter'>, </span><a href="logical.c.html#LN922"><span class='Ref_To_Local'>updated_restart</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Now the new xmin is safely on disk, we can let the global value 
+         * advance. We do not take ProcArrayLock or similar since we only 
+         * advance xmin here and there's not much harm done by a concurrent 
+         * computation missing that. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="logical.c.html#LN921"><span class='Ref_To_Local'>updated_xmin</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN111"><span class='Ref_to_Member'>effective_catalog_xmin</span></a> <span class='Operator'>= </span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN64"><span class='Ref_to_Member'>catalog_xmin</span></a><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/replication/slot.h.html#LN175"><span class='Ref_to_Proto'>ReplicationSlotsComputeRequiredXmin</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/replication/slot.h.html#LN176"><span class='Ref_to_Proto'>ReplicationSlotsComputeRequiredLSN</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if MyReplicationSlot-&GT;ca... &raquo; </span> 
+    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN114"><span class='Ref_to_Member'>data</span></a><span class='Operator'>.</span><a href="../../../include/replication/slot.h.html#LN75"><span class='Ref_to_Member'>confirmed_flush</span></a> <span class='Operator'>= </span><a href="logical.c.html#LN913"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../slot.c.html#LN95"><span class='Ref_to_Global_Var'>MyReplicationSlot</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/slot.h.html#LN87"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end LogicalConfirmReceivedLocation &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

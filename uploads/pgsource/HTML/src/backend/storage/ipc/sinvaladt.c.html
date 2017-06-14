@@ -1,0 +1,807 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\storage\ipc\sinvaladt.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\storage\ipc\sinvaladt.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:49 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * sinvaladt.c 
+ *    POSTGRES shared cache invalidation data manager. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/storage/ipc/sinvaladt.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;signal.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/backendid.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/procsignal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/sinvaladt.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/spin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/transam.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Conceptually, the shared cache invalidation messages are stored in an 
+ * infinite array, where maxMsgNum is the next array subscript to store a 
+ * submitted message in, minMsgNum is the smallest array subscript containing 
+ * a message not yet read by all backends, and we always have maxMsgNum &GT;= 
+ * minMsgNum.  (They are equal when there are no messages pending.)  For each 
+ * active backend, there is a nextMsgNum pointer indicating the next message it 
+ * needs to read; we have maxMsgNum &GT;= nextMsgNum &GT;= minMsgNum for every 
+ * backend. 
+ * 
+ * (In the current implementation, minMsgNum is a lower bound for the 
+ * per-process nextMsgNum values, but it isn't rigorously kept equal to the 
+ * smallest nextMsgNum --- it may lag behind.  We only update it when 
+ * SICleanupQueue is called, and we try not to do that often.) 
+ * 
+ * In reality, the messages are stored in a circular buffer of MAXNUMMESSAGES 
+ * entries.  We translate MsgNum values into circular-buffer indexes by 
+ * computing MsgNum % MAXNUMMESSAGES (this should be fast as long as 
+ * MAXNUMMESSAGES is a constant and a power of 2).  As long as maxMsgNum 
+ * doesn't exceed minMsgNum by more than MAXNUMMESSAGES, we have enough space 
+ * in the buffer.  If the buffer does overflow, we recover by setting the 
+ * "reset" flag for each backend that has fallen too far behind.  A backend 
+ * that is in "reset" state is ignored while determining minMsgNum.  When 
+ * it does finally attempt to receive inval messages, it must discard all 
+ * its invalidatable state, since it won't know what it missed. 
+ * 
+ * To reduce the probability of needing resets, we send a "catchup" interrupt 
+ * to any backend that seems to be falling unreasonably far behind.  The 
+ * normal behavior is that at most one such interrupt is in flight at a time; 
+ * when a backend completes processing a catchup interrupt, it executes 
+ * SICleanupQueue, which will signal the next-furthest-behind backend if 
+ * needed.  This avoids undue contention from multiple backends all trying 
+ * to catch up at once.  However, the furthest-back backend might be stuck 
+ * in a state where it can't catch up.  Eventually it will get reset, so it 
+ * won't cause any more problems for anyone but itself.  But we don't want 
+ * to find that a bunch of other backends are now too close to the reset 
+ * threshold to be saved.  So SICleanupQueue is designed to occasionally 
+ * send extra catchup interrupts as the queue gets fuller, to backends that 
+ * are far behind and haven't gotten one yet.  As long as there aren't a lot 
+ * of "stuck" backends, we won't need a lot of extra interrupts, since ones 
+ * that aren't stuck will propagate their interrupts to the next guy. 
+ * 
+ * We would have problems if the MsgNum values overflow an integer, so 
+ * whenever minMsgNum exceeds MSGNUMWRAPAROUND, we subtract MSGNUMWRAPAROUND 
+ * from all the MsgNum variables simultaneously.  MSGNUMWRAPAROUND can be 
+ * large so that we don't need to do this often.  It must be a multiple of 
+ * MAXNUMMESSAGES so that the existing circular-buffer entries don't need 
+ * to be moved when we do it. 
+ * 
+ * Access to the shared sinval array is protected by two locks, SInvalReadLock 
+ * and SInvalWriteLock.  Readers take SInvalReadLock in shared mode; this 
+ * authorizes them to modify their own ProcState but not to modify or even 
+ * look at anyone else's.  When we need to perform array-wide updates, 
+ * such as in SICleanupQueue, we take SInvalReadLock in exclusive mode to 
+ * lock out all readers.  Writers take SInvalWriteLock (always in exclusive 
+ * mode) to serialize adding messages to the queue.  Note that a writer 
+ * can operate in parallel with one or more readers, because the writer 
+ * has no need to touch anyone's ProcState, except in the infrequent cases 
+ * when SICleanupQueue is needed.  The only point of overlap is that 
+ * the writer wants to change maxMsgNum while readers need to read it. 
+ * We deal with that by having a spinlock that readers must take for just 
+ * long enough to read maxMsgNum, while writers take it for just long enough 
+ * to write maxMsgNum.  (The exact rule is that you need the spinlock to 
+ * read maxMsgNum if you are not holding SInvalWriteLock, and you need the 
+ * spinlock to write maxMsgNum unless you are holding both locks.) 
+ * 
+ * Note: since maxMsgNum is an int and hence presumably atomically readable/ 
+ * writable, the spinlock might seem unnecessary.  The reason it is needed 
+ * is to provide a memory barrier: we need to be sure that messages written 
+ * to the array are actually there before maxMsgNum is increased, and that 
+ * readers will see that data after fetching maxMsgNum.  Multiprocessors 
+ * that have weak memory-ordering guarantees can fail without the memory 
+ * barrier instructions that are included in the spinlock sequences. 
+ */ 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Configurable parameters. 
+ * 
+ * MAXNUMMESSAGES: max number of shared-inval messages we can buffer. 
+ * Must be a power of 2 for speed. 
+ * 
+ * MSGNUMWRAPAROUND: how often to reduce MsgNum variables to avoid overflow. 
+ * Must be a multiple of MAXNUMMESSAGES.  Should be large. 
+ * 
+ * CLEANUP_MIN: the minimum number of messages that must be in the buffer 
+ * before we bother to call SICleanupQueue. 
+ * 
+ * CLEANUP_QUANTUM: how often (in messages) to call SICleanupQueue once 
+ * we exceed CLEANUP_MIN.  Should be a power of 2 for speed. 
+ * 
+ * SIG_THRESHOLD: the minimum number of messages a backend must have fallen 
+ * behind before we'll send it PROCSIG_CATCHUP_INTERRUPT. 
+ * 
+ * WRITE_QUANTUM: the max number of messages to push into the buffer per 
+ * iteration of SIInsertDataEntries.  Noncritical but should be less than 
+ * CLEANUP_QUANTUM, because we only consider calling SICleanupQueue once 
+ * per iteration. 
+ */ 
+</span> 
+<a name="LN130"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MAXNUMMESSAGES</span> <span class='Number'>4096</span> 
+<a name="LN131"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MSGNUMWRAPAROUND</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN130"><span class='Ref_to_Const'>MAXNUMMESSAGES</span></a> <span class='Operator'>* </span><span class='Number'>262144</span><span class='Parentheses'>) 
+</span><a name="LN132"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CLEANUP_MIN</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN130"><span class='Ref_to_Const'>MAXNUMMESSAGES</span></a> <span class='Operator'>/ </span><span class='Number'>2</span><span class='Parentheses'>) 
+</span><a name="LN133"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CLEANUP_QUANTUM</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN130"><span class='Ref_to_Const'>MAXNUMMESSAGES</span></a> <span class='Operator'>/ </span><span class='Number'>16</span><span class='Parentheses'>) 
+</span><a name="LN134"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>SIG_THRESHOLD</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN130"><span class='Ref_to_Const'>MAXNUMMESSAGES</span></a> <span class='Operator'>/ </span><span class='Number'>2</span><span class='Parentheses'>) 
+</span><a name="LN135"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>WRITE_QUANTUM</span> <span class='Number'>64</span> 
+ 
+<span class='Comment_Multi_Line'>/* Per-backend state in shared invalidation structure */ 
+</span><a name="LN138"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>ProcState</span> 
+<span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* procPid is zero in an inactive ProcState array entry. */ 
+</span><a name="LN141"></a>    <a href="../../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Member'>procPid</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* PID of backend, for signaling */ 
+</span><a name="LN142"></a>    <a href="../../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a>     <span class='Operator'>*</span><span class='Declare_Member'>proc</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* PGPROC of backend */ 
+</span>    <span class='Comment_Multi_Line'>/* nextMsgNum is meaningless if procPid == 0 or resetState is true. */ 
+</span><a name="LN144"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>nextMsgNum</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* next message number to read */ 
+</span><a name="LN145"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>resetState</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* backend needs to reset its state */ 
+</span><a name="LN146"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>signaled</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* backend has been sent catchup signal */ 
+</span><a name="LN147"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>hasMessages</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* backend has unread messages */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Backend only sends invalidations, never receives them. This only makes 
+     * sense for Startup process during recovery because it doesn't maintain a 
+     * relcache, yet it fires inval messages to allow query backends to see 
+     * schema changes. 
+     */ 
+</span><a name="LN155"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>sendOnly</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* backend only sends, never receives */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Next LocalTransactionId to use for each idle backend slot.  We keep 
+     * this here because it is indexed by BackendId and it is convenient to 
+     * copy the value to and from local memory when MyBackendId is set. It's 
+     * meaningless in an active ProcState entry. 
+     */ 
+</span><a name="LN163"></a>    <a href="../../../include/c.h.html#LN398"><span class='Ref_to_Typedef'>LocalTransactionId</span></a> <span class='Declare_Member'>nextLXID</span><span class='Delimiter'>; 
+</span><a name="LN164"></a>}<span class='Auto_Annotations'> &laquo; end ProcState &raquo; </span> <span class='Declare_Typedef'>ProcState</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Shared cache invalidation memory segment */ 
+</span><a name="LN167"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>SISeg</span> 
+<span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * General state information 
+     */ 
+</span><a name="LN172"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>minMsgNum</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* oldest message still needed */ 
+</span><a name="LN173"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>maxMsgNum</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* next message number to be assigned */ 
+</span><a name="LN174"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>nextThreshold</span><span class='Delimiter'>;</span>  <span class='Comment_Single_Line'>/* # of messages to call SICleanupQueue */ 
+</span><a name="LN175"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>lastBackend</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* index of last active procState entry, +1 */ 
+</span><a name="LN176"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>maxBackends</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* size of procState array */ 
+</span> 
+<a name="LN178"></a>    <a href="../../../include/storage/s_lock.h.html#LN137"><span class='Ref_to_Typedef'>slock_t</span></a>     <span class='Declare_Member'>msgnumLock</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* spinlock protecting maxMsgNum */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Circular buffer holding shared-inval messages 
+     */ 
+</span><a name="LN183"></a>    <a href="../../../include/storage/sinval.h.html#LN112"><span class='Ref_to_Typedef'>SharedInvalidationMessage</span></a> <span class='Declare_Member'>buffer</span><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN130"><span class='Ref_to_Const'>MAXNUMMESSAGES</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Per-backend invalidation state info (has MaxBackends entries). 
+     */ 
+</span><a name="LN188"></a>    <a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a>   <span class='Declare_Member'>procState</span><span class='Delimiter'>[</span>FLEXIBLE_ARRAY_MEMBER<span class='Delimiter'>]; 
+</span><a name="LN189"></a>}<span class='Auto_Annotations'> &laquo; end SISeg &raquo; </span> <span class='Declare_Typedef'>SISeg</span><span class='Delimiter'>; 
+</span> 
+<a name="LN191"></a><span class='Keyword'>static </span><a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a> <span class='Operator'>*</span><span class='Declare_Var'>shmInvalBuffer</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* pointer to the shared inval buffer */ 
+</span> 
+ 
+<a name="LN194"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN398"><span class='Ref_to_Typedef'>LocalTransactionId</span></a> <span class='Declare_Var'>nextLocalTransactionId</span><span class='Delimiter'>; 
+</span> 
+<a name="LN196"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>CleanupInvalidationState</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SInvalShmemSize --- return shared-memory space needed 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN203"></a><span class='Declare_Function'>SInvalShmemSize</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN205"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>size</span><span class='Delimiter'>; 
+</span> 
+    <a href="sinvaladt.c.html#LN205"><span class='Ref_To_Local'>size</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a><span class='Delimiter'>, </span>procState<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN205"><span class='Ref_To_Local'>size</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN44"><span class='Ref_to_Proto'>add_size</span></a><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN205"><span class='Ref_To_Local'>size</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../utils/init/globals.c.html#LN126"><span class='Ref_to_Global_Var'>MaxBackends</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="sinvaladt.c.html#LN205"><span class='Ref_To_Local'>size</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * CreateSharedInvalidationState 
+ *      Create and initialize the SI message buffer 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN218"></a><span class='Declare_Function'>CreateSharedInvalidationState</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN220"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN221"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Allocate space in shared memory */ 
+</span>    <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/shmem.h.html#LN43"><span class='Ref_to_Proto'>ShmemInitStruct</span></a><span class='Parentheses'>(</span><span class='String'>"shmInvalBuffer"</span><span class='Delimiter'>, </span><a href="../../../include/storage/sinvaladt.h.html#LN30"><span class='Ref_to_Proto'>SInvalShmemSize</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="sinvaladt.c.html#LN221"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN221"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Clear message counters, save size of procState array, init spinlock */ 
+</span>    <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN172"><span class='Ref_to_Member'>minMsgNum</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN173"><span class='Ref_to_Member'>maxMsgNum</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN174"><span class='Ref_to_Member'>nextThreshold</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN132"><span class='Ref_to_Const'>CLEANUP_MIN</span></a><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN176"><span class='Ref_to_Member'>maxBackends</span></a> <span class='Operator'>= </span><a href="../../utils/init/globals.c.html#LN126"><span class='Ref_to_Global_Var'>MaxBackends</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/spin.h.html#LN59"><span class='Ref_to_Macro'>SpinLockInit</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN178"><span class='Ref_to_Member'>msgnumLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* The buffer[] array is initially all unused, so we need not fill it */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* Mark all backends inactive, and initialize nextLXID */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN176"><span class='Ref_to_Member'>maxBackends</span></a><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN141"><span class='Ref_to_Member'>procPid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* inactive */ 
+</span>        <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN142"><span class='Ref_to_Member'>proc</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* meaningless */ 
+</span>        <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN145"><span class='Ref_to_Member'>resetState</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN146"><span class='Ref_to_Member'>signaled</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN147"><span class='Ref_to_Member'>hasMessages</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN220"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN163"><span class='Ref_to_Member'>nextLXID</span></a> <span class='Operator'>= </span><a href="../../../include/storage/lock.h.html#LN69"><span class='Ref_to_Const'>InvalidLocalTransactionId</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end CreateSharedInvalidationState &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SharedInvalBackendInit 
+ *      Initialize a new backend to operate on the sinval buffer 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN257"></a><span class='Declare_Function'>SharedInvalBackendInit</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>sendOnly</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN259"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>index</span><span class='Delimiter'>; 
+</span><a name="LN260"></a>    <a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>stateP</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN261"></a>    <a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>segP</span> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * This can run in parallel with read operations, but not with write 
+     * operations, since SIInsertDataEntries relies on lastBackend to set 
+     * hasMessages appropriately. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Look for a free entry in the procState array */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN259"><span class='Ref_To_Local'>index</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN259"><span class='Ref_To_Local'>index</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN259"><span class='Ref_To_Local'>index</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN259"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN141"><span class='Ref_to_Member'>procPid</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span>        <span class='Comment_Single_Line'>/* inactive slot? */ 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a> <span class='Operator'>= &</span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN259"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>]; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN176"><span class='Ref_to_Member'>maxBackends</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a> <span class='Operator'>= &</span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a><span class='Delimiter'>]; 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN141"><span class='Ref_to_Member'>procPid</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * out of procState slots: MaxBackends exceeded -- report normally 
+             */ 
+</span>            <a href="../../utils/init/globals.c.html#LN72"><span class='Ref_to_Global_Var'>MyBackendId</span></a> <span class='Operator'>= </span><a href="../../../include/storage/backendid.h.html#LN22"><span class='Ref_to_Const'>InvalidBackendId</span></a><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_TOO_MANY_CONNECTIONS<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"sorry, too many clients already"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if stateP==NULL &raquo; </span> 
+ 
+    <a href="../../utils/init/globals.c.html#LN72"><span class='Ref_to_Global_Var'>MyBackendId</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a> <span class='Operator'>- &</span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Advertise assigned backend ID in MyProc */ 
+</span>    <a href="../lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN111"><span class='Ref_to_Member'>backendId</span></a> <span class='Operator'>= </span><a href="../../utils/init/globals.c.html#LN72"><span class='Ref_to_Global_Var'>MyBackendId</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Fetch next local transaction ID into local memory */ 
+</span>    <a href="sinvaladt.c.html#LN194"><span class='Ref_to_Global_Var'>nextLocalTransactionId</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN163"><span class='Ref_to_Member'>nextLXID</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* mark myself active, with all extant messages already read */ 
+</span>    <a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN141"><span class='Ref_to_Member'>procPid</span></a> <span class='Operator'>= </span><a href="../../utils/init/globals.c.html#LN38"><span class='Ref_to_Global_Var'>MyProcPid</span></a><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN142"><span class='Ref_to_Member'>proc</span></a> <span class='Operator'>= </span><a href="../lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN173"><span class='Ref_to_Member'>maxMsgNum</span></a><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN145"><span class='Ref_to_Member'>resetState</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN146"><span class='Ref_to_Member'>signaled</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN147"><span class='Ref_to_Member'>hasMessages</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN260"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN155"><span class='Ref_to_Member'>sendOnly</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN257"><span class='Ref_to_Parameter'>sendOnly</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* register exit routine to mark my entry inactive at exit */ 
+</span>    <a href="../../../include/storage/ipc.h.html#LN69"><span class='Ref_to_Proto'>on_shmem_exit</span></a><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN196"><span class='Ref_to_Proto'>CleanupInvalidationState</span></a><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN561"><span class='Ref_to_Macro'>PointerGetDatum</span></a><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN261"><span class='Ref_To_Local'>segP</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN21"><span class='Ref_to_Const'>DEBUG4</span></a><span class='Delimiter'>, </span><span class='String'>"my backend ID is %d"</span><span class='Delimiter'>, </span><a href="../../utils/init/globals.c.html#LN72"><span class='Ref_to_Global_Var'>MyBackendId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SharedInvalBackendInit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * CleanupInvalidationState 
+ *      Mark the current backend as no longer active. 
+ * 
+ * This function is called via on_shmem_exit() during backend shutdown. 
+ * 
+ * arg is really of type "SISeg*". 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN335"></a><span class='Declare_Function'>CleanupInvalidationState</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN337"></a>    <a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>segP</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/postgres.h.html#LN554"><span class='Ref_to_Macro'>DatumGetPointer</span></a><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN335"><span class='Ref_to_Parameter'>arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN338"></a>    <a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>stateP</span><span class='Delimiter'>; 
+</span><a name="LN339"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN525"><span class='Ref_to_Macro'>PointerIsValid</span></a><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN337"><span class='Ref_To_Local'>segP</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="sinvaladt.c.html#LN338"><span class='Ref_To_Local'>stateP</span></a> <span class='Operator'>= &</span><a href="sinvaladt.c.html#LN337"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="../../utils/init/globals.c.html#LN72"><span class='Ref_to_Global_Var'>MyBackendId</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Update next local transaction ID for next holder of this backendID */ 
+</span>    <a href="sinvaladt.c.html#LN338"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN163"><span class='Ref_to_Member'>nextLXID</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN194"><span class='Ref_to_Global_Var'>nextLocalTransactionId</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Mark myself inactive */ 
+</span>    <a href="sinvaladt.c.html#LN338"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN141"><span class='Ref_to_Member'>procPid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN338"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN142"><span class='Ref_to_Member'>proc</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN338"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN338"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN145"><span class='Ref_to_Member'>resetState</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN338"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN146"><span class='Ref_to_Member'>signaled</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Recompute index of last active backend */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN339"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN337"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN339"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN339"><span class='Ref_To_Local'>i</span></a><span class='Operator'>--</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN337"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN339"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN141"><span class='Ref_to_Member'>procPid</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="sinvaladt.c.html#LN337"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN339"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end CleanupInvalidationState &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * BackendIdGetProc 
+ *      Get the PGPROC structure for a backend, given the backend ID. 
+ *      The result may be out of date arbitrarily quickly, so the caller 
+ *      must be careful about how this information is used.  NULL is 
+ *      returned if the backend is not active. 
+ */ 
+</span><a href="../../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a> <span class='Operator'>* 
+</span><a name="LN376"></a><span class='Declare_Function'>BackendIdGetProc</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>backendID</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN378"></a>    <a href="../../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>result</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN379"></a>    <a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>segP</span> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Need to lock out additions/removals of backends */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN376"><span class='Ref_to_Parameter'>backendID</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="sinvaladt.c.html#LN376"><span class='Ref_to_Parameter'>backendID</span></a> <span class='Operator'>&LT;= </span><a href="sinvaladt.c.html#LN379"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN386"></a>        <a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>stateP</span> <span class='Operator'>= &</span><a href="sinvaladt.c.html#LN379"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN376"><span class='Ref_to_Parameter'>backendID</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span> 
+        <a href="sinvaladt.c.html#LN378"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN386"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN142"><span class='Ref_to_Member'>proc</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="sinvaladt.c.html#LN378"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end BackendIdGetProc &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * BackendIdGetTransactionIds 
+ *      Get the xid and xmin of the backend. The result may be out of date 
+ *      arbitrarily quickly, so the caller must be careful about how this 
+ *      information is used. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN403"></a><span class='Declare_Function'>BackendIdGetTransactionIds</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>backendID</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>xmin</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN405"></a>    <a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>segP</span> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="sinvaladt.c.html#LN403"><span class='Ref_to_Parameter'>xid</span></a> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="sinvaladt.c.html#LN403"><span class='Ref_to_Parameter'>xmin</span></a> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Need to lock out additions/removals of backends */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN403"><span class='Ref_to_Parameter'>backendID</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="sinvaladt.c.html#LN403"><span class='Ref_to_Parameter'>backendID</span></a> <span class='Operator'>&LT;= </span><a href="sinvaladt.c.html#LN405"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN415"></a>        <a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>stateP</span> <span class='Operator'>= &</span><a href="sinvaladt.c.html#LN405"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN403"><span class='Ref_to_Parameter'>backendID</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span><a name="LN416"></a>        <a href="../../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>proc</span> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN415"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN142"><span class='Ref_to_Member'>proc</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN416"><span class='Ref_To_Local'>proc</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN420"></a>            <a href="../../../include/storage/proc.h.html#LN206"><span class='Ref_to_Struct'>PGXACT</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>xact</span> <span class='Operator'>= &</span><a href="../lmgr/proc.c.html#LN79"><span class='Ref_to_Global_Var'>ProcGlobal</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN233"><span class='Ref_to_Member'>allPgXact</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN416"><span class='Ref_To_Local'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN108"><span class='Ref_to_Member'>pgprocno</span></a><span class='Delimiter'>]; 
+</span> 
+            <span class='Operator'>*</span><a href="sinvaladt.c.html#LN403"><span class='Ref_to_Parameter'>xid</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN420"><span class='Ref_To_Local'>xact</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN208"><span class='Ref_to_Member'>xid</span></a><span class='Delimiter'>; 
+</span>            <span class='Operator'>*</span><a href="sinvaladt.c.html#LN403"><span class='Ref_to_Parameter'>xmin</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN420"><span class='Ref_To_Local'>xact</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN212"><span class='Ref_to_Member'>xmin</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end BackendIdGetTransactionIds &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SIInsertDataEntries 
+ *      Add new invalidation message(s) to the buffer. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN435"></a><span class='Declare_Function'>SIInsertDataEntries</span><span class='Parentheses'>(</span><span class='Keyword'>const </span><a href="../../../include/storage/sinval.h.html#LN112"><span class='Ref_to_Typedef'>SharedInvalidationMessage</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>data</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>n</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN437"></a>    <a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>segP</span> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * N can be arbitrarily large.  We divide the work into groups of no more 
+     * than WRITE_QUANTUM messages, to be sure that we don't hold the lock for 
+     * an unreasonably long time.  (This is not so much because we care about 
+     * letting in other writers, as that some just-caught-up backend might be 
+     * trying to do SICleanupQueue to pass on its signal, and we don't want it 
+     * to have to wait a long time.)  Also, we need to consider calling 
+     * SICleanupQueue every so often. 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN435"><span class='Ref_to_Parameter'>n</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN450"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>nthistime</span> <span class='Operator'>= </span><a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN435"><span class='Ref_to_Parameter'>n</span></a><span class='Delimiter'>, </span><a href="sinvaladt.c.html#LN135"><span class='Ref_to_Const'>WRITE_QUANTUM</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN451"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>numMsgs</span><span class='Delimiter'>; 
+</span><a name="LN452"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>max</span><span class='Delimiter'>; 
+</span><a name="LN453"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <a href="sinvaladt.c.html#LN435"><span class='Ref_to_Parameter'>n</span></a> <span class='Operator'>-= </span><a href="sinvaladt.c.html#LN450"><span class='Ref_To_Local'>nthistime</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If the buffer is full, we *must* acquire some space.  Clean the 
+         * queue and reset anyone who is preventing space from being freed. 
+         * Otherwise, clean the queue only when it's exceeded the next 
+         * fullness threshold.  We have to loop and recheck the buffer state 
+         * after any call of SICleanupQueue. 
+         */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="sinvaladt.c.html#LN451"><span class='Ref_To_Local'>numMsgs</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN173"><span class='Ref_to_Member'>maxMsgNum</span></a> <span class='Operator'>- </span><a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN172"><span class='Ref_to_Member'>minMsgNum</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN451"><span class='Ref_To_Local'>numMsgs</span></a> <span class='Operator'>+ </span><a href="sinvaladt.c.html#LN450"><span class='Ref_To_Local'>nthistime</span></a> <span class='Operator'>&GT; </span><a href="sinvaladt.c.html#LN130"><span class='Ref_to_Const'>MAXNUMMESSAGES</span></a> <span class='Operator'>|| 
+</span>                <a href="sinvaladt.c.html#LN451"><span class='Ref_To_Local'>numMsgs</span></a> <span class='Operator'>&GT;= </span><a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN174"><span class='Ref_to_Member'>nextThreshold</span></a><span class='Parentheses'>) 
+</span>                <a href="../../../include/storage/sinvaladt.h.html#LN38"><span class='Ref_to_Proto'>SICleanupQueue</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Delimiter'>, </span><a href="sinvaladt.c.html#LN450"><span class='Ref_To_Local'>nthistime</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Insert new message(s) into proper slot of circular buffer 
+         */ 
+</span>        <a href="sinvaladt.c.html#LN452"><span class='Ref_To_Local'>max</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN173"><span class='Ref_to_Member'>maxMsgNum</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN450"><span class='Ref_To_Local'>nthistime</span></a><span class='Operator'>-- &GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN183"><span class='Ref_to_Member'>buffer</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN452"><span class='Ref_To_Local'>max</span></a> <span class='Operator'>% </span><a href="sinvaladt.c.html#LN130"><span class='Ref_to_Const'>MAXNUMMESSAGES</span></a><span class='Delimiter'>] </span><span class='Operator'>= *</span><a href="sinvaladt.c.html#LN435"><span class='Ref_to_Parameter'>data</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <a href="sinvaladt.c.html#LN452"><span class='Ref_To_Local'>max</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Update current value of maxMsgNum using spinlock */ 
+</span>        <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN178"><span class='Ref_to_Member'>msgnumLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN173"><span class='Ref_to_Member'>maxMsgNum</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN452"><span class='Ref_To_Local'>max</span></a><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN178"><span class='Ref_to_Member'>msgnumLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Now that the maxMsgNum change is globally visible, we give everyone 
+         * a swift kick to make sure they read the newly added messages. 
+         * Releasing SInvalWriteLock will enforce a full memory barrier, so 
+         * these (unlocked) changes will be committed to memory before we exit 
+         * the function. 
+         */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN453"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN453"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN453"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN500"></a>            <a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>stateP</span> <span class='Operator'>= &</span><a href="sinvaladt.c.html#LN437"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN453"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+            <a href="sinvaladt.c.html#LN500"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN147"><span class='Ref_to_Member'>hasMessages</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while n&GT;0 &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end SIInsertDataEntries &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SIGetDataEntries 
+ *      get next SI message(s) for current backend, if there are any 
+ * 
+ * Possible return values: 
+ *  0:   no SI message available 
+ *  n&GT;0: next n SI messages have been extracted into data[] 
+ * -1:   SI reset message extracted 
+ * 
+ * If the return value is less than the array size "datasize", the caller 
+ * can assume that there are no more SI messages after the one(s) returned. 
+ * Otherwise, another call is needed to collect more messages. 
+ * 
+ * NB: this can run in parallel with other instances of SIGetDataEntries 
+ * executing on behalf of other backends, since each instance will modify only 
+ * fields of its own backend's ProcState, and no instance will look at fields 
+ * of other backends' ProcStates.  We express this by grabbing SInvalReadLock 
+ * in shared mode.  Note that this is not exactly the normal (read-only) 
+ * interpretation of a shared lock! Look closely at the interactions before 
+ * allowing SInvalReadLock to be grabbed in shared mode for any other reason! 
+ * 
+ * NB: this can also run in parallel with SIInsertDataEntries.  It is not 
+ * guaranteed that we will return any messages added after the routine is 
+ * entered. 
+ * 
+ * Note: we assume that "datasize" is not so large that it might be important 
+ * to break our hold on SInvalReadLock into segments. 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN538"></a><span class='Declare_Function'>SIGetDataEntries</span><span class='Parentheses'>(</span><a href="../../../include/storage/sinval.h.html#LN112"><span class='Ref_to_Typedef'>SharedInvalidationMessage</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>data</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>datasize</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN540"></a>    <a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>segP</span><span class='Delimiter'>; 
+</span><a name="LN541"></a>    <a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>stateP</span><span class='Delimiter'>; 
+</span><a name="LN542"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>max</span><span class='Delimiter'>; 
+</span><a name="LN543"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>n</span><span class='Delimiter'>; 
+</span> 
+    <a href="sinvaladt.c.html#LN540"><span class='Ref_To_Local'>segP</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a> <span class='Operator'>= &</span><a href="sinvaladt.c.html#LN540"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="../../utils/init/globals.c.html#LN72"><span class='Ref_to_Global_Var'>MyBackendId</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Before starting to take locks, do a quick, unlocked test to see whether 
+     * there can possibly be anything to read.  On a multiprocessor system, 
+     * it's possible that this load could migrate backwards and occur before 
+     * we actually enter this function, so we might miss a sinval message that 
+     * was just added by some other processor.  But they can't migrate 
+     * backwards over a preceding lock acquisition, so it should be OK.  If we 
+     * haven't acquired a lock preventing against further relevant 
+     * invalidations, any such occurrence is not much different than if the 
+     * invalidation had arrived slightly later in the first place. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN147"><span class='Ref_to_Member'>hasMessages</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SInvalReadLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We must reset hasMessages before determining how many messages we're 
+     * going to read.  That way, if new messages arrive after we have 
+     * determined how many we're reading, the flag will get reset and we'll 
+     * notice those messages part-way through. 
+     * 
+     * Note that, if we don't end up reading all of the messages, we had 
+     * better be certain to reset this flag before exiting! 
+     */ 
+</span>    <a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN147"><span class='Ref_to_Member'>hasMessages</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Fetch current value of maxMsgNum using spinlock */ 
+</span>    <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="sinvaladt.c.html#LN540"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN178"><span class='Ref_to_Member'>msgnumLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN542"><span class='Ref_To_Local'>max</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN540"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN173"><span class='Ref_to_Member'>maxMsgNum</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="sinvaladt.c.html#LN540"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN178"><span class='Ref_to_Member'>msgnumLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN145"><span class='Ref_to_Member'>resetState</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Force reset.  We can say we have dealt with any messages added 
+         * since the reset, as well; and that means we should clear the 
+         * signaled flag, too. 
+         */ 
+</span>        <a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN542"><span class='Ref_To_Local'>max</span></a><span class='Delimiter'>; 
+</span>        <a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN145"><span class='Ref_to_Member'>resetState</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN146"><span class='Ref_to_Member'>signaled</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalReadLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Retrieve messages and advance backend's counter, until data array is 
+     * full or there are no more messages. 
+     * 
+     * There may be other backends that haven't read the message(s), so we 
+     * cannot delete them here.  SICleanupQueue() will eventually remove them 
+     * from the queue. 
+     */ 
+</span>    <a href="sinvaladt.c.html#LN543"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN543"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN538"><span class='Ref_to_Parameter'>datasize</span></a> <span class='Operator'>&& </span><a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN542"><span class='Ref_To_Local'>max</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="sinvaladt.c.html#LN538"><span class='Ref_to_Parameter'>data</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN543"><span class='Ref_To_Local'>n</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="sinvaladt.c.html#LN540"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN183"><span class='Ref_to_Member'>buffer</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a> <span class='Operator'>% </span><a href="sinvaladt.c.html#LN130"><span class='Ref_to_Const'>MAXNUMMESSAGES</span></a><span class='Delimiter'>]; 
+</span>        <a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we have caught up completely, reset our "signaled" flag so that 
+     * we'll get another signal if we fall behind again. 
+     * 
+     * If we haven't caught up completely, reset the hasMessages flag so that 
+     * we see the remaining messages next time. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a> <span class='Operator'>&GT;= </span><a href="sinvaladt.c.html#LN542"><span class='Ref_To_Local'>max</span></a><span class='Parentheses'>) 
+</span>        <a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN146"><span class='Ref_to_Member'>signaled</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="sinvaladt.c.html#LN541"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN147"><span class='Ref_to_Member'>hasMessages</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalReadLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="sinvaladt.c.html#LN543"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SIGetDataEntries &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SICleanupQueue 
+ *      Remove messages that have been consumed by all active backends 
+ * 
+ * callerHasWriteLock is TRUE if caller is holding SInvalWriteLock. 
+ * minFree is the minimum number of message slots to make free. 
+ * 
+ * Possible side effects of this routine include marking one or more 
+ * backends as "reset" in the array, and sending PROCSIG_CATCHUP_INTERRUPT 
+ * to some backend that seems to be getting too far behind.  We signal at 
+ * most one backend at a time, for reasons explained at the top of the file. 
+ * 
+ * Caution: because we transiently release write lock when we have to signal 
+ * some other backend, it is NOT guaranteed that there are still minFree 
+ * free message slots at exit.  Caller must recheck and perhaps retry. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN642"></a><span class='Declare_Function'>SICleanupQueue</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>callerHasWriteLock</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>minFree</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN644"></a>    <a href="sinvaladt.c.html#LN167"><span class='Ref_to_Struct'>SISeg</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>segP</span> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN191"><span class='Ref_to_Global_Var'>shmInvalBuffer</span></a><span class='Delimiter'>; 
+</span><a name="LN645"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>min</span><span class='Delimiter'>, 
+</span><a name="LN646"></a>                <span class='Declare_Local'>minsig</span><span class='Delimiter'>, 
+</span><a name="LN647"></a>                <span class='Declare_Local'>lowbound</span><span class='Delimiter'>, 
+</span><a name="LN648"></a>                <span class='Declare_Local'>numMsgs</span><span class='Delimiter'>, 
+</span><a name="LN649"></a>                <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN650"></a>    <a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>needSig</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Lock out all writers and readers */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="sinvaladt.c.html#LN642"><span class='Ref_to_Parameter'>callerHasWriteLock</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SInvalReadLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Recompute minMsgNum = minimum of all backends' nextMsgNum, identify the 
+     * furthest-back backend that needs signaling (if any), and reset any 
+     * backends that are too far back.  Note that because we ignore sendOnly 
+     * backends here it is possible for them to keep sending messages without 
+     * a problem even when they are the only active backend. 
+     */ 
+</span>    <a href="sinvaladt.c.html#LN645"><span class='Ref_To_Local'>min</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN173"><span class='Ref_to_Member'>maxMsgNum</span></a><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN646"><span class='Ref_To_Local'>minsig</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN645"><span class='Ref_To_Local'>min</span></a> <span class='Operator'>- </span><a href="sinvaladt.c.html#LN134"><span class='Ref_to_Const'>SIG_THRESHOLD</span></a><span class='Delimiter'>; 
+</span>    <a href="sinvaladt.c.html#LN647"><span class='Ref_To_Local'>lowbound</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN645"><span class='Ref_To_Local'>min</span></a> <span class='Operator'>- </span><a href="sinvaladt.c.html#LN130"><span class='Ref_to_Const'>MAXNUMMESSAGES</span></a> <span class='Operator'>+ </span><a href="sinvaladt.c.html#LN642"><span class='Ref_to_Parameter'>minFree</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN649"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN649"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN649"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN670"></a>        <a href="sinvaladt.c.html#LN138"><span class='Ref_to_Struct'>ProcState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>stateP</span> <span class='Operator'>= &</span><a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN649"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span><a name="LN671"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>n</span> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN670"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Ignore if inactive or already in reset state */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN670"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN141"><span class='Ref_to_Member'>procPid</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="sinvaladt.c.html#LN670"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN145"><span class='Ref_to_Member'>resetState</span></a> <span class='Operator'>|| </span><a href="sinvaladt.c.html#LN670"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN155"><span class='Ref_to_Member'>sendOnly</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If we must free some space and this backend is preventing it, force 
+         * him into reset state and then ignore until he catches up. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN671"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN647"><span class='Ref_To_Local'>lowbound</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="sinvaladt.c.html#LN670"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN145"><span class='Ref_to_Member'>resetState</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* no point in signaling him ... */ 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Track the global minimum nextMsgNum */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN671"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN645"><span class='Ref_To_Local'>min</span></a><span class='Parentheses'>) 
+</span>            <a href="sinvaladt.c.html#LN645"><span class='Ref_To_Local'>min</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN671"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Also see who's furthest back of the unsignaled backends */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN671"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN646"><span class='Ref_To_Local'>minsig</span></a> <span class='Operator'>&& !</span><a href="sinvaladt.c.html#LN670"><span class='Ref_To_Local'>stateP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN146"><span class='Ref_to_Member'>signaled</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="sinvaladt.c.html#LN646"><span class='Ref_To_Local'>minsig</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN671"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>; 
+</span>            <a href="sinvaladt.c.html#LN650"><span class='Ref_To_Local'>needSig</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN670"><span class='Ref_To_Local'>stateP</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;segP-&GT;lastBacke... &raquo; </span> 
+    <a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN172"><span class='Ref_to_Member'>minMsgNum</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN645"><span class='Ref_To_Local'>min</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * When minMsgNum gets really large, decrement all message counters so as 
+     * to forestall overflow of the counters.  This happens seldom enough that 
+     * folding it into the previous loop would be a loser. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN645"><span class='Ref_To_Local'>min</span></a> <span class='Operator'>&GT;= </span><a href="sinvaladt.c.html#LN131"><span class='Ref_to_Const'>MSGNUMWRAPAROUND</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN172"><span class='Ref_to_Member'>minMsgNum</span></a> <span class='Operator'>-= </span><a href="sinvaladt.c.html#LN131"><span class='Ref_to_Const'>MSGNUMWRAPAROUND</span></a><span class='Delimiter'>; 
+</span>        <a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN173"><span class='Ref_to_Member'>maxMsgNum</span></a> <span class='Operator'>-= </span><a href="sinvaladt.c.html#LN131"><span class='Ref_to_Const'>MSGNUMWRAPAROUND</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN649"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN649"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN175"><span class='Ref_to_Member'>lastBackend</span></a><span class='Delimiter'>; </span><a href="sinvaladt.c.html#LN649"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* we don't bother skipping inactive entries here */ 
+</span>            <a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><a href="sinvaladt.c.html#LN649"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="sinvaladt.c.html#LN144"><span class='Ref_to_Member'>nextMsgNum</span></a> <span class='Operator'>-= </span><a href="sinvaladt.c.html#LN131"><span class='Ref_to_Const'>MSGNUMWRAPAROUND</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Determine how many messages are still in the queue, and set the 
+     * threshold at which we should repeat SICleanupQueue(). 
+     */ 
+</span>    <a href="sinvaladt.c.html#LN648"><span class='Ref_To_Local'>numMsgs</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN173"><span class='Ref_to_Member'>maxMsgNum</span></a> <span class='Operator'>- </span><a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN172"><span class='Ref_to_Member'>minMsgNum</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN648"><span class='Ref_To_Local'>numMsgs</span></a> <span class='Operator'>&LT; </span><a href="sinvaladt.c.html#LN132"><span class='Ref_to_Const'>CLEANUP_MIN</span></a><span class='Parentheses'>) 
+</span>        <a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN174"><span class='Ref_to_Member'>nextThreshold</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN132"><span class='Ref_to_Const'>CLEANUP_MIN</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN174"><span class='Ref_to_Member'>nextThreshold</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN648"><span class='Ref_To_Local'>numMsgs</span></a> <span class='Operator'>/ </span><a href="sinvaladt.c.html#LN133"><span class='Ref_to_Const'>CLEANUP_QUANTUM</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="sinvaladt.c.html#LN133"><span class='Ref_to_Const'>CLEANUP_QUANTUM</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Lastly, signal anyone who needs a catchup interrupt.  Since 
+     * SendProcSignal() might not be fast, we don't want to hold locks while 
+     * executing it. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN650"><span class='Ref_To_Local'>needSig</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN734"></a>        <a href="../../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Local'>his_pid</span> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN650"><span class='Ref_To_Local'>needSig</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN141"><span class='Ref_to_Member'>procPid</span></a><span class='Delimiter'>; 
+</span><a name="LN735"></a>        <a href="../../../include/storage/backendid.h.html#LN20"><span class='Ref_to_Typedef'>BackendId</span></a>   <span class='Declare_Local'>his_backendId</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN650"><span class='Ref_To_Local'>needSig</span></a> <span class='Operator'>- &</span><a href="sinvaladt.c.html#LN644"><span class='Ref_To_Local'>segP</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN188"><span class='Ref_to_Member'>procState</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+        <a href="sinvaladt.c.html#LN650"><span class='Ref_To_Local'>needSig</span></a><span class='Operator'>-&GT;</span><a href="sinvaladt.c.html#LN146"><span class='Ref_to_Member'>signaled</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalReadLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN21"><span class='Ref_to_Const'>DEBUG4</span></a><span class='Delimiter'>, </span><span class='String'>"sending sinval catchup signal to PID %d"</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="sinvaladt.c.html#LN734"><span class='Ref_To_Local'>his_pid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/procsignal.h.html#LN55"><span class='Ref_to_Proto'>SendProcSignal</span></a><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN734"><span class='Ref_To_Local'>his_pid</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/procsignal.h.html#LN31"><span class='Ref_to_EnumConst'>PROCSIG_CATCHUP_INTERRUPT</span></a><span class='Delimiter'>, </span><a href="sinvaladt.c.html#LN735"><span class='Ref_To_Local'>his_backendId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN642"><span class='Ref_to_Parameter'>callerHasWriteLock</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalReadLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="sinvaladt.c.html#LN642"><span class='Ref_to_Parameter'>callerHasWriteLock</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SInvalWriteLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end SICleanupQueue &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * GetNextLocalTransactionId --- allocate a new LocalTransactionId 
+ * 
+ * We split VirtualTransactionIds into two parts so that it is possible 
+ * to allocate a new one without any contention for shared memory, except 
+ * for a bit of additional overhead during backend startup/shutdown. 
+ * The high-order part of a VirtualTransactionId is a BackendId, and the 
+ * low-order part is a LocalTransactionId, which we assign from a local 
+ * counter.  To avoid the risk of a VirtualTransactionId being reused 
+ * within a short interval, successive procs occupying the same backend ID 
+ * slot should use a consecutive sequence of local IDs, which is implemented 
+ * by copying nextLocalTransactionId as seen above. 
+ */ 
+</span><a href="../../../include/c.h.html#LN398"><span class='Ref_to_Typedef'>LocalTransactionId</span></a> 
+<a name="LN768"></a><span class='Declare_Function'>GetNextLocalTransactionId</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN770"></a>    <a href="../../../include/c.h.html#LN398"><span class='Ref_to_Typedef'>LocalTransactionId</span></a> <span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* loop to avoid returning InvalidLocalTransactionId at wraparound */ 
+</span>    <span class='Control'>do</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="sinvaladt.c.html#LN770"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="sinvaladt.c.html#LN194"><span class='Ref_to_Global_Var'>nextLocalTransactionId</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} </span><span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/lock.h.html#LN70"><span class='Ref_to_Macro'>LocalTransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="sinvaladt.c.html#LN770"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="sinvaladt.c.html#LN770"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

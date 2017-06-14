@@ -1,0 +1,986 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\spgist\spgvacuum.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\spgist\spgvacuum.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:30 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * spgvacuum.c 
+ *    vacuum for SP-GiST 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * IDENTIFICATION 
+ *          src/backend/access/spgist/spgvacuum.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/genam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/spgist_private.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/spgxlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/transam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xloginsert.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/storage_xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"commands/vacuum.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/bufmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/indexfsm.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/snapmgr.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* Entry in pending-list of TIDs we need to revisit */ 
+</span><a name="LN32"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>spgVacPendingItem</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN34"></a>    <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Declare_Member'>tid</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* redirection target to visit */ 
+</span><a name="LN35"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>done</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* have we dealt with this? */ 
+</span><a name="LN36"></a>    <span class='Control'>struct</span> <a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a> <span class='Operator'>*</span><span class='Declare_Member'>next</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* list link */ 
+</span><a name="LN37"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>spgVacPendingItem</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Local state for vacuum operations */ 
+</span><a name="LN40"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>spgBulkDeleteState</span> 
+<span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Parameters passed in to spgvacuumscan */ 
+</span><a name="LN43"></a>    <a href="../../../include/access/genam.h.html#LN43"><span class='Ref_to_Struct'>IndexVacuumInfo</span></a> <span class='Operator'>*</span><span class='Declare_Member'>info</span><span class='Delimiter'>; 
+</span><a name="LN44"></a>    <a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>*</span><span class='Declare_Member'>stats</span><span class='Delimiter'>; 
+</span><a name="LN45"></a>    <a href="../../../include/access/genam.h.html#LN82"><span class='Ref_to_Typedef'>IndexBulkDeleteCallback</span></a> <span class='Declare_Member'>callback</span><span class='Delimiter'>; 
+</span><a name="LN46"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Member'>callback_state</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Additional working state */ 
+</span><a name="LN49"></a>    <a href="../../../include/access/spgist_private.h.html#LN117"><span class='Ref_to_Struct'>SpGistState</span></a> <span class='Declare_Member'>spgstate</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* for SPGiST operations that need one */ 
+</span><a name="LN50"></a>    <a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a> <span class='Operator'>*</span><span class='Declare_Member'>pendingList</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* TIDs we need to (re)visit */ 
+</span><a name="LN51"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Member'>myXmin</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* for detecting newly-added redirects */ 
+</span><a name="LN52"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Member'>lastFilledBlock</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* last non-deletable block */ 
+</span><a name="LN53"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>spgBulkDeleteState</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Add TID to pendingList, but only if not already present. 
+ * 
+ * Note that new items are always appended at the end of the list; this 
+ * ensures that scans of the list don't miss items added during the scan. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN63"></a><span class='Declare_Function'>spgAddPendingTID</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN40"><span class='Ref_to_Struct'>spgBulkDeleteState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>bds</span><span class='Delimiter'>, </span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>tid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN65"></a>    <a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pitem</span><span class='Delimiter'>; 
+</span><a name="LN66"></a>    <a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a> <span class='Operator'>**</span><span class='Declare_Local'>listLink</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* search the list for pre-existing entry */ 
+</span>    <a href="spgvacuum.c.html#LN66"><span class='Ref_To_Local'>listLink</span></a> <span class='Operator'>= &</span><a href="spgvacuum.c.html#LN63"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN50"><span class='Ref_to_Member'>pendingList</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="spgvacuum.c.html#LN66"><span class='Ref_To_Local'>listLink</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="spgvacuum.c.html#LN65"><span class='Ref_To_Local'>pitem</span></a> <span class='Operator'>= *</span><a href="spgvacuum.c.html#LN66"><span class='Ref_To_Local'>listLink</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../storage/page/itemptr.c.html#LN27"><span class='Ref_to_Func'>ItemPointerEquals</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN63"><span class='Ref_to_Parameter'>tid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN65"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN34"><span class='Ref_to_Member'>tid</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>return</span><span class='Delimiter'>;</span>             <span class='Comment_Single_Line'>/* already in list, do nothing */ 
+</span>        <a href="spgvacuum.c.html#LN66"><span class='Ref_To_Local'>listLink</span></a> <span class='Operator'>= &</span><a href="spgvacuum.c.html#LN65"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN36"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Comment_Multi_Line'>/* not there, so append new entry */ 
+</span>    <a href="spgvacuum.c.html#LN65"><span class='Ref_To_Local'>pitem</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN65"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN34"><span class='Ref_to_Member'>tid</span></a> <span class='Operator'>= *</span><a href="spgvacuum.c.html#LN63"><span class='Ref_to_Parameter'>tid</span></a><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN65"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN35"><span class='Ref_to_Member'>done</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN65"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN36"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="spgvacuum.c.html#LN66"><span class='Ref_To_Local'>listLink</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN65"><span class='Ref_To_Local'>pitem</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end spgAddPendingTID &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Clear pendingList 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN89"></a><span class='Declare_Function'>spgClearPendingList</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN40"><span class='Ref_to_Struct'>spgBulkDeleteState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>bds</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN91"></a>    <a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pitem</span><span class='Delimiter'>; 
+</span><a name="LN92"></a>    <a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a> <span class='Operator'>*</span><span class='Declare_Local'>nitem</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN91"><span class='Ref_To_Local'>pitem</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN89"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN50"><span class='Ref_to_Member'>pendingList</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN91"><span class='Ref_To_Local'>pitem</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN91"><span class='Ref_To_Local'>pitem</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN92"><span class='Ref_To_Local'>nitem</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="spgvacuum.c.html#LN92"><span class='Ref_To_Local'>nitem</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN91"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN36"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* All items in list should have been dealt with */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN91"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN35"><span class='Ref_to_Member'>done</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN91"><span class='Ref_To_Local'>pitem</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="spgvacuum.c.html#LN89"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN50"><span class='Ref_to_Member'>pendingList</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Vacuum a regular (non-root) leaf page 
+ * 
+ * We must delete tuples that are targeted for deletion by the VACUUM, 
+ * but not move any tuples that are referenced by outside links; we assume 
+ * those are the ones that are heads of chains. 
+ * 
+ * If we find a REDIRECT that was made by a concurrently-running transaction, 
+ * we must add its target TID to pendingList.  (We don't try to visit the 
+ * target immediately, first because we don't want VACUUM locking more than 
+ * one buffer at a time, and second because the duplicate-filtering logic 
+ * in spgAddPendingTID is useful to ensure we can't get caught in an infinite 
+ * loop in the face of continuous concurrent insertions.) 
+ * 
+ * If forPending is true, we are examining the page as a consequence of 
+ * chasing a redirect link, not as part of the normal sequential scan. 
+ * We still vacuum the page normally, but we don't increment the stats 
+ * about live tuples; else we'd double-count those tuples, since the page 
+ * has been or will be visited in the sequential scan as well. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN125"></a><span class='Declare_Function'>vacuumLeafPage</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN40"><span class='Ref_to_Struct'>spgBulkDeleteState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>bds</span><span class='Delimiter'>, </span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>index</span><span class='Delimiter'>, </span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Parameter'>buffer</span><span class='Delimiter'>, 
+</span><a name="LN126"></a>               <span class='Keyword'>bool </span><span class='Declare_Parameter'>forPending</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN128"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN129"></a>    <a href="../../../include/access/spgxlog.h.html#LN200"><span class='Ref_to_Struct'>spgxlogVacuumLeaf</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span><a name="LN130"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>toDead</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a><span class='Delimiter'>]; 
+</span><a name="LN131"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>toPlaceholder</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a><span class='Delimiter'>]; 
+</span><a name="LN132"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>moveSrc</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a><span class='Delimiter'>]; 
+</span><a name="LN133"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>moveDest</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a><span class='Delimiter'>]; 
+</span><a name="LN134"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>chainSrc</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a><span class='Delimiter'>]; 
+</span><a name="LN135"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>chainDest</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a><span class='Delimiter'>]; 
+</span><a name="LN136"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>predecessor</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span><a name="LN137"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>deletable</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span><a name="LN138"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nDeletable</span><span class='Delimiter'>; 
+</span><a name="LN139"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>i</span><span class='Delimiter'>, 
+</span><a name="LN140"></a>                <span class='Declare_Local'>max</span> <span class='Operator'>= </span><a href="../../../include/storage/bufpage.h.html#LN353"><span class='Ref_to_Macro'>PageGetMaxOffsetNumber</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    memset<span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN136"><span class='Ref_To_Local'>predecessor</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN136"><span class='Ref_To_Local'>predecessor</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    memset<span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN137"><span class='Ref_To_Local'>deletable</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN137"><span class='Ref_To_Local'>deletable</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN138"><span class='Ref_To_Local'>nDeletable</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Scan page, identify tuples to delete, accumulate stats */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN26"><span class='Ref_to_Const'>FirstOffsetNumber</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="spgvacuum.c.html#LN140"><span class='Ref_To_Local'>max</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN149"></a>        <a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a> <span class='Declare_Local'>lt</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN336"><span class='Ref_to_Macro'>PageGetItem</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, 
+</span>                                           <a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN291"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>== </span><a href="../../../include/access/spgist_private.h.html#LN196"><span class='Ref_to_Const'>SPGIST_LIVE</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN294"><span class='Ref_to_Member'>heapPtr</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN45"><span class='Ref_to_Member'>callback</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN294"><span class='Ref_to_Member'>heapPtr</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN46"><span class='Ref_to_Member'>callback_state</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN76"><span class='Ref_to_Member'>tuples_removed</span></a> <span class='Operator'>+= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN137"><span class='Ref_To_Local'>deletable</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN138"><span class='Ref_To_Local'>nDeletable</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="spgvacuum.c.html#LN126"><span class='Ref_to_Parameter'>forPending</span></a><span class='Parentheses'>) 
+</span>                    <a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN75"><span class='Ref_to_Member'>num_index_tuples</span></a> <span class='Operator'>+= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* Form predecessor map, too */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN293"><span class='Ref_to_Member'>nextOffset</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* paranoia about corrupted chain links */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN293"><span class='Ref_to_Member'>nextOffset</span></a> <span class='Operator'>&LT; </span><a href="../../../include/storage/off.h.html#LN26"><span class='Ref_to_Const'>FirstOffsetNumber</span></a> <span class='Operator'>|| 
+</span>                    <a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN293"><span class='Ref_to_Member'>nextOffset</span></a> <span class='Operator'>&GT; </span><a href="spgvacuum.c.html#LN140"><span class='Ref_To_Local'>max</span></a> <span class='Operator'>|| 
+</span>                    <a href="spgvacuum.c.html#LN136"><span class='Ref_To_Local'>predecessor</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN293"><span class='Ref_to_Member'>nextOffset</span></a><span class='Delimiter'>] </span><span class='Operator'>!= </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>) 
+</span>                    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"inconsistent tuple chain links in page %u of index \"%s\""</span><span class='Delimiter'>, 
+</span>                         <a href="../../../include/storage/bufmgr.h.html#LN187"><span class='Ref_to_Proto'>BufferGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                         <a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>index</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN136"><span class='Ref_To_Local'>predecessor</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN293"><span class='Ref_to_Member'>nextOffset</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if lt-&GT;tupstate==SPGIST_... &raquo; </span> 
+        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN291"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>== </span><a href="../../../include/access/spgist_private.h.html#LN197"><span class='Ref_to_Const'>SPGIST_REDIRECT</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN184"></a>            <a href="../../../include/access/spgist_private.h.html#LN326"><span class='Ref_to_Typedef'>SpGistDeadTuple</span></a> <span class='Declare_Local'>dt</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN326"><span class='Ref_to_Typedef'>SpGistDeadTuple</span></a><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN184"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN321"><span class='Ref_to_Member'>nextOffset</span></a> <span class='Operator'>== </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN184"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN322"><span class='Ref_to_Member'>pointer</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Add target TID to pending list if the redirection could have 
+             * happened since VACUUM started. 
+             * 
+             * Note: we could make a tighter test by seeing if the xid is 
+             * "running" according to the active snapshot; but tqual.c doesn't 
+             * currently export a suitable API, and it's not entirely clear 
+             * that a tighter test is worth the cycles anyway. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN171"><span class='Ref_to_Proto'>TransactionIdFollowsOrEquals</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN184"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN323"><span class='Ref_to_Member'>xid</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN51"><span class='Ref_to_Member'>myXmin</span></a><span class='Parentheses'>))</span> 
+                <a href="spgvacuum.c.html#LN62"><span class='Ref_to_Func'>spgAddPendingTID</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN184"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN322"><span class='Ref_to_Member'>pointer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN149"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN293"><span class='Ref_to_Member'>nextOffset</span></a> <span class='Operator'>== </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=FirstOffsetNumber;i... &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN138"><span class='Ref_To_Local'>nDeletable</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>;</span>                 <span class='Comment_Single_Line'>/* nothing more to do */ 
+</span> 
+    <span class='Comment_Multi_Line'>/*---------- 
+     * Figure out exactly what we have to do.  We do this separately from 
+     * actually modifying the page, mainly so that we have a representation 
+     * that can be dumped into WAL and then the replay code can do exactly 
+     * the same thing.  The output of this step consists of six arrays 
+     * describing four kinds of operations, to be performed in this order: 
+     * 
+     * toDead[]: tuple numbers to be replaced with DEAD tuples 
+     * toPlaceholder[]: tuple numbers to be replaced with PLACEHOLDER tuples 
+     * moveSrc[]: tuple numbers that need to be relocated to another offset 
+     * (replacing the tuple there) and then replaced with PLACEHOLDER tuples 
+     * moveDest[]: new locations for moveSrc tuples 
+     * chainSrc[]: tuple numbers whose chain links (nextOffset) need updates 
+     * chainDest[]: new values of nextOffset for chainSrc members 
+     * 
+     * It's easiest to figure out what we have to do by processing tuple 
+     * chains, so we iterate over all the tuples (not just the deletable 
+     * ones!) to identify chain heads, then chase down each chain and make 
+     * work item entries for deletable tuples within the chain. 
+     *---------- 
+     */ 
+</span>    <a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN202"><span class='Ref_to_Member'>nDead</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN203"><span class='Ref_to_Member'>nPlaceholder</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN204"><span class='Ref_to_Member'>nMove</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN26"><span class='Ref_to_Const'>FirstOffsetNumber</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="spgvacuum.c.html#LN140"><span class='Ref_To_Local'>max</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN235"></a>        <a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a> <span class='Declare_Local'>head</span><span class='Delimiter'>; 
+</span><a name="LN236"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>interveningDeletable</span><span class='Delimiter'>; 
+</span><a name="LN237"></a>        <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>prevLive</span><span class='Delimiter'>; 
+</span><a name="LN238"></a>        <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>j</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN235"><span class='Ref_To_Local'>head</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN336"><span class='Ref_to_Macro'>PageGetItem</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, 
+</span>                                             <a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN235"><span class='Ref_To_Local'>head</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN291"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>!= </span><a href="../../../include/access/spgist_private.h.html#LN196"><span class='Ref_to_Const'>SPGIST_LIVE</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* can't be a chain member */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN136"><span class='Ref_To_Local'>predecessor</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* not a chain head */ 
+</span> 
+        <span class='Comment_Multi_Line'>/* initialize ... */ 
+</span>        <a href="spgvacuum.c.html#LN236"><span class='Ref_To_Local'>interveningDeletable</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN237"><span class='Ref_To_Local'>prevLive</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN137"><span class='Ref_To_Local'>deletable</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>? </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a> <span class='Operator'>: </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* scan down the chain ... */ 
+</span>        <a href="spgvacuum.c.html#LN238"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN235"><span class='Ref_To_Local'>head</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN293"><span class='Ref_to_Member'>nextOffset</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN238"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN255"></a>            <a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a> <span class='Declare_Local'>lt</span><span class='Delimiter'>; 
+</span> 
+            <a href="spgvacuum.c.html#LN255"><span class='Ref_To_Local'>lt</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN336"><span class='Ref_to_Macro'>PageGetItem</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, 
+</span>                                               <a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN238"><span class='Ref_To_Local'>j</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN255"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN291"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>!= </span><a href="../../../include/access/spgist_private.h.html#LN196"><span class='Ref_to_Const'>SPGIST_LIVE</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* all tuples in chain should be live */ 
+</span>                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unexpected SPGiST tuple state: %d"</span><span class='Delimiter'>, 
+</span>                     <a href="spgvacuum.c.html#LN255"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN291"><span class='Ref_to_Member'>tupstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN137"><span class='Ref_To_Local'>deletable</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN238"><span class='Ref_To_Local'>j</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* This tuple should be replaced by a placeholder */ 
+</span>                <a href="spgvacuum.c.html#LN131"><span class='Ref_To_Local'>toPlaceholder</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN203"><span class='Ref_to_Member'>nPlaceholder</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN238"><span class='Ref_To_Local'>j</span></a><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN203"><span class='Ref_to_Member'>nPlaceholder</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                <span class='Comment_Multi_Line'>/* previous live tuple's chain link will need an update */ 
+</span>                <a href="spgvacuum.c.html#LN236"><span class='Ref_To_Local'>interveningDeletable</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN237"><span class='Ref_To_Local'>prevLive</span></a> <span class='Operator'>== </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * This is the first live tuple in the chain.  It has to move 
+                 * to the head position. 
+                 */ 
+</span>                <a href="spgvacuum.c.html#LN132"><span class='Ref_To_Local'>moveSrc</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN204"><span class='Ref_to_Member'>nMove</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN238"><span class='Ref_To_Local'>j</span></a><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN133"><span class='Ref_To_Local'>moveDest</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN204"><span class='Ref_to_Member'>nMove</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN204"><span class='Ref_to_Member'>nMove</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                <span class='Comment_Multi_Line'>/* Chain updates will be applied after the move */ 
+</span>                <a href="spgvacuum.c.html#LN237"><span class='Ref_To_Local'>prevLive</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN236"><span class='Ref_To_Local'>interveningDeletable</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * Second or later live tuple.  Arrange to re-chain it to the 
+                 * previous live one, if there was a gap. 
+                 */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN236"><span class='Ref_To_Local'>interveningDeletable</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="spgvacuum.c.html#LN134"><span class='Ref_To_Local'>chainSrc</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN237"><span class='Ref_To_Local'>prevLive</span></a><span class='Delimiter'>; 
+</span>                    <a href="spgvacuum.c.html#LN135"><span class='Ref_To_Local'>chainDest</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN238"><span class='Ref_To_Local'>j</span></a><span class='Delimiter'>; 
+</span>                    <a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>                <a href="spgvacuum.c.html#LN237"><span class='Ref_To_Local'>prevLive</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN238"><span class='Ref_To_Local'>j</span></a><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN236"><span class='Ref_To_Local'>interveningDeletable</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <a href="spgvacuum.c.html#LN238"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN255"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN293"><span class='Ref_to_Member'>nextOffset</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while j!=InvalidOffsetNumbe... &raquo; </span> 
+ 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN237"><span class='Ref_To_Local'>prevLive</span></a> <span class='Operator'>== </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* The chain is entirely removable, so we need a DEAD tuple */ 
+</span>            <a href="spgvacuum.c.html#LN130"><span class='Ref_To_Local'>toDead</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN202"><span class='Ref_to_Member'>nDead</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN202"><span class='Ref_to_Member'>nDead</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN236"><span class='Ref_To_Local'>interveningDeletable</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* One or more deletions at end of chain, so close it off */ 
+</span>            <a href="spgvacuum.c.html#LN134"><span class='Ref_To_Local'>chainSrc</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN237"><span class='Ref_To_Local'>prevLive</span></a><span class='Delimiter'>; 
+</span>            <a href="spgvacuum.c.html#LN135"><span class='Ref_To_Local'>chainDest</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Delimiter'>; 
+</span>            <a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=FirstOffsetNumber;i... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* sanity check ... */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN138"><span class='Ref_To_Local'>nDeletable</span></a> <span class='Operator'>!= </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN202"><span class='Ref_to_Member'>nDead</span></a> <span class='Operator'>+ </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN203"><span class='Ref_to_Member'>nPlaceholder</span></a> <span class='Operator'>+ </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN204"><span class='Ref_to_Member'>nMove</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"inconsistent counts of deletable tuples"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Do the updates */ 
+</span>    <a href="../../../include/miscadmin.h.html#LN132"><span class='Ref_to_Macro'>START_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="spgdoinsert.c.html#LN129"><span class='Ref_to_Func'>spgPageIndexMultiDelete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN49"><span class='Ref_to_Member'>spgstate</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, 
+</span>                            <a href="spgvacuum.c.html#LN130"><span class='Ref_To_Local'>toDead</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN202"><span class='Ref_to_Member'>nDead</span></a><span class='Delimiter'>, 
+</span>                            <a href="../../../include/access/spgist_private.h.html#LN198"><span class='Ref_to_Const'>SPGIST_DEAD</span></a><span class='Delimiter'>, </span><a href="../../../include/access/spgist_private.h.html#LN198"><span class='Ref_to_Const'>SPGIST_DEAD</span></a><span class='Delimiter'>, 
+</span>                            <a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="spgdoinsert.c.html#LN129"><span class='Ref_to_Func'>spgPageIndexMultiDelete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN49"><span class='Ref_to_Member'>spgstate</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, 
+</span>                            <a href="spgvacuum.c.html#LN131"><span class='Ref_To_Local'>toPlaceholder</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN203"><span class='Ref_to_Member'>nPlaceholder</span></a><span class='Delimiter'>, 
+</span>                            <a href="../../../include/access/spgist_private.h.html#LN199"><span class='Ref_to_Const'>SPGIST_PLACEHOLDER</span></a><span class='Delimiter'>, </span><a href="../../../include/access/spgist_private.h.html#LN199"><span class='Ref_to_Const'>SPGIST_PLACEHOLDER</span></a><span class='Delimiter'>, 
+</span>                            <a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We implement the move step by swapping the item pointers of the source 
+     * and target tuples, then replacing the newly-source tuples with 
+     * placeholders.  This is perhaps unduly friendly with the page data 
+     * representation, but it's fast and doesn't risk page overflow when a 
+     * tuple to be relocated is large. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN204"><span class='Ref_to_Member'>nMove</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN347"></a>        <a href="../../../include/storage/itemid.h.html#LN30"><span class='Ref_to_Typedef'>ItemId</span></a>      <span class='Declare_Local'>idSrc</span> <span class='Operator'>= </span><a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN132"><span class='Ref_To_Local'>moveSrc</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN348"></a>        <a href="../../../include/storage/itemid.h.html#LN30"><span class='Ref_to_Typedef'>ItemId</span></a>      <span class='Declare_Local'>idDest</span> <span class='Operator'>= </span><a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN133"><span class='Ref_To_Local'>moveDest</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN349"></a>        <a href="../../../include/storage/itemid.h.html#LN23"><span class='Ref_to_Struct'>ItemIdData</span></a>  <span class='Declare_Local'>tmp</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN349"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= *</span><a href="spgvacuum.c.html#LN347"><span class='Ref_To_Local'>idSrc</span></a><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="spgvacuum.c.html#LN347"><span class='Ref_To_Local'>idSrc</span></a> <span class='Operator'>= *</span><a href="spgvacuum.c.html#LN348"><span class='Ref_To_Local'>idDest</span></a><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="spgvacuum.c.html#LN348"><span class='Ref_To_Local'>idDest</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN349"><span class='Ref_To_Local'>tmp</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="spgdoinsert.c.html#LN129"><span class='Ref_to_Func'>spgPageIndexMultiDelete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN49"><span class='Ref_to_Member'>spgstate</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, 
+</span>                            <a href="spgvacuum.c.html#LN132"><span class='Ref_To_Local'>moveSrc</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN204"><span class='Ref_to_Member'>nMove</span></a><span class='Delimiter'>, 
+</span>                            <a href="../../../include/access/spgist_private.h.html#LN199"><span class='Ref_to_Const'>SPGIST_PLACEHOLDER</span></a><span class='Delimiter'>, </span><a href="../../../include/access/spgist_private.h.html#LN199"><span class='Ref_to_Const'>SPGIST_PLACEHOLDER</span></a><span class='Delimiter'>, 
+</span>                            <a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN363"></a>        <a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a> <span class='Declare_Local'>lt</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN363"><span class='Ref_To_Local'>lt</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN336"><span class='Ref_to_Macro'>PageGetItem</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, 
+</span>                                           <a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN134"><span class='Ref_To_Local'>chainSrc</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN363"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN291"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>== </span><a href="../../../include/access/spgist_private.h.html#LN196"><span class='Ref_to_Const'>SPGIST_LIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN363"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN293"><span class='Ref_to_Member'>nextOffset</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN135"><span class='Ref_To_Local'>chainDest</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN176"><span class='Ref_to_Proto'>MarkBufferDirty</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN505"><span class='Ref_to_Macro'>RelationNeedsWAL</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>index</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN375"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/spgist_private.h.html#LN356"><span class='Ref_to_Macro'>STORE_STATE</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN49"><span class='Ref_to_Member'>spgstate</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN207"><span class='Ref_to_Member'>stateSrc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Delimiter'>, </span><a href="../../../include/access/spgxlog.h.html#LN222"><span class='Ref_to_Const'>SizeOfSpgxlogVacuumLeaf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* sizeof(xlrec) should be a multiple of sizeof(OffsetNumber) */ 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN130"><span class='Ref_To_Local'>toDead</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN202"><span class='Ref_to_Member'>nDead</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN131"><span class='Ref_To_Local'>toPlaceholder</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN203"><span class='Ref_to_Member'>nPlaceholder</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN132"><span class='Ref_To_Local'>moveSrc</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN204"><span class='Ref_to_Member'>nMove</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN133"><span class='Ref_To_Local'>moveDest</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN204"><span class='Ref_to_Member'>nMove</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN134"><span class='Ref_To_Local'>chainSrc</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN135"><span class='Ref_To_Local'>chainDest</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="spgvacuum.c.html#LN129"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN205"><span class='Ref_to_Member'>nChain</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN46"><span class='Ref_to_Proto'>XLogRegisterBuffer</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN125"><span class='Ref_to_Parameter'>buffer</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xloginsert.h.html#LN34"><span class='Ref_to_Const'>REGBUF_STANDARD</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN375"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_SPGIST_ID<span class='Delimiter'>, </span><a href="../../../include/access/spgxlog.h.html#LN26"><span class='Ref_to_Const'>XLOG_SPGIST_VACUUM_LEAF</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/bufpage.h.html#LN364"><span class='Ref_to_Macro'>PageSetLSN</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN128"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN375"><span class='Ref_To_Local'>recptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if RelationNeedsWAL(inde... &raquo; </span> 
+ 
+    <a href="../../../include/miscadmin.h.html#LN134"><span class='Ref_to_Macro'>END_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end vacuumLeafPage &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Vacuum a root page when it is also a leaf 
+ * 
+ * On the root, we just delete any dead leaf tuples; no fancy business 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN406"></a><span class='Declare_Function'>vacuumLeafRoot</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN40"><span class='Ref_to_Struct'>spgBulkDeleteState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>bds</span><span class='Delimiter'>, </span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>index</span><span class='Delimiter'>, </span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Parameter'>buffer</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN408"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN406"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN409"></a>    <a href="../../../include/access/spgxlog.h.html#LN224"><span class='Ref_to_Struct'>spgxlogVacuumRoot</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span><a name="LN410"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>toDelete</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a><span class='Delimiter'>]; 
+</span><a name="LN411"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>i</span><span class='Delimiter'>, 
+</span><a name="LN412"></a>                <span class='Declare_Local'>max</span> <span class='Operator'>= </span><a href="../../../include/storage/bufpage.h.html#LN353"><span class='Ref_to_Macro'>PageGetMaxOffsetNumber</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN408"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="spgvacuum.c.html#LN409"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN227"><span class='Ref_to_Member'>nDelete</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Scan page, identify tuples to delete, accumulate stats */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN411"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN26"><span class='Ref_to_Const'>FirstOffsetNumber</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN411"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="spgvacuum.c.html#LN412"><span class='Ref_To_Local'>max</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN411"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN419"></a>        <a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a> <span class='Declare_Local'>lt</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN419"><span class='Ref_To_Local'>lt</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN298"><span class='Ref_to_Typedef'>SpGistLeafTuple</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN336"><span class='Ref_to_Macro'>PageGetItem</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN408"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, 
+</span>                                           <a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN408"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN411"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN419"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN291"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>== </span><a href="../../../include/access/spgist_private.h.html#LN196"><span class='Ref_to_Const'>SPGIST_LIVE</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN419"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN294"><span class='Ref_to_Member'>heapPtr</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN406"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN45"><span class='Ref_to_Member'>callback</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN419"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN294"><span class='Ref_to_Member'>heapPtr</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN406"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN46"><span class='Ref_to_Member'>callback_state</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="spgvacuum.c.html#LN406"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN76"><span class='Ref_to_Member'>tuples_removed</span></a> <span class='Operator'>+= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN410"><span class='Ref_To_Local'>toDelete</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN409"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN227"><span class='Ref_to_Member'>nDelete</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN411"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>                <a href="spgvacuum.c.html#LN409"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN227"><span class='Ref_to_Member'>nDelete</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="spgvacuum.c.html#LN406"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN75"><span class='Ref_to_Member'>num_index_tuples</span></a> <span class='Operator'>+= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* all tuples on root should be live */ 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unexpected SPGiST tuple state: %d"</span><span class='Delimiter'>, 
+</span>                 <a href="spgvacuum.c.html#LN419"><span class='Ref_To_Local'>lt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN291"><span class='Ref_to_Member'>tupstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=FirstOffsetNumber;i... &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN409"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN227"><span class='Ref_to_Member'>nDelete</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>;</span>                 <span class='Comment_Single_Line'>/* nothing more to do */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* Do the update */ 
+</span>    <a href="../../../include/miscadmin.h.html#LN132"><span class='Ref_to_Macro'>START_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* The tuple numbers are in order, so we can use PageIndexMultiDelete */ 
+</span>    <a href="../../../include/storage/bufpage.h.html#LN431"><span class='Ref_to_Proto'>PageIndexMultiDelete</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN408"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN410"><span class='Ref_To_Local'>toDelete</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN409"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN227"><span class='Ref_to_Member'>nDelete</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN176"><span class='Ref_to_Proto'>MarkBufferDirty</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN406"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN505"><span class='Ref_to_Macro'>RelationNeedsWAL</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN406"><span class='Ref_to_Parameter'>index</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN459"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Prepare WAL record */ 
+</span>        <a href="../../../include/access/spgist_private.h.html#LN356"><span class='Ref_to_Macro'>STORE_STATE</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN406"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN49"><span class='Ref_to_Member'>spgstate</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN409"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN229"><span class='Ref_to_Member'>stateSrc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN409"><span class='Ref_To_Local'>xlrec</span></a><span class='Delimiter'>, </span><a href="../../../include/access/spgxlog.h.html#LN235"><span class='Ref_to_Const'>SizeOfSpgxlogVacuumRoot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* sizeof(xlrec) should be a multiple of sizeof(OffsetNumber) */ 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN410"><span class='Ref_To_Local'>toDelete</span></a><span class='Delimiter'>, 
+</span>                         <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="spgvacuum.c.html#LN409"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN227"><span class='Ref_to_Member'>nDelete</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN46"><span class='Ref_to_Proto'>XLogRegisterBuffer</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN406"><span class='Ref_to_Parameter'>buffer</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xloginsert.h.html#LN34"><span class='Ref_to_Const'>REGBUF_STANDARD</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN459"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_SPGIST_ID<span class='Delimiter'>, </span><a href="../../../include/access/spgxlog.h.html#LN27"><span class='Ref_to_Const'>XLOG_SPGIST_VACUUM_ROOT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/bufpage.h.html#LN364"><span class='Ref_to_Macro'>PageSetLSN</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN408"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN459"><span class='Ref_To_Local'>recptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if RelationNeedsWAL(inde... &raquo; </span> 
+ 
+    <a href="../../../include/miscadmin.h.html#LN134"><span class='Ref_to_Macro'>END_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end vacuumLeafRoot &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Clean up redirect and placeholder tuples on the given page 
+ * 
+ * Redirect tuples can be marked placeholder once they're old enough. 
+ * Placeholder tuples can be removed if it won't change the offsets of 
+ * non-placeholder ones. 
+ * 
+ * Unlike the routines above, this works on both leaf and inner pages. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN491"></a><span class='Declare_Function'>vacuumRedirectAndPlaceholder</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>index</span><span class='Delimiter'>, </span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Parameter'>buffer</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN493"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN491"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN494"></a>    <a href="../../../include/access/spgist_private.h.html#LN46"><span class='Ref_to_Typedef'>SpGistPageOpaque</span></a> <span class='Declare_Local'>opaque</span> <span class='Operator'>= </span><a href="../../../include/access/spgist_private.h.html#LN55"><span class='Ref_to_Macro'>SpGistPageGetOpaque</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN493"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN495"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>i</span><span class='Delimiter'>, 
+</span><a name="LN496"></a>                <span class='Declare_Local'>max</span> <span class='Operator'>= </span><a href="../../../include/storage/bufpage.h.html#LN353"><span class='Ref_to_Macro'>PageGetMaxOffsetNumber</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN493"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span><a name="LN497"></a>                <span class='Declare_Local'>firstPlaceholder</span> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Delimiter'>; 
+</span><a name="LN498"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>hasNonPlaceholder</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN499"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>hasUpdate</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN500"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>itemToPlaceholder</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a><span class='Delimiter'>]; 
+</span><a name="LN501"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>itemnos</span><span class='Delimiter'>[</span><a href="../../../include/access/itup.h.html#LN136"><span class='Ref_to_Const'>MaxIndexTuplesPerPage</span></a><span class='Delimiter'>]; 
+</span><a name="LN502"></a>    <a href="../../../include/access/spgxlog.h.html#LN237"><span class='Ref_to_Struct'>spgxlogVacuumRedirect</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span> 
+    <a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN239"><span class='Ref_to_Member'>nToPlaceholder</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN241"><span class='Ref_to_Member'>newestRedirectXid</span></a> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/miscadmin.h.html#LN132"><span class='Ref_to_Macro'>START_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Scan backwards to convert old redirection tuples to placeholder tuples, 
+     * and identify location of last non-placeholder tuple while at it. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN496"><span class='Ref_To_Local'>max</span></a><span class='Delimiter'>; 
+</span>         <a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&GT;= </span><a href="../../../include/storage/off.h.html#LN26"><span class='Ref_to_Const'>FirstOffsetNumber</span></a> <span class='Operator'>&& 
+</span>         <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN494"><span class='Ref_To_Local'>opaque</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN40"><span class='Ref_to_Member'>nRedirection</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>|| !</span><a href="spgvacuum.c.html#LN498"><span class='Ref_To_Local'>hasNonPlaceholder</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>         <a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Operator'>--</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN518"></a>        <a href="../../../include/access/spgist_private.h.html#LN326"><span class='Ref_to_Typedef'>SpGistDeadTuple</span></a> <span class='Declare_Local'>dt</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN518"><span class='Ref_To_Local'>dt</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN326"><span class='Ref_to_Typedef'>SpGistDeadTuple</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN336"><span class='Ref_to_Macro'>PageGetItem</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN493"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN493"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN518"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN319"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>== </span><a href="../../../include/access/spgist_private.h.html#LN197"><span class='Ref_to_Const'>SPGIST_REDIRECT</span></a> <span class='Operator'>&& 
+</span>            <a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN518"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN323"><span class='Ref_to_Member'>xid</span></a><span class='Delimiter'>, </span><a href="../../utils/time/snapmgr.c.html#LN165"><span class='Ref_to_Global_Var'>RecentGlobalXmin</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="spgvacuum.c.html#LN518"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN319"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>= </span><a href="../../../include/access/spgist_private.h.html#LN199"><span class='Ref_to_Const'>SPGIST_PLACEHOLDER</span></a><span class='Delimiter'>; 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN494"><span class='Ref_To_Local'>opaque</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN40"><span class='Ref_to_Member'>nRedirection</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="spgvacuum.c.html#LN494"><span class='Ref_To_Local'>opaque</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN40"><span class='Ref_to_Member'>nRedirection</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>            <a href="spgvacuum.c.html#LN494"><span class='Ref_To_Local'>opaque</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN41"><span class='Ref_to_Member'>nPlaceholder</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* remember newest XID among the removed redirects */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN241"><span class='Ref_to_Member'>newestRedirectXid</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>                <a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN241"><span class='Ref_to_Member'>newestRedirectXid</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN518"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN323"><span class='Ref_to_Member'>xid</span></a><span class='Parentheses'>))</span> 
+                <a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN241"><span class='Ref_to_Member'>newestRedirectXid</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN518"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN323"><span class='Ref_to_Member'>xid</span></a><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/storage/itemptr.h.html#LN148"><span class='Ref_to_Macro'>ItemPointerSetInvalid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN518"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN322"><span class='Ref_to_Member'>pointer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="spgvacuum.c.html#LN500"><span class='Ref_To_Local'>itemToPlaceholder</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN239"><span class='Ref_to_Member'>nToPlaceholder</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN239"><span class='Ref_to_Member'>nToPlaceholder</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+            <a href="spgvacuum.c.html#LN499"><span class='Ref_To_Local'>hasUpdate</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if dt-&GT;tupstate==SPGIST_... &raquo; </span> 
+ 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN518"><span class='Ref_To_Local'>dt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN319"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>== </span><a href="../../../include/access/spgist_private.h.html#LN199"><span class='Ref_to_Const'>SPGIST_PLACEHOLDER</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="spgvacuum.c.html#LN498"><span class='Ref_To_Local'>hasNonPlaceholder</span></a><span class='Parentheses'>) 
+</span>                <a href="spgvacuum.c.html#LN497"><span class='Ref_To_Local'>firstPlaceholder</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="spgvacuum.c.html#LN498"><span class='Ref_To_Local'>hasNonPlaceholder</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=max;i&GT;=FirstOffsetN... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Any placeholder tuples at the end of page can safely be removed.  We 
+     * can't remove ones before the last non-placeholder, though, because we 
+     * can't alter the offset numbers of non-placeholder tuples. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN497"><span class='Ref_To_Local'>firstPlaceholder</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * We do not store this array to rdata because it's easy to recreate. 
+         */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN497"><span class='Ref_To_Local'>firstPlaceholder</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="spgvacuum.c.html#LN496"><span class='Ref_To_Local'>max</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>            <a href="spgvacuum.c.html#LN501"><span class='Ref_To_Local'>itemnos</span></a><span class='Delimiter'>[</span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>- </span><a href="spgvacuum.c.html#LN497"><span class='Ref_To_Local'>firstPlaceholder</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN496"><span class='Ref_To_Local'>max</span></a> <span class='Operator'>- </span><a href="spgvacuum.c.html#LN497"><span class='Ref_To_Local'>firstPlaceholder</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN494"><span class='Ref_To_Local'>opaque</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN41"><span class='Ref_to_Member'>nPlaceholder</span></a> <span class='Operator'>&GT;= </span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN494"><span class='Ref_To_Local'>opaque</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN41"><span class='Ref_to_Member'>nPlaceholder</span></a> <span class='Operator'>-= </span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* The array is surely sorted, so can use PageIndexMultiDelete */ 
+</span>        <a href="../../../include/storage/bufpage.h.html#LN431"><span class='Ref_to_Proto'>PageIndexMultiDelete</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN493"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN501"><span class='Ref_To_Local'>itemnos</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN499"><span class='Ref_To_Local'>hasUpdate</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN240"><span class='Ref_to_Member'>firstPlaceholder</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN497"><span class='Ref_To_Local'>firstPlaceholder</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN499"><span class='Ref_To_Local'>hasUpdate</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN176"><span class='Ref_to_Proto'>MarkBufferDirty</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN491"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN499"><span class='Ref_To_Local'>hasUpdate</span></a> <span class='Operator'>&& </span><a href="../../../include/utils/rel.h.html#LN505"><span class='Ref_to_Macro'>RelationNeedsWAL</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN491"><span class='Ref_to_Parameter'>index</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN584"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Delimiter'>, </span><a href="../../../include/access/spgxlog.h.html#LN247"><span class='Ref_to_Const'>SizeOfSpgxlogVacuumRedirect</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN500"><span class='Ref_To_Local'>itemToPlaceholder</span></a><span class='Delimiter'>, 
+</span>                         <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="spgvacuum.c.html#LN502"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/spgxlog.h.html#LN239"><span class='Ref_to_Member'>nToPlaceholder</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN46"><span class='Ref_to_Proto'>XLogRegisterBuffer</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN491"><span class='Ref_to_Parameter'>buffer</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xloginsert.h.html#LN34"><span class='Ref_to_Const'>REGBUF_STANDARD</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN584"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_SPGIST_ID<span class='Delimiter'>, </span><a href="../../../include/access/spgxlog.h.html#LN28"><span class='Ref_to_Const'>XLOG_SPGIST_VACUUM_REDIRECT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/bufpage.h.html#LN364"><span class='Ref_to_Macro'>PageSetLSN</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN493"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN584"><span class='Ref_To_Local'>recptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/miscadmin.h.html#LN134"><span class='Ref_to_Macro'>END_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end vacuumRedirectAndPlaceholder &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Process one page during a bulkdelete scan 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN606"></a><span class='Declare_Function'>spgvacuumpage</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN40"><span class='Ref_to_Struct'>spgBulkDeleteState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>bds</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>blkno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN608"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>index</span> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN43"><span class='Ref_to_Member'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN45"><span class='Ref_to_Member'>index</span></a><span class='Delimiter'>; 
+</span><a name="LN609"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buffer</span><span class='Delimiter'>; 
+</span><a name="LN610"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* call vacuum_delay_point while not holding any buffer lock */ 
+</span>    <a href="../../../include/commands/vacuum.h.html#LN188"><span class='Ref_to_Proto'>vacuum_delay_point</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="spgvacuum.c.html#LN609"><span class='Ref_To_Local'>buffer</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN168"><span class='Ref_to_Proto'>ReadBufferExtended</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN608"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN26"><span class='Ref_to_EnumConst'>MAIN_FORKNUM</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, 
+</span>                                <a href="../../../include/storage/bufmgr.h.html#LN39"><span class='Ref_to_EnumConst'>RBM_NORMAL</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN43"><span class='Ref_to_Member'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN50"><span class='Ref_to_Member'>strategy</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN609"><span class='Ref_To_Local'>buffer</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN610"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN609"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN225"><span class='Ref_to_Macro'>PageIsNew</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN610"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * We found an all-zero page, which could happen if the database 
+         * crashed just after extending the file.  Recycle it. 
+         */ 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN218"><span class='Ref_to_Macro'>PageIsEmpty</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN610"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* nothing to do */ 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN58"><span class='Ref_to_Macro'>SpGistPageIsLeaf</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN610"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN29"><span class='Ref_to_Macro'>SpGistBlockIsRoot</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>blkno</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="spgvacuum.c.html#LN405"><span class='Ref_to_Func'>vacuumLeafRoot</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>bds</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN608"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN609"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* no need for vacuumRedirectAndPlaceholder */ 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="spgvacuum.c.html#LN124"><span class='Ref_to_Func'>vacuumLeafPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>bds</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN608"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN609"><span class='Ref_To_Local'>buffer</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="spgvacuum.c.html#LN490"><span class='Ref_to_Func'>vacuumRedirectAndPlaceholder</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN608"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN609"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* inner page */ 
+</span>        <a href="spgvacuum.c.html#LN490"><span class='Ref_to_Func'>vacuumRedirectAndPlaceholder</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN608"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN609"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The root pages must never be deleted, nor marked as available in FSM, 
+     * because we don't want them ever returned by a search for a place to put 
+     * a new tuple.  Otherwise, check for empty page, and make sure the FSM 
+     * knows about it. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/spgist_private.h.html#LN29"><span class='Ref_to_Macro'>SpGistBlockIsRoot</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>blkno</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN225"><span class='Ref_to_Macro'>PageIsNew</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN610"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>) </span><span class='Operator'>|| </span><a href="../../../include/storage/bufpage.h.html#LN218"><span class='Ref_to_Macro'>PageIsEmpty</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN610"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/indexfsm.h.html#LN20"><span class='Ref_to_Proto'>RecordFreeIndexPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN608"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>blkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN77"><span class='Ref_to_Member'>pages_deleted</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/access/spgist_private.h.html#LN388"><span class='Ref_to_Proto'>SpGistSetLastUsedPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN608"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN609"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN52"><span class='Ref_to_Member'>lastFilledBlock</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN606"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN175"><span class='Ref_to_Proto'>UnlockReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN609"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end spgvacuumpage &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Process the pending-TID list between pages of the main scan 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN677"></a><span class='Declare_Function'>spgprocesspending</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN40"><span class='Ref_to_Struct'>spgBulkDeleteState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>bds</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN679"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>index</span> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN677"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN43"><span class='Ref_to_Member'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN45"><span class='Ref_to_Member'>index</span></a><span class='Delimiter'>; 
+</span><a name="LN680"></a>    <a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pitem</span><span class='Delimiter'>; 
+</span><a name="LN681"></a>    <a href="spgvacuum.c.html#LN32"><span class='Ref_to_Struct'>spgVacPendingItem</span></a> <span class='Operator'>*</span><span class='Declare_Local'>nitem</span><span class='Delimiter'>; 
+</span><a name="LN682"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>blkno</span><span class='Delimiter'>; 
+</span><a name="LN683"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buffer</span><span class='Delimiter'>; 
+</span><a name="LN684"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN680"><span class='Ref_To_Local'>pitem</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN677"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN50"><span class='Ref_to_Member'>pendingList</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN680"><span class='Ref_To_Local'>pitem</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN680"><span class='Ref_To_Local'>pitem</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN680"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN36"><span class='Ref_to_Member'>next</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN680"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN35"><span class='Ref_to_Member'>done</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* ignore already-done items */ 
+</span> 
+        <span class='Comment_Multi_Line'>/* call vacuum_delay_point while not holding any buffer lock */ 
+</span>        <a href="../../../include/commands/vacuum.h.html#LN188"><span class='Ref_to_Proto'>vacuum_delay_point</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* examine the referenced page */ 
+</span>        <a href="spgvacuum.c.html#LN682"><span class='Ref_To_Local'>blkno</span></a> <span class='Operator'>= </span><a href="../../../include/storage/itemptr.h.html#LN74"><span class='Ref_to_Macro'>ItemPointerGetBlockNumber</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN680"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN34"><span class='Ref_to_Member'>tid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN683"><span class='Ref_To_Local'>buffer</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN168"><span class='Ref_to_Proto'>ReadBufferExtended</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN679"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN26"><span class='Ref_to_EnumConst'>MAIN_FORKNUM</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN682"><span class='Ref_To_Local'>blkno</span></a><span class='Delimiter'>, 
+</span>                                    <a href="../../../include/storage/bufmgr.h.html#LN39"><span class='Ref_to_EnumConst'>RBM_NORMAL</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN677"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN43"><span class='Ref_to_Member'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN50"><span class='Ref_to_Member'>strategy</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN683"><span class='Ref_To_Local'>buffer</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN684"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN683"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN225"><span class='Ref_to_Macro'>PageIsNew</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN684"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>) </span><span class='Operator'>|| </span><a href="../../../include/access/spgist_private.h.html#LN57"><span class='Ref_to_Macro'>SpGistPageIsDeleted</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN684"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Probably shouldn't happen, but ignore it */ 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN58"><span class='Ref_to_Macro'>SpGistPageIsLeaf</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN684"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN29"><span class='Ref_to_Macro'>SpGistBlockIsRoot</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN682"><span class='Ref_To_Local'>blkno</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* this should definitely not happen */ 
+</span>                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"redirection leads to root page of index \"%s\""</span><span class='Delimiter'>, 
+</span>                     <a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN679"><span class='Ref_To_Local'>index</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* deal with any deletable tuples */ 
+</span>            <a href="spgvacuum.c.html#LN124"><span class='Ref_to_Func'>vacuumLeafPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN677"><span class='Ref_to_Parameter'>bds</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN679"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN683"><span class='Ref_To_Local'>buffer</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* might as well do this while we are here */ 
+</span>            <a href="spgvacuum.c.html#LN490"><span class='Ref_to_Func'>vacuumRedirectAndPlaceholder</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN679"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN683"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/access/spgist_private.h.html#LN388"><span class='Ref_to_Proto'>SpGistSetLastUsedPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN679"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN683"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * We can mark as done not only this item, but any later ones 
+             * pointing at the same page, since we vacuumed the whole page. 
+             */ 
+</span>            <a href="spgvacuum.c.html#LN680"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN35"><span class='Ref_to_Member'>done</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN680"><span class='Ref_To_Local'>pitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN36"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN36"><span class='Ref_to_Member'>next</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN74"><span class='Ref_to_Macro'>ItemPointerGetBlockNumber</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN34"><span class='Ref_to_Member'>tid</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="spgvacuum.c.html#LN682"><span class='Ref_To_Local'>blkno</span></a><span class='Parentheses'>)</span> 
+                    <a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN35"><span class='Ref_to_Member'>done</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if SpGistPageIsLeaf(page... &raquo; </span> 
+        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * On an inner page, visit the referenced inner tuple and add all 
+             * its downlinks to the pending list.  We might have pending items 
+             * for more than one inner tuple on the same page (in fact this is 
+             * pretty likely given the way space allocation works), so get 
+             * them all while we are here. 
+             */ 
+</span>            <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN680"><span class='Ref_To_Local'>pitem</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN36"><span class='Ref_to_Member'>next</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN35"><span class='Ref_to_Member'>done</span></a><span class='Parentheses'>) 
+</span>                    <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN74"><span class='Ref_to_Macro'>ItemPointerGetBlockNumber</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN34"><span class='Ref_to_Member'>tid</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="spgvacuum.c.html#LN682"><span class='Ref_To_Local'>blkno</span></a><span class='Parentheses'>)</span> 
+                <span class='Delimiter'>{ 
+</span><a name="LN747"></a>                    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>offset</span><span class='Delimiter'>; 
+</span><a name="LN748"></a>                    <a href="../../../include/access/spgist_private.h.html#LN220"><span class='Ref_to_Typedef'>SpGistInnerTuple</span></a> <span class='Declare_Local'>innerTuple</span><span class='Delimiter'>; 
+</span> 
+                    <a href="spgvacuum.c.html#LN747"><span class='Ref_To_Local'>offset</span></a> <span class='Operator'>= </span><a href="../../../include/storage/itemptr.h.html#LN93"><span class='Ref_to_Macro'>ItemPointerGetOffsetNumber</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN34"><span class='Ref_to_Member'>tid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="spgvacuum.c.html#LN748"><span class='Ref_To_Local'>innerTuple</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/spgist_private.h.html#LN220"><span class='Ref_to_Typedef'>SpGistInnerTuple</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN336"><span class='Ref_to_Macro'>PageGetItem</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN684"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, 
+</span>                                                <a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN684"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN747"><span class='Ref_To_Local'>offset</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN748"><span class='Ref_To_Local'>innerTuple</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN211"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>== </span><a href="../../../include/access/spgist_private.h.html#LN196"><span class='Ref_to_Const'>SPGIST_LIVE</span></a><span class='Parentheses'>) 
+</span>                    <span class='Delimiter'>{ 
+</span><a name="LN755"></a>                        <a href="../../../include/access/spgist_private.h.html#LN255"><span class='Ref_to_Typedef'>SpGistNodeTuple</span></a> <span class='Declare_Local'>node</span><span class='Delimiter'>; 
+</span><a name="LN756"></a>                        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+                        <a href="../../../include/access/spgist_private.h.html#LN238"><span class='Ref_to_Macro'>SGITITERATE</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN748"><span class='Ref_To_Local'>innerTuple</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN756"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN755"><span class='Ref_To_Local'>node</span></a><span class='Parentheses'>) 
+</span>                        <span class='Delimiter'>{ 
+</span>                            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN755"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/itup.h.html#LN36"><span class='Ref_to_Member'>t_tid</span></a><span class='Parentheses'>))</span> 
+                                <a href="spgvacuum.c.html#LN62"><span class='Ref_to_Func'>spgAddPendingTID</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN677"><span class='Ref_to_Parameter'>bds</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN755"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/itup.h.html#LN36"><span class='Ref_to_Member'>t_tid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                        <span class='Delimiter'>} 
+</span>                    <span class='Delimiter'>} 
+</span>                    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN748"><span class='Ref_To_Local'>innerTuple</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN211"><span class='Ref_to_Member'>tupstate</span></a> <span class='Operator'>== </span><a href="../../../include/access/spgist_private.h.html#LN197"><span class='Ref_to_Const'>SPGIST_REDIRECT</span></a><span class='Parentheses'>) 
+</span>                    <span class='Delimiter'>{ 
+</span>                        <span class='Comment_Multi_Line'>/* transfer attention to redirect point */ 
+</span>                        <a href="spgvacuum.c.html#LN62"><span class='Ref_to_Func'>spgAddPendingTID</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN677"><span class='Ref_to_Parameter'>bds</span></a><span class='Delimiter'>, 
+</span>                                   <span class='Operator'>&</span><span class='Parentheses'>((</span><a href="../../../include/access/spgist_private.h.html#LN326"><span class='Ref_to_Typedef'>SpGistDeadTuple</span></a><span class='Parentheses'>) </span><a href="spgvacuum.c.html#LN748"><span class='Ref_To_Local'>innerTuple</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>pointer<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Delimiter'>} 
+</span>                    <span class='Control'>else</span> 
+                        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unexpected SPGiST tuple state: %d"</span><span class='Delimiter'>, 
+</span>                             <a href="spgvacuum.c.html#LN748"><span class='Ref_To_Local'>innerTuple</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/spgist_private.h.html#LN211"><span class='Ref_to_Member'>tupstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                    <a href="spgvacuum.c.html#LN681"><span class='Ref_To_Local'>nitem</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN35"><span class='Ref_to_Member'>done</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if ItemPointerGetBlockNu... &raquo; </span> 
+            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for nitem=pitem;nitem!=NU... &raquo; </span> 
+        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+ 
+        <a href="../../../include/storage/bufmgr.h.html#LN175"><span class='Ref_to_Proto'>UnlockReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN683"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for pitem=bds-&GT;pendingLis... &raquo; </span> 
+ 
+    <a href="spgvacuum.c.html#LN88"><span class='Ref_to_Func'>spgClearPendingList</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN677"><span class='Ref_to_Parameter'>bds</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end spgprocesspending &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Perform a bulkdelete scan 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN789"></a><span class='Declare_Function'>spgvacuumscan</span><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN40"><span class='Ref_to_Struct'>spgBulkDeleteState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>bds</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN791"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>index</span> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN43"><span class='Ref_to_Member'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN45"><span class='Ref_to_Member'>index</span></a><span class='Delimiter'>; 
+</span><a name="LN792"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>needLock</span><span class='Delimiter'>; 
+</span><a name="LN793"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>num_pages</span><span class='Delimiter'>, 
+</span><a name="LN794"></a>                <span class='Declare_Local'>blkno</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Finish setting up spgBulkDeleteState */ 
+</span>    <a href="spgutils.c.html#LN156"><span class='Ref_to_Func'>initSpGistState</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN49"><span class='Ref_to_Member'>spgstate</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN791"><span class='Ref_To_Local'>index</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN50"><span class='Ref_to_Member'>pendingList</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN51"><span class='Ref_to_Member'>myXmin</span></a> <span class='Operator'>= </span><a href="../../../include/utils/snapmgr.h.html#LN77"><span class='Ref_to_Proto'>GetActiveSnapshot</span></a><span class='Parentheses'>()</span><span class='Operator'>-&GT;</span><a href="../../../include/utils/snapshot.h.html#LN65"><span class='Ref_to_Member'>xmin</span></a><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN52"><span class='Ref_to_Member'>lastFilledBlock</span></a> <span class='Operator'>= </span><a href="../../../include/access/spgist_private.h.html#LN27"><span class='Ref_to_Const'>SPGIST_LAST_FIXED_BLKNO</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Reset counts that will be incremented during the scan; needed in case 
+     * of multiple scans during a single VACUUM command 
+     */ 
+</span>    <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN74"><span class='Ref_to_Member'>estimated_count</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN75"><span class='Ref_to_Member'>num_index_tuples</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN77"><span class='Ref_to_Member'>pages_deleted</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We can skip locking for new or temp relations */ 
+</span>    <a href="spgvacuum.c.html#LN792"><span class='Ref_To_Local'>needLock</span></a> <span class='Operator'>= !</span><a href="../../../include/utils/rel.h.html#LN523"><span class='Ref_to_Macro'>RELATION_IS_LOCAL</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN791"><span class='Ref_To_Local'>index</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The outer loop iterates over all index pages except the metapage, in 
+     * physical order (we hope the kernel will cooperate in providing 
+     * read-ahead for speed).  It is critical that we visit all leaf pages, 
+     * including ones added after we start the scan, else we might fail to 
+     * delete some deletable tuples.  See more extensive comments about this 
+     * in btvacuumscan(). 
+     */ 
+</span>    <a href="spgvacuum.c.html#LN794"><span class='Ref_To_Local'>blkno</span></a> <span class='Operator'>= </span><a href="../../../include/access/spgist_private.h.html#LN24"><span class='Ref_to_Const'>SPGIST_METAPAGE_BLKNO</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Get the current relation length */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN792"><span class='Ref_To_Local'>needLock</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/storage/lmgr.h.html#LN53"><span class='Ref_to_Proto'>LockRelationForExtension</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN791"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN43"><span class='Ref_to_Const'>ExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN793"><span class='Ref_To_Local'>num_pages</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN198"><span class='Ref_to_Macro'>RelationGetNumberOfBlocks</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN791"><span class='Ref_To_Local'>index</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN792"><span class='Ref_To_Local'>needLock</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/storage/lmgr.h.html#LN54"><span class='Ref_to_Proto'>UnlockRelationForExtension</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN791"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN43"><span class='Ref_to_Const'>ExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Quit if we've scanned the whole relation */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN794"><span class='Ref_To_Local'>blkno</span></a> <span class='Operator'>&GT;= </span><a href="spgvacuum.c.html#LN793"><span class='Ref_To_Local'>num_pages</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* Iterate over pages, then loop back to recheck length */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN794"><span class='Ref_To_Local'>blkno</span></a> <span class='Operator'>&LT; </span><a href="spgvacuum.c.html#LN793"><span class='Ref_To_Local'>num_pages</span></a><span class='Delimiter'>; </span><a href="spgvacuum.c.html#LN794"><span class='Ref_To_Local'>blkno</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="spgvacuum.c.html#LN605"><span class='Ref_to_Func'>spgvacuumpage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN794"><span class='Ref_To_Local'>blkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* empty the pending-list after each page */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN50"><span class='Ref_to_Member'>pendingList</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>                <a href="spgvacuum.c.html#LN676"><span class='Ref_to_Func'>spgprocesspending</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Propagate local lastUsedPage cache to metablock */ 
+</span>    <a href="spgutils.c.html#LN250"><span class='Ref_to_Func'>SpGistUpdateMetaPage</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN791"><span class='Ref_To_Local'>index</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Truncate index if possible 
+     * 
+     * XXX disabled because it's unsafe due to possible concurrent inserts. 
+     * We'd have to rescan the pages to make sure they're still empty, and it 
+     * doesn't seem worth it.  Note that btree doesn't do this either. 
+     * 
+     * Another reason not to truncate is that it could invalidate the cached 
+     * pages-with-freespace pointers in the metapage and other backends' 
+     * relation caches, that is leave them pointing to nonexistent pages. 
+     * Adding RelationGetNumberOfBlocks calls to protect the places that use 
+     * those pointers would be unduly expensive. 
+     */ 
+</span><span class='Directive'>#ifdef</span> NOT_USED 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN793"><span class='Ref_To_Local'>num_pages</span></a> <span class='Operator'>&GT; </span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN52"><span class='Ref_to_Member'>lastFilledBlock</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN863"></a>        <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>lastBlock</span> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN793"><span class='Ref_To_Local'>num_pages</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN793"><span class='Ref_To_Local'>num_pages</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN52"><span class='Ref_to_Member'>lastFilledBlock</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/catalog/storage.h.html#LN23"><span class='Ref_to_Proto'>RelationTruncate</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN791"><span class='Ref_To_Local'>index</span></a><span class='Delimiter'>, </span><a href="spgvacuum.c.html#LN793"><span class='Ref_To_Local'>num_pages</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN73"><span class='Ref_to_Member'>pages_removed</span></a> <span class='Operator'>+= </span><a href="spgvacuum.c.html#LN863"><span class='Ref_To_Local'>lastBlock</span></a> <span class='Operator'>- </span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN52"><span class='Ref_to_Member'>lastFilledBlock</span></a><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN77"><span class='Ref_to_Member'>pages_deleted</span></a> <span class='Operator'>-= </span><a href="spgvacuum.c.html#LN863"><span class='Ref_To_Local'>lastBlock</span></a> <span class='Operator'>- </span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN52"><span class='Ref_to_Member'>lastFilledBlock</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Comment_Multi_Line'>/* Report final stats */ 
+</span>    <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN72"><span class='Ref_to_Member'>num_pages</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN793"><span class='Ref_To_Local'>num_pages</span></a><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN78"><span class='Ref_to_Member'>pages_free</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN789"><span class='Ref_to_Parameter'>bds</span></a><span class='Operator'>-&GT;</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN77"><span class='Ref_to_Member'>pages_deleted</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end spgvacuumscan &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Bulk deletion of all index entries pointing to a set of heap tuples. 
+ * The set of target tuples is specified via a callback routine that tells 
+ * whether any given heap tuple (identified by ItemPointer) is being deleted. 
+ * 
+ * Result: a palloc'd struct containing statistical info for VACUUM displays. 
+ */ 
+</span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>* 
+</span><a name="LN885"></a><span class='Declare_Function'>spgbulkdelete</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN43"><span class='Ref_to_Struct'>IndexVacuumInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>info</span><span class='Delimiter'>, </span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>stats</span><span class='Delimiter'>, 
+</span><a name="LN886"></a>              <a href="../../../include/access/genam.h.html#LN82"><span class='Ref_to_Typedef'>IndexBulkDeleteCallback</span></a> <span class='Declare_Parameter'>callback</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>callback_state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN888"></a>    <a href="spgvacuum.c.html#LN40"><span class='Ref_to_Struct'>spgBulkDeleteState</span></a> <span class='Declare_Local'>bds</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* allocate stats if first time through, else re-use existing struct */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN885"><span class='Ref_to_Parameter'>stats</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="spgvacuum.c.html#LN885"><span class='Ref_to_Parameter'>stats</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN888"><span class='Ref_To_Local'>bds</span></a><span class='Operator'>.</span><a href="spgvacuum.c.html#LN43"><span class='Ref_to_Member'>info</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN885"><span class='Ref_to_Parameter'>info</span></a><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN888"><span class='Ref_To_Local'>bds</span></a><span class='Operator'>.</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN885"><span class='Ref_to_Parameter'>stats</span></a><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN888"><span class='Ref_To_Local'>bds</span></a><span class='Operator'>.</span><a href="spgvacuum.c.html#LN45"><span class='Ref_to_Member'>callback</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN886"><span class='Ref_to_Parameter'>callback</span></a><span class='Delimiter'>; 
+</span>    <a href="spgvacuum.c.html#LN888"><span class='Ref_To_Local'>bds</span></a><span class='Operator'>.</span><a href="spgvacuum.c.html#LN46"><span class='Ref_to_Member'>callback_state</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN886"><span class='Ref_to_Parameter'>callback_state</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="spgvacuum.c.html#LN788"><span class='Ref_to_Func'>spgvacuumscan</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN888"><span class='Ref_To_Local'>bds</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="spgvacuum.c.html#LN885"><span class='Ref_to_Parameter'>stats</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* Dummy callback to delete no tuples during spgvacuumcleanup */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN905"></a><span class='Declare_Function'>dummy_callback</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>itemptr</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Post-VACUUM cleanup. 
+ * 
+ * Result: a palloc'd struct containing statistical info for VACUUM displays. 
+ */ 
+</span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>* 
+</span><a name="LN916"></a><span class='Declare_Function'>spgvacuumcleanup</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN43"><span class='Ref_to_Struct'>IndexVacuumInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>info</span><span class='Delimiter'>, </span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>stats</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN918"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>index</span> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN45"><span class='Ref_to_Member'>index</span></a><span class='Delimiter'>; 
+</span><a name="LN919"></a>    <a href="spgvacuum.c.html#LN40"><span class='Ref_to_Struct'>spgBulkDeleteState</span></a> <span class='Declare_Local'>bds</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* No-op in ANALYZE ONLY mode */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN46"><span class='Ref_to_Member'>analyze_only</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>stats</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We don't need to scan the index if there was a preceding bulkdelete 
+     * pass.  Otherwise, make a pass that won't delete any live tuples, but 
+     * might still accomplish useful stuff with redirect/placeholder cleanup, 
+     * and in any case will provide stats. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>stats</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>stats</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/genam.h.html#LN70"><span class='Ref_to_Struct'>IndexBulkDeleteResult</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN919"><span class='Ref_To_Local'>bds</span></a><span class='Operator'>.</span><a href="spgvacuum.c.html#LN43"><span class='Ref_to_Member'>info</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>info</span></a><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN919"><span class='Ref_To_Local'>bds</span></a><span class='Operator'>.</span><a href="spgvacuum.c.html#LN44"><span class='Ref_to_Member'>stats</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>stats</span></a><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN919"><span class='Ref_To_Local'>bds</span></a><span class='Operator'>.</span><a href="spgvacuum.c.html#LN45"><span class='Ref_to_Member'>callback</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN904"><span class='Ref_to_Func'>dummy_callback</span></a><span class='Delimiter'>; 
+</span>        <a href="spgvacuum.c.html#LN919"><span class='Ref_To_Local'>bds</span></a><span class='Operator'>.</span><a href="spgvacuum.c.html#LN46"><span class='Ref_to_Member'>callback_state</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <a href="spgvacuum.c.html#LN788"><span class='Ref_to_Func'>spgvacuumscan</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="spgvacuum.c.html#LN919"><span class='Ref_To_Local'>bds</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Finally, vacuum the FSM */ 
+</span>    <a href="../../../include/storage/indexfsm.h.html#LN23"><span class='Ref_to_Proto'>IndexFreeSpaceMapVacuum</span></a><span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN918"><span class='Ref_To_Local'>index</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * It's quite possible for us to be fooled by concurrent tuple moves into 
+     * double-counting some index tuples, so disbelieve any total that exceeds 
+     * the underlying heap's count ... if we know that accurately.  Otherwise 
+     * this might just make matters worse. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN47"><span class='Ref_to_Member'>estimated_count</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN75"><span class='Ref_to_Member'>num_index_tuples</span></a> <span class='Operator'>&GT; </span><a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN49"><span class='Ref_to_Member'>num_heap_tuples</span></a><span class='Parentheses'>) 
+</span>            <a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>stats</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN75"><span class='Ref_to_Member'>num_index_tuples</span></a> <span class='Operator'>= </span><a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>info</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/genam.h.html#LN49"><span class='Ref_to_Member'>num_heap_tuples</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="spgvacuum.c.html#LN916"><span class='Ref_to_Parameter'>stats</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end spgvacuumcleanup &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

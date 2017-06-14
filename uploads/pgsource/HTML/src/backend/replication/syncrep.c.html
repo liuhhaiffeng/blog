@@ -1,0 +1,1217 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\replication\syncrep.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\replication\syncrep.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:46 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * syncrep.c 
+ * 
+ * Synchronous replication is new as of PostgreSQL 9.1. 
+ * 
+ * If requested, transaction commits wait until their commit LSN are 
+ * acknowledged by the synchronous standbys. 
+ * 
+ * This module contains the code for waiting and release of backends. 
+ * All code in this module executes on the primary. The core streaming 
+ * replication transport remains within WALreceiver/WALsender modules. 
+ * 
+ * The essence of this design is that it isolates all logic about 
+ * waiting/releasing onto the primary. The primary defines which standbys 
+ * it wishes to wait for. The standbys are completely unaware of the 
+ * durability requirements of transactions on the primary, reducing the 
+ * complexity of the code and streamlining both standby operations and 
+ * network bandwidth because there is no requirement to ship 
+ * per-transaction state information. 
+ * 
+ * Replication is either synchronous or not synchronous (async). If it is 
+ * async, we just fastpath out of here. If it is sync, then we wait for 
+ * the write, flush or apply location on the standby before releasing 
+ * the waiting backend. Further complexity in that interaction is 
+ * expected in later releases. 
+ * 
+ * The best performing way to manage the waiting backends is to have a 
+ * single ordered queue of waiting backends, so that we can avoid 
+ * searching the through all waiters each time we receive a reply. 
+ * 
+ * In 9.5 or before only a single standby could be considered as 
+ * synchronous. In 9.6 we support a priority-based multiple synchronous 
+ * standbys. In 10.0 a quorum-based multiple synchronous standbys is also 
+ * supported. The number of synchronous standbys that transactions 
+ * must wait for replies from is specified in synchronous_standby_names. 
+ * This parameter also specifies a list of standby names and the method 
+ * (FIRST and ANY) to choose synchronous standbys from the listed ones. 
+ * 
+ * The method FIRST specifies a priority-based synchronous replication 
+ * and makes transaction commits wait until their WAL records are 
+ * replicated to the requested number of synchronous standbys chosen based 
+ * on their priorities. The standbys whose names appear earlier in the list 
+ * are given higher priority and will be considered as synchronous. 
+ * Other standby servers appearing later in this list represent potential 
+ * synchronous standbys. If any of the current synchronous standbys 
+ * disconnects for whatever reason, it will be replaced immediately with 
+ * the next-highest-priority standby. 
+ * 
+ * The method ANY specifies a quorum-based synchronous replication 
+ * and makes transaction commits wait until their WAL records are 
+ * replicated to at least the requested number of synchronous standbys 
+ * in the list. All the standbys appearing in the list are considered as 
+ * candidates for quorum synchronous standbys. 
+ * 
+ * If neither FIRST nor ANY is specified, FIRST is used as the method. 
+ * This is for backward compatibility with 9.6 or before where only a 
+ * priority-based sync replication was supported. 
+ * 
+ * Before the standbys chosen from synchronous_standby_names can 
+ * become the synchronous standbys they must have caught up with 
+ * the primary; that may take some time. Once caught up, 
+ * the standbys which are considered as synchronous at that moment 
+ * will release waiters from the queue. 
+ * 
+ * Portions Copyright (c) 2010-2017, PostgreSQL Global Development Group 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/replication/syncrep.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/syncrep.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/walsender.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/walsender_private.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/pmsignal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"tcop/tcopprot.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/builtins.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/ps_status.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* User-settable parameters for sync rep */ 
+</span><a name="LN89"></a><span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Var'>SyncRepStandbyNames</span><span class='Delimiter'>; 
+</span> 
+<a name="LN91"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SyncStandbysDefined</span><span class='Parentheses'>() </span><span class='Operator'>\ 
+</span>    <span class='Parentheses'>(</span><a href="syncrep.c.html#LN89"><span class='Ref_to_Global_Var'>SyncRepStandbyNames</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& </span><a href="syncrep.c.html#LN89"><span class='Ref_to_Global_Var'>SyncRepStandbyNames</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>!= </span><span class='String'>'\0'</span><span class='Parentheses'>) 
+</span> 
+<a name="LN94"></a><span class='Keyword'>static bool </span><span class='Declare_Var'>announce_next_takeover</span> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+<a name="LN96"></a><a href="../../include/replication/syncrep.h.html#LN45"><span class='Ref_to_Struct'>SyncRepConfigData</span></a> <span class='Operator'>*</span><span class='Declare_Var'>SyncRepConfig</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN97"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>SyncRepWaitMode</span> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN22"><span class='Ref_to_Const'>SYNC_REP_NO_WAIT</span></a><span class='Delimiter'>; 
+</span> 
+<a name="LN99"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SyncRepQueueInsert</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>mode</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN100"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SyncRepCancelWait</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN101"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>SyncRepWakeQueue</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>all</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>mode</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN103"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>SyncRepGetSyncRecPtr</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>writePtr</span><span class='Delimiter'>, 
+</span><a name="LN104"></a>                     <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>flushPtr</span><span class='Delimiter'>, 
+</span><a name="LN105"></a>                     <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>applyPtr</span><span class='Delimiter'>, 
+</span><a name="LN106"></a>                     <span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>am_sync</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN107"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SyncRepGetOldestSyncRecPtr</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>writePtr</span><span class='Delimiter'>, 
+</span><a name="LN108"></a>                           <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>flushPtr</span><span class='Delimiter'>, 
+</span><a name="LN109"></a>                           <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>applyPtr</span><span class='Delimiter'>, 
+</span><a name="LN110"></a>                           <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>sync_standbys</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN111"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SyncRepGetNthLatestSyncRecPtr</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>writePtr</span><span class='Delimiter'>, 
+</span><a name="LN112"></a>                              <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>flushPtr</span><span class='Delimiter'>, 
+</span><a name="LN113"></a>                              <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>applyPtr</span><span class='Delimiter'>, 
+</span><a name="LN114"></a>                              <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>sync_standbys</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>nth</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN115"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>SyncRepGetStandbyPriority</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN116"></a><span class='Keyword'>static </span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>SyncRepGetSyncStandbysPriority</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>am_sync</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN117"></a><span class='Keyword'>static </span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>SyncRepGetSyncStandbysQuorum</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>am_sync</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN118"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>cmp_lsn</span><span class='Parentheses'>(</span><span class='Keyword'>const void </span><span class='Operator'>*</span><span class='Declare_Parameter'>a</span><span class='Delimiter'>, </span><span class='Keyword'>const void </span><span class='Operator'>*</span><span class='Declare_Parameter'>b</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> USE_ASSERT_CHECKING 
+<a name="LN121"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>SyncRepQueueIsOrderedByLSN</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>mode</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * =========================================================== 
+ * Synchronous Replication functions for normal user backends 
+ * =========================================================== 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Wait for synchronous replication, if requested by user. 
+ * 
+ * Initially backends start in state SYNC_REP_NOT_WAITING and then 
+ * change that state to SYNC_REP_WAITING before adding ourselves 
+ * to the wait queue. During SyncRepWakeQueue() a WALSender changes 
+ * the state to SYNC_REP_WAIT_COMPLETE once replication is confirmed. 
+ * This backend then resets its state to SYNC_REP_NOT_WAITING. 
+ * 
+ * 'lsn' represents the LSN to wait for.  'commit' indicates whether this LSN 
+ * represents a commit record.  If it doesn't, then we wait only for the WAL 
+ * to be flushed if synchronous_commit is set to the higher level of 
+ * remote_apply, because only commit records provide apply feedback. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN145"></a><span class='Declare_Function'>SyncRepWaitForLSN</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>lsn</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>commit</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN147"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>new_status</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN148"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>old_status</span><span class='Delimiter'>; 
+</span><a name="LN149"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>mode</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Cap the level for anything other than commit to remote flush only. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN145"><span class='Ref_to_Parameter'>commit</span></a><span class='Parentheses'>) 
+</span>        <a href="syncrep.c.html#LN149"><span class='Ref_To_Local'>mode</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN97"><span class='Ref_to_Global_Var'>SyncRepWaitMode</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="syncrep.c.html#LN149"><span class='Ref_To_Local'>mode</span></a> <span class='Operator'>= </span><a href="../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN97"><span class='Ref_to_Global_Var'>SyncRepWaitMode</span></a><span class='Delimiter'>, </span><a href="../../include/replication/syncrep.h.html#LN24"><span class='Ref_to_Const'>SYNC_REP_WAIT_FLUSH</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Fast exit if user has not requested sync replication, or there are no 
+     * sync replication standby names defined. Note that those standbys don't 
+     * need to be connected. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/replication/syncrep.h.html#LN18"><span class='Ref_to_Macro'>SyncRepRequested</span></a><span class='Parentheses'>() </span><span class='Operator'>|| !</span><a href="syncrep.c.html#LN91"><span class='Ref_to_Macro'>SyncStandbysDefined</span></a><span class='Parentheses'>())</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../storage/ipc/shmqueue.c.html#LN45"><span class='Ref_to_Func'>SHMQueueIsDetached</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN147"><span class='Ref_to_Member'>syncRepState</span></a> <span class='Operator'>== </span><a href="../../include/replication/syncrep.h.html#LN30"><span class='Ref_to_Const'>SYNC_REP_NOT_WAITING</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We don't wait for sync rep if WalSndCtl-&GT;sync_standbys_defined is not 
+     * set.  See SyncRepUpdateSyncStandbysDefined. 
+     * 
+     * Also check that the standby hasn't already replied. Unlikely race 
+     * condition but we'll be fetching that cache line anyway so it's likely 
+     * to be a low cost check. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN94"><span class='Ref_to_Member'>sync_standbys_defined</span></a> <span class='Operator'>|| 
+</span>        <a href="syncrep.c.html#LN145"><span class='Ref_to_Parameter'>lsn</span></a> <span class='Operator'>&LT;= </span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN87"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN149"><span class='Ref_To_Local'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Set our waitLSN so WALSender will know when to wake us, and add 
+     * ourselves to the queue. 
+     */ 
+</span>    <a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN146"><span class='Ref_to_Member'>waitLSN</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN145"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>; 
+</span>    <a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN147"><span class='Ref_to_Member'>syncRepState</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN31"><span class='Ref_to_Const'>SYNC_REP_WAITING</span></a><span class='Delimiter'>; 
+</span>    <a href="syncrep.c.html#LN99"><span class='Ref_to_Proto'>SyncRepQueueInsert</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN149"><span class='Ref_To_Local'>mode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN121"><span class='Ref_to_Proto'>SyncRepQueueIsOrderedByLSN</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN149"><span class='Ref_To_Local'>mode</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Alter ps display to show waiting for sync rep. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../utils/misc/ps_status.c.html#LN34"><span class='Ref_to_Global_Var'>update_process_title</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN199"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>len</span><span class='Delimiter'>; 
+</span> 
+        <a href="syncrep.c.html#LN148"><span class='Ref_To_Local'>old_status</span></a> <span class='Operator'>= </span><a href="../../include/utils/ps_status.h.html#LN23"><span class='Ref_to_Proto'>get_ps_display</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="syncrep.c.html#LN199"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN147"><span class='Ref_To_Local'>new_status</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN199"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>+ </span><span class='Number'>32</span> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><a href="syncrep.c.html#LN147"><span class='Ref_To_Local'>new_status</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN148"><span class='Ref_To_Local'>old_status</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN199"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/port.h.html#LN170"><span class='Ref_to_Macro'>sprintf</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN147"><span class='Ref_To_Local'>new_status</span></a> <span class='Operator'>+ </span><a href="syncrep.c.html#LN199"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>, </span><span class='String'>" waiting for %X/%X"</span><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="syncrep.c.html#LN145"><span class='Ref_to_Parameter'>lsn</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="syncrep.c.html#LN145"><span class='Ref_to_Parameter'>lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/ps_status.h.html#LN21"><span class='Ref_to_Proto'>set_ps_display</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN147"><span class='Ref_To_Local'>new_status</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN147"><span class='Ref_To_Local'>new_status</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN199"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* truncate off " waiting ..." */ 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Wait for specified LSN to be confirmed. 
+     * 
+     * Each proc has its own wait latch, so we perform a normal latch 
+     * check/wait loop here. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Must reset the latch before testing state. */ 
+</span>        <a href="../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Acquiring the lock is not needed, the latch ensures proper 
+         * barriers. If it looks like we're done, we must really be done, 
+         * because once walsender changes the state to SYNC_REP_WAIT_COMPLETE, 
+         * it will never update it again, so we can't be seeing a stale value 
+         * in that case. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN147"><span class='Ref_to_Member'>syncRepState</span></a> <span class='Operator'>== </span><a href="../../include/replication/syncrep.h.html#LN32"><span class='Ref_to_Const'>SYNC_REP_WAIT_COMPLETE</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If a wait for synchronous replication is pending, we can neither 
+         * acknowledge the commit nor raise ERROR or FATAL.  The latter would 
+         * lead the client to believe that the transaction aborted, which is 
+         * not true: it's already committed locally. The former is no good 
+         * either: the client has requested synchronous replication, and is 
+         * entitled to assume that an acknowledged commit is also replicated, 
+         * which might not be true. So in this case we issue a WARNING (which 
+         * some clients may be able to interpret) and shut off further output. 
+         * We do NOT reset ProcDiePending, so that the process will die after 
+         * the commit is cleaned up. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN30"><span class='Ref_to_Global_Var'>ProcDiePending</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_ADMIN_SHUTDOWN<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"canceling the wait for synchronous replication and terminating connection due to administrator command"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The transaction has already committed locally, but might not have been replicated to the standby."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <a href="../tcop/postgres.c.html#LN87"><span class='Ref_to_Global_Var'>whereToSendOutput</span></a> <span class='Operator'>= </span><a href="../../include/tcop/dest.h.html#LN87"><span class='Ref_to_EnumConst'>DestNone</span></a><span class='Delimiter'>; 
+</span>            <a href="syncrep.c.html#LN100"><span class='Ref_to_Proto'>SyncRepCancelWait</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * It's unclear what to do if a query cancel interrupt arrives.  We 
+         * can't actually abort at this point, but ignoring the interrupt 
+         * altogether is not helpful, so we just terminate the wait with a 
+         * suitable warning. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN29"><span class='Ref_to_Global_Var'>QueryCancelPending</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../utils/init/globals.c.html#LN29"><span class='Ref_to_Global_Var'>QueryCancelPending</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"canceling wait for synchronous replication due to user request"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The transaction has already committed locally, but might not have been replicated to the standby."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <a href="syncrep.c.html#LN100"><span class='Ref_to_Proto'>SyncRepCancelWait</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If the postmaster dies, we'll probably never get an 
+         * acknowledgement, because all the wal sender processes will exit. So 
+         * just bail out. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/storage/pmsignal.h.html#LN53"><span class='Ref_to_Proto'>PostmasterIsAlive</span></a><span class='Parentheses'>())</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../utils/init/globals.c.html#LN30"><span class='Ref_to_Global_Var'>ProcDiePending</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="../tcop/postgres.c.html#LN87"><span class='Ref_to_Global_Var'>whereToSendOutput</span></a> <span class='Operator'>= </span><a href="../../include/tcop/dest.h.html#LN87"><span class='Ref_to_EnumConst'>DestNone</span></a><span class='Delimiter'>; 
+</span>            <a href="syncrep.c.html#LN100"><span class='Ref_to_Proto'>SyncRepCancelWait</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Wait on latch.  Any condition that should wake us up will set the 
+         * latch, so no need for timeout. 
+         */ 
+</span>        <a href="../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, </span><a href="../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>, 
+</span>                  <a href="../../include/pgstat.h.html#LN812"><span class='Ref_to_EnumConst'>WAIT_EVENT_SYNC_REP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * WalSender has checked our LSN and has removed us from queue. Clean up 
+     * state and leave.  It's OK to reset these shared memory fields without 
+     * holding SyncRepLock, because any walsenders will ignore us anyway when 
+     * we're not on the queue. 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../storage/ipc/shmqueue.c.html#LN45"><span class='Ref_to_Func'>SHMQueueIsDetached</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN147"><span class='Ref_to_Member'>syncRepState</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN30"><span class='Ref_to_Const'>SYNC_REP_NOT_WAITING</span></a><span class='Delimiter'>; 
+</span>    <a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN146"><span class='Ref_to_Member'>waitLSN</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN147"><span class='Ref_To_Local'>new_status</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Reset ps display */ 
+</span>        <a href="../../include/utils/ps_status.h.html#LN21"><span class='Ref_to_Proto'>set_ps_display</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN147"><span class='Ref_To_Local'>new_status</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN147"><span class='Ref_To_Local'>new_status</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepWaitForLSN &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Insert MyProc into the specified SyncRepQueue, maintaining sorted invariant. 
+ * 
+ * Usually we will go at tail of queue, though it's possible that we arrive 
+ * here out of order, so start at tail and work back to insertion point. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN316"></a><span class='Declare_Function'>SyncRepQueueInsert</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>mode</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN318"></a>    <a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>proc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN316"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="syncrep.c.html#LN316"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>&LT; </span><a href="../../include/replication/syncrep.h.html#LN27"><span class='Ref_to_Const'>NUM_SYNC_REP_WAIT_MODE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="syncrep.c.html#LN318"><span class='Ref_To_Local'>proc</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/storage/shmem.h.html#LN74"><span class='Ref_to_Proto'>SHMQueuePrev</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN316"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                   <span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN316"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                   <a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a><span class='Delimiter'>, </span>syncRepLinks<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN318"><span class='Ref_To_Local'>proc</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Stop at the queue element that we should after to ensure the queue 
+         * is ordered by LSN. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN318"><span class='Ref_To_Local'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN146"><span class='Ref_to_Member'>waitLSN</span></a> <span class='Operator'>&LT; </span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN146"><span class='Ref_to_Member'>waitLSN</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <a href="syncrep.c.html#LN318"><span class='Ref_To_Local'>proc</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/storage/shmem.h.html#LN74"><span class='Ref_to_Proto'>SHMQueuePrev</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN316"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                       <span class='Operator'>&</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN318"><span class='Ref_To_Local'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                       <a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a><span class='Delimiter'>, </span>syncRepLinks<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN318"><span class='Ref_To_Local'>proc</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/storage/shmem.h.html#LN71"><span class='Ref_to_Proto'>SHMQueueInsertAfter</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN318"><span class='Ref_To_Local'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="../../include/storage/shmem.h.html#LN71"><span class='Ref_to_Proto'>SHMQueueInsertAfter</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN316"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepQueueInsert &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Acquire SyncRepLock and cancel any wait currently in progress. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN349"></a><span class='Declare_Function'>SyncRepCancelWait</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../storage/ipc/shmqueue.c.html#LN45"><span class='Ref_to_Func'>SHMQueueIsDetached</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>)))</span> 
+        <a href="../storage/ipc/shmqueue.c.html#LN66"><span class='Ref_to_Func'>SHMQueueDelete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN147"><span class='Ref_to_Member'>syncRepState</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN30"><span class='Ref_to_Const'>SYNC_REP_NOT_WAITING</span></a><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>void 
+</span><a name="LN359"></a><span class='Declare_Function'>SyncRepCleanupAtProcExit</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../storage/ipc/shmqueue.c.html#LN45"><span class='Ref_to_Func'>SHMQueueIsDetached</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>)))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../storage/ipc/shmqueue.c.html#LN66"><span class='Ref_to_Func'>SHMQueueDelete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * =========================================================== 
+ * Synchronous Replication functions for wal sender processes 
+ * =========================================================== 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Take any action required to initialise sync rep state from config 
+ * data. Called at WALSender startup and after each SIGHUP. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN380"></a><span class='Declare_Function'>SyncRepInitConfig</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN382"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>priority</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Determine if we are a potential sync standby and remember the result 
+     * for handling replies from standby. 
+     */ 
+</span>    <a href="syncrep.c.html#LN382"><span class='Ref_To_Local'>priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN115"><span class='Ref_to_Proto'>SyncRepGetStandbyPriority</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN69"><span class='Ref_to_Member'>sync_standby_priority</span></a> <span class='Operator'>!= </span><a href="syncrep.c.html#LN382"><span class='Ref_To_Local'>priority</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN69"><span class='Ref_to_Member'>sync_standby_priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN382"><span class='Ref_To_Local'>priority</span></a><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"standby \"%s\" now has synchronous standby priority %u"</span><span class='Delimiter'>, 
+</span>                    <a href="../utils/misc/guc.c.html#LN468"><span class='Ref_to_Global_Var'>application_name</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN382"><span class='Ref_To_Local'>priority</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepInitConfig &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Update the LSNs on each queue based upon our latest state. This 
+ * implements a simple policy of first-valid-sync-standby-releases-waiter. 
+ * 
+ * Other policies are possible, which would change what we do here and 
+ * perhaps also which information we store as well. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN408"></a><span class='Declare_Function'>SyncRepReleaseWaiters</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN410"></a>    <span class='Keyword'>volatile </span><a href="../../include/replication/walsender_private.h.html#LN75"><span class='Ref_to_Typedef'>WalSndCtlData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>walsndctl</span> <span class='Operator'>= </span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Delimiter'>; 
+</span><a name="LN411"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>writePtr</span><span class='Delimiter'>; 
+</span><a name="LN412"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>flushPtr</span><span class='Delimiter'>; 
+</span><a name="LN413"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>applyPtr</span><span class='Delimiter'>; 
+</span><a name="LN414"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>got_recptr</span><span class='Delimiter'>; 
+</span><a name="LN415"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>am_sync</span><span class='Delimiter'>; 
+</span><a name="LN416"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>numwrite</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN417"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>numflush</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN418"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>numapply</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If this WALSender is serving a standby that is not on the list of 
+     * potential sync standbys then we have nothing to do. If we are still 
+     * starting up, still running base backup or the current flush position is 
+     * still invalid, then leave quickly also. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN69"><span class='Ref_to_Member'>sync_standby_priority</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>        <a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN36"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>&LT; </span><a href="../../include/replication/walsender_private.h.html#LN26"><span class='Ref_to_EnumConst'>WALSNDSTATE_STREAMING</span></a> <span class='Operator'>|| 
+</span>        <a href="../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN47"><span class='Ref_to_Member'>flush</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="syncrep.c.html#LN94"><span class='Ref_to_Global_Var'>announce_next_takeover</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We're a potential sync standby. Release waiters if there are enough 
+     * sync standbys and we are considered as sync. 
+     */ 
+</span>    <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check whether we are a sync standby or not, and calculate the synced 
+     * positions among all sync standbys. 
+     */ 
+</span>    <a href="syncrep.c.html#LN414"><span class='Ref_To_Local'>got_recptr</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN103"><span class='Ref_to_Proto'>SyncRepGetSyncRecPtr</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="syncrep.c.html#LN411"><span class='Ref_To_Local'>writePtr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="syncrep.c.html#LN412"><span class='Ref_To_Local'>flushPtr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="syncrep.c.html#LN413"><span class='Ref_To_Local'>applyPtr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="syncrep.c.html#LN415"><span class='Ref_To_Local'>am_sync</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we are managing a sync standby, though we weren't prior to this, 
+     * then announce we are now a sync standby. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN94"><span class='Ref_to_Global_Var'>announce_next_takeover</span></a> <span class='Operator'>&& </span><a href="syncrep.c.html#LN415"><span class='Ref_To_Local'>am_sync</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="syncrep.c.html#LN94"><span class='Ref_to_Global_Var'>announce_next_takeover</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN50"><span class='Ref_to_Member'>syncrep_method</span></a> <span class='Operator'>== </span><a href="../../include/replication/syncrep.h.html#LN35"><span class='Ref_to_Const'>SYNC_REP_PRIORITY</span></a><span class='Parentheses'>) 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"standby \"%s\" is now a synchronous standby with priority %u"</span><span class='Delimiter'>, 
+</span>                        <a href="../utils/misc/guc.c.html#LN468"><span class='Ref_to_Global_Var'>application_name</span></a><span class='Delimiter'>, </span><a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN69"><span class='Ref_to_Member'>sync_standby_priority</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"standby \"%s\" is now a candidate for quorum synchronous standby"</span><span class='Delimiter'>, 
+</span>                            <a href="../utils/misc/guc.c.html#LN468"><span class='Ref_to_Global_Var'>application_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the number of sync standbys is less than requested or we aren't 
+     * managing a sync standby then just leave. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="syncrep.c.html#LN414"><span class='Ref_To_Local'>got_recptr</span></a> <span class='Operator'>|| !</span><a href="syncrep.c.html#LN415"><span class='Ref_To_Local'>am_sync</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN94"><span class='Ref_to_Global_Var'>announce_next_takeover</span></a> <span class='Operator'>= !</span><a href="syncrep.c.html#LN415"><span class='Ref_To_Local'>am_sync</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Set the lsn first so that when we wake backends they will release up to 
+     * this location. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN410"><span class='Ref_To_Local'>walsndctl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN87"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>[</span><a href="../../include/replication/syncrep.h.html#LN23"><span class='Ref_to_Const'>SYNC_REP_WAIT_WRITE</span></a><span class='Delimiter'>] </span><span class='Operator'>&LT; </span><a href="syncrep.c.html#LN411"><span class='Ref_To_Local'>writePtr</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="syncrep.c.html#LN410"><span class='Ref_To_Local'>walsndctl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN87"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>[</span><a href="../../include/replication/syncrep.h.html#LN23"><span class='Ref_to_Const'>SYNC_REP_WAIT_WRITE</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="syncrep.c.html#LN411"><span class='Ref_To_Local'>writePtr</span></a><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN416"><span class='Ref_To_Local'>numwrite</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN101"><span class='Ref_to_Proto'>SyncRepWakeQueue</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="../../include/replication/syncrep.h.html#LN23"><span class='Ref_to_Const'>SYNC_REP_WAIT_WRITE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN410"><span class='Ref_To_Local'>walsndctl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN87"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>[</span><a href="../../include/replication/syncrep.h.html#LN24"><span class='Ref_to_Const'>SYNC_REP_WAIT_FLUSH</span></a><span class='Delimiter'>] </span><span class='Operator'>&LT; </span><a href="syncrep.c.html#LN412"><span class='Ref_To_Local'>flushPtr</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="syncrep.c.html#LN410"><span class='Ref_To_Local'>walsndctl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN87"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>[</span><a href="../../include/replication/syncrep.h.html#LN24"><span class='Ref_to_Const'>SYNC_REP_WAIT_FLUSH</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="syncrep.c.html#LN412"><span class='Ref_To_Local'>flushPtr</span></a><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN417"><span class='Ref_To_Local'>numflush</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN101"><span class='Ref_to_Proto'>SyncRepWakeQueue</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="../../include/replication/syncrep.h.html#LN24"><span class='Ref_to_Const'>SYNC_REP_WAIT_FLUSH</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN410"><span class='Ref_To_Local'>walsndctl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN87"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>[</span><a href="../../include/replication/syncrep.h.html#LN25"><span class='Ref_to_Const'>SYNC_REP_WAIT_APPLY</span></a><span class='Delimiter'>] </span><span class='Operator'>&LT; </span><a href="syncrep.c.html#LN413"><span class='Ref_To_Local'>applyPtr</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="syncrep.c.html#LN410"><span class='Ref_To_Local'>walsndctl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN87"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>[</span><a href="../../include/replication/syncrep.h.html#LN25"><span class='Ref_to_Const'>SYNC_REP_WAIT_APPLY</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="syncrep.c.html#LN413"><span class='Ref_To_Local'>applyPtr</span></a><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN418"><span class='Ref_To_Local'>numapply</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN101"><span class='Ref_to_Proto'>SyncRepWakeQueue</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="../../include/replication/syncrep.h.html#LN25"><span class='Ref_to_Const'>SYNC_REP_WAIT_APPLY</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, </span><span class='String'>"released %d procs up to write %X/%X, %d procs up to flush %X/%X, %d procs up to apply %X/%X"</span><span class='Delimiter'>, 
+</span>         <a href="syncrep.c.html#LN416"><span class='Ref_To_Local'>numwrite</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="syncrep.c.html#LN411"><span class='Ref_To_Local'>writePtr</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="syncrep.c.html#LN411"><span class='Ref_To_Local'>writePtr</span></a><span class='Delimiter'>, 
+</span>         <a href="syncrep.c.html#LN417"><span class='Ref_To_Local'>numflush</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="syncrep.c.html#LN412"><span class='Ref_To_Local'>flushPtr</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="syncrep.c.html#LN412"><span class='Ref_To_Local'>flushPtr</span></a><span class='Delimiter'>, 
+</span>         <a href="syncrep.c.html#LN418"><span class='Ref_To_Local'>numapply</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="syncrep.c.html#LN413"><span class='Ref_To_Local'>applyPtr</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><a href="syncrep.c.html#LN413"><span class='Ref_To_Local'>applyPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepReleaseWaiters &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Calculate the synced Write, Flush and Apply positions among sync standbys. 
+ * 
+ * Return false if the number of sync standbys is less than 
+ * synchronous_standby_names specifies. Otherwise return true and 
+ * store the positions into *writePtr, *flushPtr and *applyPtr. 
+ * 
+ * On return, *am_sync is set to true if this walsender is connecting to 
+ * sync standby. Otherwise it's set to false. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN514"></a><span class='Declare_Function'>SyncRepGetSyncRecPtr</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>writePtr</span><span class='Delimiter'>, </span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>flushPtr</span><span class='Delimiter'>, 
+</span><a name="LN515"></a>                     <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>applyPtr</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>am_sync</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN517"></a>    <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>sync_standbys</span><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="syncrep.c.html#LN514"><span class='Ref_to_Parameter'>writePtr</span></a> <span class='Operator'>= </span><a href="../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="syncrep.c.html#LN514"><span class='Ref_to_Parameter'>flushPtr</span></a> <span class='Operator'>= </span><a href="../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="syncrep.c.html#LN515"><span class='Ref_to_Parameter'>applyPtr</span></a> <span class='Operator'>= </span><a href="../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="syncrep.c.html#LN515"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get standbys that are considered as synchronous at this moment */ 
+</span>    <a href="syncrep.c.html#LN517"><span class='Ref_To_Local'>sync_standbys</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN76"><span class='Ref_to_Proto'>SyncRepGetSyncStandbys</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN515"><span class='Ref_to_Parameter'>am_sync</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Quick exit if we are not managing a sync standby or there are not 
+     * enough synchronous standbys. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="syncrep.c.html#LN515"><span class='Ref_to_Parameter'>am_sync</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>        <a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL </span><span class='Operator'>|| 
+</span>        <a href="../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN517"><span class='Ref_To_Local'>sync_standbys</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN48"><span class='Ref_to_Member'>num_sync</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../include/nodes/pg_list.h.html#LN265"><span class='Ref_to_Proto'>list_free</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN517"><span class='Ref_To_Local'>sync_standbys</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * In a priority-based sync replication, the synced positions are the 
+     * oldest ones among sync standbys. In a quorum-based, they are the Nth 
+     * latest ones. 
+     * 
+     * SyncRepGetNthLatestSyncRecPtr() also can calculate the oldest 
+     * positions. But we use SyncRepGetOldestSyncRecPtr() for that calculation 
+     * because it's a bit more efficient. 
+     * 
+     * XXX If the numbers of current and requested sync standbys are the same, 
+     * we can use SyncRepGetOldestSyncRecPtr() to calculate the synced 
+     * positions even in a quorum-based sync replication. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN50"><span class='Ref_to_Member'>syncrep_method</span></a> <span class='Operator'>== </span><a href="../../include/replication/syncrep.h.html#LN35"><span class='Ref_to_Const'>SYNC_REP_PRIORITY</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="syncrep.c.html#LN107"><span class='Ref_to_Proto'>SyncRepGetOldestSyncRecPtr</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN514"><span class='Ref_to_Parameter'>writePtr</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN514"><span class='Ref_to_Parameter'>flushPtr</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN515"><span class='Ref_to_Parameter'>applyPtr</span></a><span class='Delimiter'>, 
+</span>                                   <a href="syncrep.c.html#LN517"><span class='Ref_To_Local'>sync_standbys</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="syncrep.c.html#LN111"><span class='Ref_to_Proto'>SyncRepGetNthLatestSyncRecPtr</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN514"><span class='Ref_to_Parameter'>writePtr</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN514"><span class='Ref_to_Parameter'>flushPtr</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN515"><span class='Ref_to_Parameter'>applyPtr</span></a><span class='Delimiter'>, 
+</span>                                      <a href="syncrep.c.html#LN517"><span class='Ref_To_Local'>sync_standbys</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN48"><span class='Ref_to_Member'>num_sync</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../include/nodes/pg_list.h.html#LN265"><span class='Ref_to_Proto'>list_free</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN517"><span class='Ref_To_Local'>sync_standbys</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepGetSyncRecPtr &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Calculate the oldest Write, Flush and Apply positions among sync standbys. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN571"></a><span class='Declare_Function'>SyncRepGetOldestSyncRecPtr</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>writePtr</span><span class='Delimiter'>, </span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>flushPtr</span><span class='Delimiter'>, 
+</span><a name="LN572"></a>                           <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>applyPtr</span><span class='Delimiter'>, </span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>sync_standbys</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN574"></a>    <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>cell</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Scan through all sync standbys and calculate the oldest Write, Flush 
+     * and Apply positions. 
+     */ 
+</span>    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN574"><span class='Ref_To_Local'>cell</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN572"><span class='Ref_to_Parameter'>sync_standbys</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN582"></a>        <a href="../../include/replication/walsender_private.h.html#LN33"><span class='Ref_to_Struct'>WalSnd</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>walsnd</span> <span class='Operator'>= &</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN96"><span class='Ref_to_Member'>walsnds</span></a><span class='Delimiter'>[</span><a href="../../include/nodes/pg_list.h.html#LN106"><span class='Ref_to_Macro'>lfirst_int</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN574"><span class='Ref_To_Local'>cell</span></a><span class='Parentheses'>)</span><span class='Delimiter'>]; 
+</span><a name="LN583"></a>        <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>write</span><span class='Delimiter'>; 
+</span><a name="LN584"></a>        <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>flush</span><span class='Delimiter'>; 
+</span><a name="LN585"></a>        <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>apply</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="syncrep.c.html#LN582"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN56"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN583"><span class='Ref_To_Local'>write</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN582"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN46"><span class='Ref_to_Member'>write</span></a><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN584"><span class='Ref_To_Local'>flush</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN582"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN47"><span class='Ref_to_Member'>flush</span></a><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN585"><span class='Ref_To_Local'>apply</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN582"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN48"><span class='Ref_to_Member'>apply</span></a><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="syncrep.c.html#LN582"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN56"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="syncrep.c.html#LN571"><span class='Ref_to_Parameter'>writePtr</span></a><span class='Parentheses'>) </span><span class='Operator'>|| *</span><a href="syncrep.c.html#LN571"><span class='Ref_to_Parameter'>writePtr</span></a> <span class='Operator'>&GT; </span><a href="syncrep.c.html#LN583"><span class='Ref_To_Local'>write</span></a><span class='Parentheses'>)</span> 
+            <span class='Operator'>*</span><a href="syncrep.c.html#LN571"><span class='Ref_to_Parameter'>writePtr</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN583"><span class='Ref_To_Local'>write</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="syncrep.c.html#LN571"><span class='Ref_to_Parameter'>flushPtr</span></a><span class='Parentheses'>) </span><span class='Operator'>|| *</span><a href="syncrep.c.html#LN571"><span class='Ref_to_Parameter'>flushPtr</span></a> <span class='Operator'>&GT; </span><a href="syncrep.c.html#LN584"><span class='Ref_To_Local'>flush</span></a><span class='Parentheses'>)</span> 
+            <span class='Operator'>*</span><a href="syncrep.c.html#LN571"><span class='Ref_to_Parameter'>flushPtr</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN584"><span class='Ref_To_Local'>flush</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="syncrep.c.html#LN572"><span class='Ref_to_Parameter'>applyPtr</span></a><span class='Parentheses'>) </span><span class='Operator'>|| *</span><a href="syncrep.c.html#LN572"><span class='Ref_to_Parameter'>applyPtr</span></a> <span class='Operator'>&GT; </span><a href="syncrep.c.html#LN585"><span class='Ref_To_Local'>apply</span></a><span class='Parentheses'>)</span> 
+            <span class='Operator'>*</span><a href="syncrep.c.html#LN572"><span class='Ref_to_Parameter'>applyPtr</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN585"><span class='Ref_To_Local'>apply</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepGetOldestSyncRecPtr &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Calculate the Nth latest Write, Flush and Apply positions among sync 
+ * standbys. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN607"></a><span class='Declare_Function'>SyncRepGetNthLatestSyncRecPtr</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>writePtr</span><span class='Delimiter'>, </span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>flushPtr</span><span class='Delimiter'>, 
+</span><a name="LN608"></a>                        <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>applyPtr</span><span class='Delimiter'>, </span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>sync_standbys</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>nth</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN610"></a>    <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>cell</span><span class='Delimiter'>; 
+</span><a name="LN611"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Local'>write_array</span><span class='Delimiter'>; 
+</span><a name="LN612"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Local'>flush_array</span><span class='Delimiter'>; 
+</span><a name="LN613"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Local'>apply_array</span><span class='Delimiter'>; 
+</span><a name="LN614"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>len</span><span class='Delimiter'>; 
+</span><a name="LN615"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="syncrep.c.html#LN614"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN608"><span class='Ref_to_Parameter'>sync_standbys</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="syncrep.c.html#LN611"><span class='Ref_To_Local'>write_array</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="syncrep.c.html#LN614"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="syncrep.c.html#LN612"><span class='Ref_To_Local'>flush_array</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="syncrep.c.html#LN614"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="syncrep.c.html#LN613"><span class='Ref_To_Local'>apply_array</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="syncrep.c.html#LN614"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN610"><span class='Ref_To_Local'>cell</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN608"><span class='Ref_to_Parameter'>sync_standbys</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN624"></a>        <a href="../../include/replication/walsender_private.h.html#LN33"><span class='Ref_to_Struct'>WalSnd</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>walsnd</span> <span class='Operator'>= &</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN96"><span class='Ref_to_Member'>walsnds</span></a><span class='Delimiter'>[</span><a href="../../include/nodes/pg_list.h.html#LN106"><span class='Ref_to_Macro'>lfirst_int</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN610"><span class='Ref_To_Local'>cell</span></a><span class='Parentheses'>)</span><span class='Delimiter'>]; 
+</span> 
+        <a href="../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="syncrep.c.html#LN624"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN56"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN611"><span class='Ref_To_Local'>write_array</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN615"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="syncrep.c.html#LN624"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN46"><span class='Ref_to_Member'>write</span></a><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN612"><span class='Ref_To_Local'>flush_array</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN615"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="syncrep.c.html#LN624"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN47"><span class='Ref_to_Member'>flush</span></a><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN613"><span class='Ref_To_Local'>apply_array</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN615"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="syncrep.c.html#LN624"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN48"><span class='Ref_to_Member'>apply</span></a><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="syncrep.c.html#LN624"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN56"><span class='Ref_to_Member'>mutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="syncrep.c.html#LN615"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Sort each array in descending order */ 
+</span>    <a href="../../include/port.h.html#LN439"><span class='Ref_to_Macro'>qsort</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN611"><span class='Ref_To_Local'>write_array</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN614"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="syncrep.c.html#LN118"><span class='Ref_to_Proto'>cmp_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/port.h.html#LN439"><span class='Ref_to_Macro'>qsort</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN612"><span class='Ref_To_Local'>flush_array</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN614"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="syncrep.c.html#LN118"><span class='Ref_to_Proto'>cmp_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/port.h.html#LN439"><span class='Ref_to_Macro'>qsort</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN613"><span class='Ref_To_Local'>apply_array</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN614"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="syncrep.c.html#LN118"><span class='Ref_to_Proto'>cmp_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get Nth latest Write, Flush, Apply positions */ 
+</span>    <span class='Operator'>*</span><a href="syncrep.c.html#LN607"><span class='Ref_to_Parameter'>writePtr</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN611"><span class='Ref_To_Local'>write_array</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN608"><span class='Ref_to_Parameter'>nth</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span>    <span class='Operator'>*</span><a href="syncrep.c.html#LN607"><span class='Ref_to_Parameter'>flushPtr</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN612"><span class='Ref_To_Local'>flush_array</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN608"><span class='Ref_to_Parameter'>nth</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span>    <span class='Operator'>*</span><a href="syncrep.c.html#LN608"><span class='Ref_to_Parameter'>applyPtr</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN613"><span class='Ref_To_Local'>apply_array</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN608"><span class='Ref_to_Parameter'>nth</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span> 
+    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN611"><span class='Ref_To_Local'>write_array</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN612"><span class='Ref_To_Local'>flush_array</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN613"><span class='Ref_To_Local'>apply_array</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepGetNthLatestSyncRecPtr &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Compare lsn in order to sort array in descending order. 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN654"></a><span class='Declare_Function'>cmp_lsn</span><span class='Parentheses'>(</span><span class='Keyword'>const void </span><span class='Operator'>*</span><span class='Declare_Parameter'>a</span><span class='Delimiter'>, </span><span class='Keyword'>const void </span><span class='Operator'>*</span><span class='Declare_Parameter'>b</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN656"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>lsn1</span> <span class='Operator'>= *</span><span class='Parentheses'>((</span><span class='Keyword'>const </span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="syncrep.c.html#LN654"><span class='Ref_to_Parameter'>a</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN657"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>lsn2</span> <span class='Operator'>= *</span><span class='Parentheses'>((</span><span class='Keyword'>const </span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="syncrep.c.html#LN654"><span class='Ref_to_Parameter'>b</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN656"><span class='Ref_To_Local'>lsn1</span></a> <span class='Operator'>&GT; </span><a href="syncrep.c.html#LN657"><span class='Ref_To_Local'>lsn2</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN656"><span class='Ref_To_Local'>lsn1</span></a> <span class='Operator'>== </span><a href="syncrep.c.html#LN657"><span class='Ref_To_Local'>lsn2</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Return the list of sync standbys, or NIL if no sync standby is connected. 
+ * 
+ * The caller must hold SyncRepLock. 
+ * 
+ * On return, *am_sync is set to true if this walsender is connecting to 
+ * sync standby. Otherwise it's set to false. 
+ */ 
+</span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN676"></a><span class='Declare_Function'>SyncRepGetSyncStandbys</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>am_sync</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Set default result */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN676"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="syncrep.c.html#LN676"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Quick exit if sync replication is not requested */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN50"><span class='Ref_to_Member'>syncrep_method</span></a> <span class='Operator'>== </span><a href="../../include/replication/syncrep.h.html#LN35"><span class='Ref_to_Const'>SYNC_REP_PRIORITY</span></a><span class='Parentheses'>) </span><span class='Operator'>? 
+</span>        <a href="syncrep.c.html#LN116"><span class='Ref_to_Proto'>SyncRepGetSyncStandbysPriority</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN676"><span class='Ref_to_Parameter'>am_sync</span></a><span class='Parentheses'>) </span><span class='Operator'>: 
+</span>        <a href="syncrep.c.html#LN117"><span class='Ref_to_Proto'>SyncRepGetSyncStandbysQuorum</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN676"><span class='Ref_to_Parameter'>am_sync</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Return the list of all the candidates for quorum sync standbys, 
+ * or NIL if no such standby is connected. 
+ * 
+ * The caller must hold SyncRepLock. This function must be called only in 
+ * a quorum-based sync replication. 
+ * 
+ * On return, *am_sync is set to true if this walsender is connecting to 
+ * sync standby. Otherwise it's set to false. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN702"></a><span class='Declare_Function'>SyncRepGetSyncStandbysQuorum</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>am_sync</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN704"></a>    <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>result</span> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN705"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN706"></a>    <span class='Keyword'>volatile </span><a href="../../include/replication/walsender_private.h.html#LN33"><span class='Ref_to_Struct'>WalSnd</span></a> <span class='Operator'>*</span><span class='Declare_Local'>walsnd</span><span class='Delimiter'>;</span>    <span class='Comment_Multi_Line'>/* Use volatile pointer to prevent code 
+                                 * rearrangement */ 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN50"><span class='Ref_to_Member'>syncrep_method</span></a> <span class='Operator'>== </span><a href="../../include/replication/syncrep.h.html#LN36"><span class='Ref_to_Const'>SYNC_REP_QUORUM</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN705"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="syncrep.c.html#LN705"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="walsender.c.html#LN119"><span class='Ref_to_Global_Var'>max_wal_senders</span></a><span class='Delimiter'>; </span><a href="syncrep.c.html#LN705"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="syncrep.c.html#LN706"><span class='Ref_To_Local'>walsnd</span></a> <span class='Operator'>= &</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN96"><span class='Ref_to_Member'>walsnds</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN705"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must be active */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN706"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN35"><span class='Ref_to_Member'>pid</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must be streaming */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN706"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN36"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>!= </span><a href="../../include/replication/walsender_private.h.html#LN26"><span class='Ref_to_EnumConst'>WALSNDSTATE_STREAMING</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must be synchronous */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN706"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN69"><span class='Ref_to_Member'>sync_standby_priority</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must have a valid flush position */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN706"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN47"><span class='Ref_to_Member'>flush</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Consider this standby as a candidate for quorum sync standbys and 
+         * append it to the result. 
+         */ 
+</span>        <a href="syncrep.c.html#LN704"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../nodes/list.c.html#LN144"><span class='Ref_to_Func'>lappend_int</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN704"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN705"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN702"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& </span><a href="syncrep.c.html#LN706"><span class='Ref_To_Local'>walsnd</span></a> <span class='Operator'>== </span><a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Parentheses'>) 
+</span>            <span class='Operator'>*</span><a href="syncrep.c.html#LN702"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;max_wal_senders... &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="syncrep.c.html#LN704"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepGetSyncStandbysQuorum &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Return the list of sync standbys chosen based on their priorities, 
+ * or NIL if no sync standby is connected. 
+ * 
+ * If there are multiple standbys with the same priority, 
+ * the first one found is selected preferentially. 
+ * 
+ * The caller must hold SyncRepLock. This function must be called only in 
+ * a priority-based sync replication. 
+ * 
+ * On return, *am_sync is set to true if this walsender is connecting to 
+ * sync standby. Otherwise it's set to false. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN757"></a><span class='Declare_Function'>SyncRepGetSyncStandbysPriority</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>am_sync</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN759"></a>    <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>result</span> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN760"></a>    <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>pending</span> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN761"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>lowest_priority</span><span class='Delimiter'>; 
+</span><a name="LN762"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>next_highest_priority</span><span class='Delimiter'>; 
+</span><a name="LN763"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>this_priority</span><span class='Delimiter'>; 
+</span><a name="LN764"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>priority</span><span class='Delimiter'>; 
+</span><a name="LN765"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN766"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>am_in_pending</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN767"></a>    <span class='Keyword'>volatile </span><a href="../../include/replication/walsender_private.h.html#LN33"><span class='Ref_to_Struct'>WalSnd</span></a> <span class='Operator'>*</span><span class='Declare_Local'>walsnd</span><span class='Delimiter'>;</span>    <span class='Comment_Multi_Line'>/* Use volatile pointer to prevent code 
+                                 * rearrangement */ 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN50"><span class='Ref_to_Member'>syncrep_method</span></a> <span class='Operator'>== </span><a href="../../include/replication/syncrep.h.html#LN35"><span class='Ref_to_Const'>SYNC_REP_PRIORITY</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="syncrep.c.html#LN761"><span class='Ref_To_Local'>lowest_priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN51"><span class='Ref_to_Member'>nmembers</span></a><span class='Delimiter'>; 
+</span>    <a href="syncrep.c.html#LN762"><span class='Ref_To_Local'>next_highest_priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN761"><span class='Ref_To_Local'>lowest_priority</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Find the sync standbys which have the highest priority (i.e, 1). Also 
+     * store all the other potential sync standbys into the pending list, in 
+     * order to scan it later and find other sync standbys from it quickly. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN765"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="syncrep.c.html#LN765"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="walsender.c.html#LN119"><span class='Ref_to_Global_Var'>max_wal_senders</span></a><span class='Delimiter'>; </span><a href="syncrep.c.html#LN765"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a> <span class='Operator'>= &</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN96"><span class='Ref_to_Member'>walsnds</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN765"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must be active */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN35"><span class='Ref_to_Member'>pid</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must be streaming */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN36"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>!= </span><a href="../../include/replication/walsender_private.h.html#LN26"><span class='Ref_to_EnumConst'>WALSNDSTATE_STREAMING</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must be synchronous */ 
+</span>        <a href="syncrep.c.html#LN763"><span class='Ref_To_Local'>this_priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN69"><span class='Ref_to_Member'>sync_standby_priority</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN763"><span class='Ref_To_Local'>this_priority</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must have a valid flush position */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN47"><span class='Ref_to_Member'>flush</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If the priority is equal to 1, consider this standby as sync and 
+         * append it to the result. Otherwise append this standby to the 
+         * pending list to check if it's actually sync or not later. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN763"><span class='Ref_To_Local'>this_priority</span></a> <span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../nodes/list.c.html#LN144"><span class='Ref_to_Func'>lappend_int</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN765"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN757"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& </span><a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a> <span class='Operator'>== </span><a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Parentheses'>) 
+</span>                <span class='Operator'>*</span><a href="syncrep.c.html#LN757"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN48"><span class='Ref_to_Member'>num_sync</span></a><span class='Parentheses'>)</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="../../include/nodes/pg_list.h.html#LN265"><span class='Ref_to_Proto'>list_free</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>return</span> <a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>;</span>  <span class='Comment_Single_Line'>/* Exit if got enough sync standbys */ 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="../nodes/list.c.html#LN144"><span class='Ref_to_Func'>lappend_int</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN765"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN757"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& </span><a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a> <span class='Operator'>== </span><a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Parentheses'>) 
+</span>                <a href="syncrep.c.html#LN766"><span class='Ref_To_Local'>am_in_pending</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Track the highest priority among the standbys in the pending 
+             * list, in order to use it as the starting priority for later 
+             * scan of the list. This is useful to find quickly the sync 
+             * standbys from the pending list later because we can skip 
+             * unnecessary scans for the unused priorities. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN763"><span class='Ref_To_Local'>this_priority</span></a> <span class='Operator'>&LT; </span><a href="syncrep.c.html#LN762"><span class='Ref_To_Local'>next_highest_priority</span></a><span class='Parentheses'>) 
+</span>                <a href="syncrep.c.html#LN762"><span class='Ref_To_Local'>next_highest_priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN763"><span class='Ref_To_Local'>this_priority</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;max_wal_senders... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Consider all pending standbys as sync if the number of them plus 
+     * already-found sync ones is lower than the configuration requests. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><a href="../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT;= </span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN48"><span class='Ref_to_Member'>num_sync</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN841"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>needfree</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>!= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a> <span class='Operator'>&& </span><a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>!= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Set *am_sync to true if this walsender is in the pending list 
+         * because all pending standbys are considered as sync. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN757"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& !</span><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="syncrep.c.html#LN757"><span class='Ref_to_Parameter'>am_sync</span></a><span class='Parentheses'>))</span> 
+            <span class='Operator'>*</span><a href="syncrep.c.html#LN757"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN766"><span class='Ref_To_Local'>am_in_pending</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN219"><span class='Ref_to_Proto'>list_concat</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN841"><span class='Ref_To_Local'>needfree</span></a><span class='Parentheses'>) 
+</span>            <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Find the sync standbys from the pending list. 
+     */ 
+</span>    <a href="syncrep.c.html#LN764"><span class='Ref_To_Local'>priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN762"><span class='Ref_To_Local'>next_highest_priority</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN764"><span class='Ref_To_Local'>priority</span></a> <span class='Operator'>&LT;= </span><a href="syncrep.c.html#LN761"><span class='Ref_To_Local'>lowest_priority</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN862"></a>        <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>cell</span><span class='Delimiter'>; 
+</span><a name="LN863"></a>        <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>prev</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN864"></a>        <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>next</span><span class='Delimiter'>; 
+</span> 
+        <a href="syncrep.c.html#LN762"><span class='Ref_To_Local'>next_highest_priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN761"><span class='Ref_To_Local'>lowest_priority</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN862"><span class='Ref_To_Local'>cell</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN75"><span class='Ref_to_Func'>list_head</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; </span><a href="syncrep.c.html#LN862"><span class='Ref_To_Local'>cell</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="syncrep.c.html#LN862"><span class='Ref_To_Local'>cell</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN864"><span class='Ref_To_Local'>next</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="syncrep.c.html#LN765"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN106"><span class='Ref_to_Macro'>lfirst_int</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN862"><span class='Ref_To_Local'>cell</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a> <span class='Operator'>= &</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN96"><span class='Ref_to_Member'>walsnds</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN765"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+            <a href="syncrep.c.html#LN864"><span class='Ref_To_Local'>next</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN104"><span class='Ref_to_Macro'>lnext</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN862"><span class='Ref_To_Local'>cell</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="syncrep.c.html#LN763"><span class='Ref_To_Local'>this_priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN69"><span class='Ref_to_Member'>sync_standby_priority</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN763"><span class='Ref_To_Local'>this_priority</span></a> <span class='Operator'>== </span><a href="syncrep.c.html#LN764"><span class='Ref_To_Local'>priority</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../nodes/list.c.html#LN144"><span class='Ref_to_Func'>lappend_int</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN765"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN757"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& </span><a href="syncrep.c.html#LN767"><span class='Ref_To_Local'>walsnd</span></a> <span class='Operator'>== </span><a href="walsender.c.html#LN110"><span class='Ref_to_Global_Var'>MyWalSnd</span></a><span class='Parentheses'>) 
+</span>                    <span class='Operator'>*</span><a href="syncrep.c.html#LN757"><span class='Ref_to_Parameter'>am_sync</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * We should always exit here after the scan of pending list 
+                 * starts because we know that the list has enough elements to 
+                 * reach SyncRepConfig-&GT;num_sync. 
+                 */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN48"><span class='Ref_to_Member'>num_sync</span></a><span class='Parentheses'>)</span> 
+                <span class='Delimiter'>{ 
+</span>                    <a href="../../include/nodes/pg_list.h.html#LN265"><span class='Ref_to_Proto'>list_free</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>return</span> <a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* Exit if got enough sync standbys */ 
+</span>                <span class='Delimiter'>} 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * Remove the entry for this sync standby from the list to 
+                 * prevent us from looking at the same entry again. 
+                 */ 
+</span>                <a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN238"><span class='Ref_to_Proto'>list_delete_cell</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN760"><span class='Ref_To_Local'>pending</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN862"><span class='Ref_To_Local'>cell</span></a><span class='Delimiter'>, </span><a href="syncrep.c.html#LN863"><span class='Ref_To_Local'>prev</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if this_priority==priori... &raquo; </span> 
+ 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN763"><span class='Ref_To_Local'>this_priority</span></a> <span class='Operator'>&LT; </span><a href="syncrep.c.html#LN762"><span class='Ref_To_Local'>next_highest_priority</span></a><span class='Parentheses'>) 
+</span>                <a href="syncrep.c.html#LN762"><span class='Ref_To_Local'>next_highest_priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN763"><span class='Ref_To_Local'>this_priority</span></a><span class='Delimiter'>; 
+</span> 
+            <a href="syncrep.c.html#LN863"><span class='Ref_To_Local'>prev</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN862"><span class='Ref_To_Local'>cell</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for cell=list_head(pendin... &raquo; </span> 
+ 
+        <a href="syncrep.c.html#LN764"><span class='Ref_To_Local'>priority</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN762"><span class='Ref_To_Local'>next_highest_priority</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while priority&LT;=lowest_prio... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* never reached, but keep compiler quiet */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="syncrep.c.html#LN759"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepGetSyncStandbysPriority &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Check if we are in the list of sync standbys, and if so, determine 
+ * priority sequence. Return priority if set, or zero to indicate that 
+ * we are not a potential sync standby. 
+ * 
+ * Compare the parameter SyncRepStandbyNames against the application_name 
+ * for this WALSender, or allow any name if we find a wildcard "*". 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN925"></a><span class='Declare_Function'>SyncRepGetStandbyPriority</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN927"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>standby_name</span><span class='Delimiter'>; 
+</span><a name="LN928"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>priority</span><span class='Delimiter'>; 
+</span><a name="LN929"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Since synchronous cascade replication is not allowed, we always set the 
+     * priority of cascading walsender to zero. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="walsender.c.html#LN114"><span class='Ref_to_Global_Var'>am_cascading_walsender</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="syncrep.c.html#LN91"><span class='Ref_to_Macro'>SyncStandbysDefined</span></a><span class='Parentheses'>() </span><span class='Operator'>|| </span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="syncrep.c.html#LN927"><span class='Ref_To_Local'>standby_name</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN53"><span class='Ref_to_Member'>member_names</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN928"><span class='Ref_To_Local'>priority</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="syncrep.c.html#LN928"><span class='Ref_To_Local'>priority</span></a> <span class='Operator'>&LT;= </span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN51"><span class='Ref_to_Member'>nmembers</span></a><span class='Delimiter'>; </span><a href="syncrep.c.html#LN928"><span class='Ref_To_Local'>priority</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../port/pgstrcasecmp.c.html#LN34"><span class='Ref_to_Func'>pg_strcasecmp</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN927"><span class='Ref_To_Local'>standby_name</span></a><span class='Delimiter'>, </span><a href="../utils/misc/guc.c.html#LN468"><span class='Ref_to_Global_Var'>application_name</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>            strcmp<span class='Parentheses'>(</span><a href="syncrep.c.html#LN927"><span class='Ref_To_Local'>standby_name</span></a><span class='Delimiter'>, </span><span class='String'>"*"</span><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="syncrep.c.html#LN929"><span class='Ref_To_Local'>found</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="syncrep.c.html#LN927"><span class='Ref_To_Local'>standby_name</span></a> <span class='Operator'>+= </span>strlen<span class='Parentheses'>(</span><a href="syncrep.c.html#LN927"><span class='Ref_To_Local'>standby_name</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="syncrep.c.html#LN929"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * In quorum-based sync replication, all the standbys in the list have the 
+     * same priority, one. 
+     */ 
+</span>    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN50"><span class='Ref_to_Member'>syncrep_method</span></a> <span class='Operator'>== </span><a href="../../include/replication/syncrep.h.html#LN35"><span class='Ref_to_Const'>SYNC_REP_PRIORITY</span></a><span class='Parentheses'>) </span><span class='Operator'>? </span><a href="syncrep.c.html#LN928"><span class='Ref_To_Local'>priority</span></a> <span class='Operator'>: </span><span class='Number'>1</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepGetStandbyPriority &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Walk the specified queue from head.  Set the state of any backends that 
+ * need to be woken, remove them from the queue, and then wake them. 
+ * Pass all = true to wake whole queue; otherwise, just wake up to 
+ * the walsender's LSN. 
+ * 
+ * Must hold SyncRepLock. 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN972"></a><span class='Declare_Function'>SyncRepWakeQueue</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>all</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>mode</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN974"></a>    <span class='Keyword'>volatile </span><a href="../../include/replication/walsender_private.h.html#LN75"><span class='Ref_to_Typedef'>WalSndCtlData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>walsndctl</span> <span class='Operator'>= </span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Delimiter'>; 
+</span><a name="LN975"></a>    <a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>proc</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN976"></a>    <a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>thisproc</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN977"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>numprocs</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN972"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="syncrep.c.html#LN972"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>&LT; </span><a href="../../include/replication/syncrep.h.html#LN27"><span class='Ref_to_Const'>NUM_SYNC_REP_WAIT_MODE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN121"><span class='Ref_to_Proto'>SyncRepQueueIsOrderedByLSN</span></a><span class='Parentheses'>(</span><a href="syncrep.c.html#LN972"><span class='Ref_to_Parameter'>mode</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="syncrep.c.html#LN975"><span class='Ref_To_Local'>proc</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/storage/shmem.h.html#LN72"><span class='Ref_to_Proto'>SHMQueueNext</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN972"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                   <span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN972"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                   <a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a><span class='Delimiter'>, </span>syncRepLinks<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN975"><span class='Ref_To_Local'>proc</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Assume the queue is ordered by LSN 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="syncrep.c.html#LN972"><span class='Ref_to_Parameter'>all</span></a> <span class='Operator'>&& </span><a href="syncrep.c.html#LN974"><span class='Ref_To_Local'>walsndctl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN87"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN972"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>] </span><span class='Operator'>&LT; </span><a href="syncrep.c.html#LN975"><span class='Ref_To_Local'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN146"><span class='Ref_to_Member'>waitLSN</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <a href="syncrep.c.html#LN977"><span class='Ref_To_Local'>numprocs</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Move to next proc, so we can delete thisproc from the queue. 
+         * thisproc is valid, proc may be NULL after this. 
+         */ 
+</span>        <a href="syncrep.c.html#LN976"><span class='Ref_To_Local'>thisproc</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN975"><span class='Ref_To_Local'>proc</span></a><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN975"><span class='Ref_To_Local'>proc</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/storage/shmem.h.html#LN72"><span class='Ref_to_Proto'>SHMQueueNext</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN972"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                       <span class='Operator'>&</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN975"><span class='Ref_To_Local'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                       <a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a><span class='Delimiter'>, </span>syncRepLinks<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Set state to complete; see SyncRepWaitForLSN() for discussion of 
+         * the various states. 
+         */ 
+</span>        <a href="syncrep.c.html#LN976"><span class='Ref_To_Local'>thisproc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN147"><span class='Ref_to_Member'>syncRepState</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN32"><span class='Ref_to_Const'>SYNC_REP_WAIT_COMPLETE</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Remove thisproc from queue. 
+         */ 
+</span>        <a href="../storage/ipc/shmqueue.c.html#LN66"><span class='Ref_to_Func'>SHMQueueDelete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN976"><span class='Ref_To_Local'>thisproc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Wake only when we have set state and removed from queue. 
+         */ 
+</span>        <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN976"><span class='Ref_To_Local'>thisproc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN102"><span class='Ref_to_Member'>procLatch</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="syncrep.c.html#LN977"><span class='Ref_To_Local'>numprocs</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while proc &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="syncrep.c.html#LN977"><span class='Ref_To_Local'>numprocs</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepWakeQueue &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The checkpointer calls this as needed to update the shared 
+ * sync_standbys_defined flag, so that backends don't remain permanently wedged 
+ * if synchronous_standby_names is unset.  It's safe to check the current value 
+ * without the lock, because it's only ever updated by one process.  But we 
+ * must take the lock to change it. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN1033"></a><span class='Declare_Function'>SyncRepUpdateSyncStandbysDefined</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1035"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>sync_standbys_defined</span> <span class='Operator'>= </span><a href="syncrep.c.html#LN91"><span class='Ref_to_Macro'>SyncStandbysDefined</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN1035"><span class='Ref_To_Local'>sync_standbys_defined</span></a> <span class='Operator'>!= </span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN94"><span class='Ref_to_Member'>sync_standbys_defined</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If synchronous_standby_names has been reset to empty, it's futile 
+         * for backends to continue to waiting.  Since the user no longer 
+         * wants synchronous replication, we'd better wake them up. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="syncrep.c.html#LN1035"><span class='Ref_To_Local'>sync_standbys_defined</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN1048"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN1048"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="syncrep.c.html#LN1048"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="../../include/replication/syncrep.h.html#LN27"><span class='Ref_to_Const'>NUM_SYNC_REP_WAIT_MODE</span></a><span class='Delimiter'>; </span><a href="syncrep.c.html#LN1048"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>                <a href="syncrep.c.html#LN101"><span class='Ref_to_Proto'>SyncRepWakeQueue</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Delimiter'>, </span><a href="syncrep.c.html#LN1048"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Only allow people to join the queue when there are synchronous 
+         * standbys defined.  Without this interlock, there's a race 
+         * condition: we might wake up all the current waiters; then, some 
+         * backend that hasn't yet reloaded its config might go to sleep on 
+         * the queue (and never wake up).  This prevents that. 
+         */ 
+</span>        <a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN94"><span class='Ref_to_Member'>sync_standbys_defined</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN1035"><span class='Ref_To_Local'>sync_standbys_defined</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncRepLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if sync_standbys_defined... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end SyncRepUpdateSyncStandbysDefined &raquo; </span> 
+ 
+<span class='Directive'>#ifdef</span> USE_ASSERT_CHECKING 
+<span class='Keyword'>static bool 
+</span><a name="LN1069"></a><span class='Declare_Function'>SyncRepQueueIsOrderedByLSN</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>mode</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1071"></a>    <a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>proc</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN1072"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>lastLSN</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN1069"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="syncrep.c.html#LN1069"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>&LT; </span><a href="../../include/replication/syncrep.h.html#LN27"><span class='Ref_to_Const'>NUM_SYNC_REP_WAIT_MODE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="syncrep.c.html#LN1072"><span class='Ref_To_Local'>lastLSN</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="syncrep.c.html#LN1071"><span class='Ref_To_Local'>proc</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/storage/shmem.h.html#LN72"><span class='Ref_to_Proto'>SHMQueueNext</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN1069"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                   <span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN1069"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                   <a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a><span class='Delimiter'>, </span>syncRepLinks<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN1071"><span class='Ref_To_Local'>proc</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Check the queue is ordered by LSN and that multiple procs don't 
+         * have matching LSNs 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN1071"><span class='Ref_To_Local'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN146"><span class='Ref_to_Member'>waitLSN</span></a> <span class='Operator'>&LT;= </span><a href="syncrep.c.html#LN1072"><span class='Ref_To_Local'>lastLSN</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <a href="syncrep.c.html#LN1072"><span class='Ref_To_Local'>lastLSN</span></a> <span class='Operator'>= </span><a href="syncrep.c.html#LN1071"><span class='Ref_To_Local'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN146"><span class='Ref_to_Member'>waitLSN</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="syncrep.c.html#LN1071"><span class='Ref_To_Local'>proc</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/storage/shmem.h.html#LN72"><span class='Ref_to_Proto'>SHMQueueNext</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><span class='Parentheses'>(</span><a href="walsender.c.html#LN107"><span class='Ref_to_Global_Var'>WalSndCtl</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/walsender_private.h.html#LN81"><span class='Ref_to_Member'>SyncRepQueue</span></a><span class='Delimiter'>[</span><a href="syncrep.c.html#LN1069"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                       <span class='Operator'>&</span><span class='Parentheses'>(</span><a href="syncrep.c.html#LN1071"><span class='Ref_To_Local'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN148"><span class='Ref_to_Member'>syncRepLinks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                       <a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../include/storage/proc.h.html#LN93"><span class='Ref_to_Struct'>PGPROC</span></a><span class='Delimiter'>, </span>syncRepLinks<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncRepQueueIsOrderedByLSN &raquo; </span> 
+<span class='Directive'>#endif</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * =========================================================== 
+ * Synchronous Replication functions executed by any process 
+ * =========================================================== 
+ */ 
+</span> 
+<span class='Keyword'>bool 
+</span><a name="LN1109"></a><span class='Declare_Function'>check_synchronous_standby_names</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>**</span><span class='Declare_Parameter'>newval</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>**</span><span class='Declare_Parameter'>extra</span><span class='Delimiter'>, </span><a href="../../include/utils/guc.h.html#LN104"><span class='Ref_to_Typedef'>GucSource</span></a> <span class='Declare_Parameter'>source</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="syncrep.c.html#LN1109"><span class='Ref_to_Parameter'>newval</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& </span><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="syncrep.c.html#LN1109"><span class='Ref_to_Parameter'>newval</span></a><span class='Parentheses'>)</span><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>!= </span><span class='String'>'\0'</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN1113"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>parse_rc</span><span class='Delimiter'>; 
+</span><a name="LN1114"></a>        <a href="../../include/replication/syncrep.h.html#LN45"><span class='Ref_to_Struct'>SyncRepConfigData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pconf</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Reset communication variables to ensure a fresh start */ 
+</span>        <a href="syncrep_gram.y.html#LN19"><span class='Ref_to_Global_Var'>syncrep_parse_result</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <a href="syncrep_gram.y.html#LN20"><span class='Ref_to_Global_Var'>syncrep_parse_error_msg</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Parse the synchronous_standby_names string */ 
+</span>        <a href="../../include/replication/syncrep.h.html#LN93"><span class='Ref_to_Proto'>syncrep_scanner_init</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="syncrep.c.html#LN1109"><span class='Ref_to_Parameter'>newval</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="syncrep.c.html#LN1113"><span class='Ref_To_Local'>parse_rc</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN90"><span class='Ref_to_Proto'>syncrep_yyparse</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/replication/syncrep.h.html#LN94"><span class='Ref_to_Proto'>syncrep_scanner_finish</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN1113"><span class='Ref_To_Local'>parse_rc</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="syncrep_gram.y.html#LN19"><span class='Ref_to_Global_Var'>syncrep_parse_result</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../include/utils/guc.h.html#LN400"><span class='Ref_to_Proto'>GUC_check_errcode</span></a><span class='Parentheses'>(</span>ERRCODE_SYNTAX_ERROR<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep_gram.y.html#LN20"><span class='Ref_to_Global_Var'>syncrep_parse_error_msg</span></a><span class='Parentheses'>) 
+</span>                <a href="../../include/utils/guc.h.html#LN406"><span class='Ref_to_Const'>GUC_check_errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"%s"</span><span class='Delimiter'>, </span><a href="syncrep_gram.y.html#LN20"><span class='Ref_to_Global_Var'>syncrep_parse_error_msg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="../../include/utils/guc.h.html#LN406"><span class='Ref_to_Const'>GUC_check_errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"synchronous_standby_names parser failed"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep_gram.y.html#LN19"><span class='Ref_to_Global_Var'>syncrep_parse_result</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN48"><span class='Ref_to_Member'>num_sync</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../include/utils/guc.h.html#LN402"><span class='Ref_to_Const'>GUC_check_errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"number of synchronous standbys (%d) must be greater than zero"</span><span class='Delimiter'>, 
+</span>                             <a href="syncrep_gram.y.html#LN19"><span class='Ref_to_Global_Var'>syncrep_parse_result</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN48"><span class='Ref_to_Member'>num_sync</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* GUC extra value must be malloc'd, not palloc'd */ 
+</span>        <a href="syncrep.c.html#LN1114"><span class='Ref_To_Local'>pconf</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/replication/syncrep.h.html#LN45"><span class='Ref_to_Struct'>SyncRepConfigData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>            <a href="../../include/snowball/header.h.html#LN49"><span class='Ref_to_Macro'>malloc</span></a><span class='Parentheses'>(</span><a href="syncrep_gram.y.html#LN19"><span class='Ref_to_Global_Var'>syncrep_parse_result</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN47"><span class='Ref_to_Member'>config_size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN1114"><span class='Ref_To_Local'>pconf</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><a href="syncrep.c.html#LN1114"><span class='Ref_To_Local'>pconf</span></a><span class='Delimiter'>, </span><a href="syncrep_gram.y.html#LN19"><span class='Ref_to_Global_Var'>syncrep_parse_result</span></a><span class='Delimiter'>, </span><a href="syncrep_gram.y.html#LN19"><span class='Ref_to_Global_Var'>syncrep_parse_result</span></a><span class='Operator'>-&GT;</span><a href="../../include/replication/syncrep.h.html#LN47"><span class='Ref_to_Member'>config_size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Operator'>*</span><a href="syncrep.c.html#LN1109"><span class='Ref_to_Parameter'>extra</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="syncrep.c.html#LN1114"><span class='Ref_To_Local'>pconf</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * We need not explicitly clean up syncrep_parse_result.  It, and any 
+         * other cruft generated during parsing, will be freed when the 
+         * current memory context is deleted.  (This code is generally run in 
+         * a short-lived context used for config file processing, so that will 
+         * not be very long.) 
+         */ 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if *newval!=NULL&&(*newv... &raquo; </span> 
+    <span class='Control'>else</span> 
+        <span class='Operator'>*</span><a href="syncrep.c.html#LN1109"><span class='Ref_to_Parameter'>extra</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end check_synchronous_standby_names &raquo; </span> 
+ 
+<span class='Keyword'>void 
+</span><a name="LN1166"></a><span class='Declare_Function'>assign_synchronous_standby_names</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>newval</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>extra</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="syncrep.c.html#LN96"><span class='Ref_to_Global_Var'>SyncRepConfig</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/replication/syncrep.h.html#LN45"><span class='Ref_to_Struct'>SyncRepConfigData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="syncrep.c.html#LN1166"><span class='Ref_to_Parameter'>extra</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>void 
+</span><a name="LN1172"></a><span class='Declare_Function'>assign_synchronous_commit</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>newval</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>extra</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="syncrep.c.html#LN1172"><span class='Ref_to_Parameter'>newval</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="../../include/access/xact.h.html#LN60"><span class='Ref_to_EnumConst'>SYNCHRONOUS_COMMIT_REMOTE_WRITE</span></a><span class='Operator'>: 
+</span>            <a href="syncrep.c.html#LN97"><span class='Ref_to_Global_Var'>SyncRepWaitMode</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN23"><span class='Ref_to_Const'>SYNC_REP_WAIT_WRITE</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/access/xact.h.html#LN62"><span class='Ref_to_EnumConst'>SYNCHRONOUS_COMMIT_REMOTE_FLUSH</span></a><span class='Operator'>: 
+</span>            <a href="syncrep.c.html#LN97"><span class='Ref_to_Global_Var'>SyncRepWaitMode</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN24"><span class='Ref_to_Const'>SYNC_REP_WAIT_FLUSH</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/access/xact.h.html#LN63"><span class='Ref_to_EnumConst'>SYNCHRONOUS_COMMIT_REMOTE_APPLY</span></a><span class='Operator'>: 
+</span>            <a href="syncrep.c.html#LN97"><span class='Ref_to_Global_Var'>SyncRepWaitMode</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN25"><span class='Ref_to_Const'>SYNC_REP_WAIT_APPLY</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="syncrep.c.html#LN97"><span class='Ref_to_Global_Var'>SyncRepWaitMode</span></a> <span class='Operator'>= </span><a href="../../include/replication/syncrep.h.html#LN22"><span class='Ref_to_Const'>SYNC_REP_NO_WAIT</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

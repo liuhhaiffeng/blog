@@ -1,0 +1,1085 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\transam\xloginsert.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\transam\xloginsert.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:31 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * xloginsert.c 
+ *      Functions for constructing WAL records 
+ * 
+ * Constructing a WAL record begins with a call to XLogBeginInsert, 
+ * followed by a number of XLogRegister* calls. The registered data is 
+ * collected in private working memory, and finally assembled into a chain 
+ * of XLogRecData structs by a call to XLogRecordAssemble(). See 
+ * access/transam/README for details. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * src/backend/access/transam/xloginsert.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog_internal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xloginsert.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_control.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"common/pg_lzcompress.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/origin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/bufmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pg_trace.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* Buffer size required to store a compressed version of backup block image */ 
+</span><a name="LN35"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PGLZ_MAX_BLCKSZ</span> <a href="../../../include/common/pg_lzcompress.h.html#LN20"><span class='Ref_to_Macro'>PGLZ_MAX_OUTPUT</span></a><span class='Parentheses'>(</span>BLCKSZ<span class='Parentheses'>) 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * For each block reference registered with XLogRegisterBuffer, we fill in 
+ * a registered_buffer struct. 
+ */ 
+</span><span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN43"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>in_use</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* is this slot in use? */ 
+</span><a name="LN44"></a>    <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Member'>flags</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* REGBUF_* flags */ 
+</span><a name="LN45"></a>    <a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Member'>rnode</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* identifies the relation and block */ 
+</span><a name="LN46"></a>    <a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a>  <span class='Declare_Member'>forkno</span><span class='Delimiter'>; 
+</span><a name="LN47"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Member'>block</span><span class='Delimiter'>; 
+</span><a name="LN48"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Member'>page</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* page content */ 
+</span><a name="LN49"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>rdata_len</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* total length of data in rdata chain */ 
+</span><a name="LN50"></a>    <a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Member'>rdata_head</span><span class='Delimiter'>;</span>    <span class='Comment_Multi_Line'>/* head of the chain of data registered with 
+                                 * this block */ 
+</span><a name="LN52"></a>    <a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Member'>rdata_tail</span><span class='Delimiter'>;</span>    <span class='Comment_Multi_Line'>/* last entry in the chain, or &rdata_head if 
+                                 * empty */ 
+</span> 
+<a name="LN55"></a>    <a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Declare_Member'>bkp_rdatas</span><span class='Delimiter'>[</span><span class='Number'>2</span><span class='Delimiter'>];</span>  <span class='Comment_Multi_Line'>/* temporary rdatas used to hold references to 
+                                 * backup block data in XLogRecordAssemble() */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* buffer to store a compressed version of backup block image */ 
+</span><a name="LN59"></a>    <span class='Keyword'>char</span>        <span class='Declare_Member'>compressed_page</span><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN35"><span class='Ref_to_Const'>PGLZ_MAX_BLCKSZ</span></a><span class='Delimiter'>]; 
+</span><a name="LN60"></a>}<span class='Auto_Annotations'> &laquo; end {anonregistered_buffer} &raquo; </span> <span class='Declare_Typedef'>registered_buffer</span><span class='Delimiter'>; 
+</span> 
+<a name="LN62"></a><span class='Keyword'>static </span><a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Declare_Var'>registered_buffers</span><span class='Delimiter'>; 
+</span><a name="LN63"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>max_registered_buffers</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* allocated size */ 
+</span><a name="LN64"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>max_registered_block_id</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>;</span>        <span class='Comment_Multi_Line'>/* highest block_id + 1 
+                                                 * currently registered */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * A chain of XLogRecDatas to hold the "main data" of a WAL record, registered 
+ * with XLogRegisterData(...). 
+ */ 
+</span><a name="LN71"></a><span class='Keyword'>static </span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Var'>mainrdata_head</span><span class='Delimiter'>; 
+</span><a name="LN72"></a><span class='Keyword'>static </span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Var'>mainrdata_last</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN71"><span class='Ref_to_Global_Var'>mainrdata_head</span></a><span class='Delimiter'>; 
+</span><a name="LN73"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Var'>mainrdata_len</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* total # of bytes in chain */ 
+</span> 
+<span class='Comment_Multi_Line'>/* flags for the in-progress insertion */ 
+</span><a name="LN76"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Var'>curinsert_flags</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * These are used to hold the record header while constructing a record. 
+ * 'hdr_scratch' is not a plain variable, but is palloc'd at initialization, 
+ * because we want it to be MAXALIGNed and padding bytes zeroed. 
+ * 
+ * For simplicity, it's allocated large enough to hold the headers for any 
+ * WAL record. 
+ */ 
+</span><a name="LN86"></a><span class='Keyword'>static </span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Declare_Var'>hdr_rdt</span><span class='Delimiter'>; 
+</span><a name="LN87"></a><span class='Keyword'>static char </span><span class='Operator'>*</span><span class='Declare_Var'>hdr_scratch</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+<a name="LN89"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>SizeOfXlogOrigin</span>    <span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>char</span><span class='Parentheses'>))</span> 
+ 
+<a name="LN91"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>HEADER_SCRATCH_SIZE</span> <span class='Operator'>\ 
+</span>    <span class='Parentheses'>(</span><a href="../../../include/access/xlogrecord.h.html#LN54"><span class='Ref_to_Const'>SizeOfXLogRecord</span></a> <span class='Operator'>+ \ 
+</span>     <a href="../../../include/access/xlogrecord.h.html#LN166"><span class='Ref_to_Const'>MaxSizeOfXLogRecordBlockHeader</span></a> <span class='Operator'>* </span><span class='Parentheses'>(</span><a href="../../../include/access/xlogrecord.h.html#LN220"><span class='Ref_to_Const'>XLR_MAX_BLOCK_ID</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>+ \ 
+</span>     <a href="../../../include/access/xlogrecord.h.html#LN207"><span class='Ref_to_Const'>SizeOfXLogRecordDataHeaderLong</span></a> <span class='Operator'>+ </span><a href="xloginsert.c.html#LN89"><span class='Ref_to_Const'>SizeOfXlogOrigin</span></a><span class='Parentheses'>)</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * An array of XLogRecData structs, to hold registered data. 
+ */ 
+</span><a name="LN99"></a><span class='Keyword'>static </span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Var'>rdatas</span><span class='Delimiter'>; 
+</span><a name="LN100"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>num_rdatas</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* entries currently used */ 
+</span><a name="LN101"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>max_rdatas</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* allocated size */ 
+</span> 
+<a name="LN103"></a><span class='Keyword'>static bool </span><span class='Declare_Var'>begininsert_called</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Memory context to hold the registered buffer and data references. */ 
+</span><a name="LN106"></a><span class='Keyword'>static </span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Var'>xloginsert_cxt</span><span class='Delimiter'>; 
+</span> 
+<a name="LN108"></a><span class='Keyword'>static </span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>XLogRecordAssemble</span><span class='Parentheses'>(</span><a href="../../../include/access/rmgr.h.html#LN10"><span class='Ref_to_Typedef'>RmgrId</span></a> <span class='Declare_Parameter'>rmid</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>info</span><span class='Delimiter'>, 
+</span><a name="LN109"></a>                   <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>RedoRecPtr</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>doPageWrites</span><span class='Delimiter'>, 
+</span><a name="LN110"></a>                   <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>fpw_lsn</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN111"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>XLogCompressBackupBlock</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>page</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>hole_offset</span><span class='Delimiter'>, 
+</span><a name="LN112"></a>                        <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>hole_length</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>dest</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>dlen</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Begin constructing a WAL record. This must be called before the 
+ * XLogRegister* functions and XLogInsert(). 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN119"></a><span class='Declare_Function'>XLogBeginInsert</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN72"><span class='Ref_to_Global_Var'>mainrdata_last</span></a> <span class='Operator'>== </span><span class='Parentheses'>(</span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN71"><span class='Ref_to_Global_Var'>mainrdata_head</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN73"><span class='Ref_to_Global_Var'>mainrdata_len</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* cross-check on whether we should be here or not */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xlog.h.html#LN245"><span class='Ref_to_Proto'>XLogInsertAllowed</span></a><span class='Parentheses'>())</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"cannot make new WAL entries during recovery"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN103"><span class='Ref_to_Global_Var'>begininsert_called</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"XLogBeginInsert was already called"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="xloginsert.c.html#LN103"><span class='Ref_to_Global_Var'>begininsert_called</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Ensure that there are enough buffer and data slots in the working area, 
+ * for subsequent XLogRegisterBuffer, XLogRegisterData and XLogRegisterBufData 
+ * calls. 
+ * 
+ * There is always space for a small number of buffers and data chunks, enough 
+ * for most record types. This function is for the exceptional cases that need 
+ * more. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN145"></a><span class='Declare_Function'>XLogEnsureRecordSpace</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>max_block_id</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>ndatas</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN147"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nbuffers</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * This must be called before entering a critical section, because 
+     * allocating memory inside a critical section can fail. repalloc() will 
+     * check the same, but better to check it here too so that we fail 
+     * consistently even if the arrays happen to be large enough already. 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN36"><span class='Ref_to_Global_Var'>CritSectionCount</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* the minimum values can't be decreased */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN145"><span class='Ref_to_Parameter'>max_block_id</span></a> <span class='Operator'>&LT; </span><a href="../../../include/access/xloginsert.h.html#LN25"><span class='Ref_to_Const'>XLR_NORMAL_MAX_BLOCK_ID</span></a><span class='Parentheses'>) 
+</span>        <a href="xloginsert.c.html#LN145"><span class='Ref_to_Parameter'>max_block_id</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN25"><span class='Ref_to_Const'>XLR_NORMAL_MAX_BLOCK_ID</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN145"><span class='Ref_to_Parameter'>ndatas</span></a> <span class='Operator'>&LT; </span><a href="../../../include/access/xloginsert.h.html#LN26"><span class='Ref_to_Const'>XLR_NORMAL_RDATAS</span></a><span class='Parentheses'>) 
+</span>        <a href="xloginsert.c.html#LN145"><span class='Ref_to_Parameter'>ndatas</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN26"><span class='Ref_to_Const'>XLR_NORMAL_RDATAS</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN145"><span class='Ref_to_Parameter'>max_block_id</span></a> <span class='Operator'>&GT; </span><a href="../../../include/access/xlogrecord.h.html#LN220"><span class='Ref_to_Const'>XLR_MAX_BLOCK_ID</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"maximum number of WAL record block references exceeded"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN147"><span class='Ref_To_Local'>nbuffers</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN145"><span class='Ref_to_Parameter'>max_block_id</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN147"><span class='Ref_To_Local'>nbuffers</span></a> <span class='Operator'>&GT; </span><a href="xloginsert.c.html#LN63"><span class='Ref_to_Global_Var'>max_registered_buffers</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>            <a href="../../../include/common/fe_memutils.h.html#LN36"><span class='Ref_to_Proto'>repalloc</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="xloginsert.c.html#LN147"><span class='Ref_To_Local'>nbuffers</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * At least the padding bytes in the structs must be zeroed, because 
+         * they are included in WAL data, but initialize it all for tidiness. 
+         */ 
+</span>        <a href="../../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN63"><span class='Ref_to_Global_Var'>max_registered_buffers</span></a><span class='Delimiter'>], </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN147"><span class='Ref_To_Local'>nbuffers</span></a> <span class='Operator'>- </span><a href="xloginsert.c.html#LN63"><span class='Ref_to_Global_Var'>max_registered_buffers</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN63"><span class='Ref_to_Global_Var'>max_registered_buffers</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN147"><span class='Ref_To_Local'>nbuffers</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN145"><span class='Ref_to_Parameter'>ndatas</span></a> <span class='Operator'>&GT; </span><a href="xloginsert.c.html#LN101"><span class='Ref_to_Global_Var'>max_rdatas</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="xloginsert.c.html#LN99"><span class='Ref_to_Global_Var'>rdatas</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN36"><span class='Ref_to_Proto'>repalloc</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN99"><span class='Ref_to_Global_Var'>rdatas</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="xloginsert.c.html#LN145"><span class='Ref_to_Parameter'>ndatas</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN101"><span class='Ref_to_Global_Var'>max_rdatas</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN145"><span class='Ref_to_Parameter'>ndatas</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end XLogEnsureRecordSpace &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Reset WAL record construction buffers. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN192"></a><span class='Declare_Function'>XLogResetInsertion</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN194"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN194"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN194"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN194"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN194"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="xloginsert.c.html#LN43"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="xloginsert.c.html#LN100"><span class='Ref_to_Global_Var'>num_rdatas</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN73"><span class='Ref_to_Global_Var'>mainrdata_len</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN72"><span class='Ref_to_Global_Var'>mainrdata_last</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN71"><span class='Ref_to_Global_Var'>mainrdata_head</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN76"><span class='Ref_to_Global_Var'>curinsert_flags</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN103"><span class='Ref_to_Global_Var'>begininsert_called</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Register a reference to a buffer with the WAL record being constructed. 
+ * This must be called for every page that the WAL-logged operation modifies. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN212"></a><span class='Declare_Function'>XLogRegisterBuffer</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>block_id</span><span class='Delimiter'>, </span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Parameter'>buffer</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>flags</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN214"></a>    <a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>regbuf</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* NO_IMAGE doesn't make sense with FORCE_IMAGE */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>((</span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>flags</span></a> <span class='Operator'>& </span><a href="../../../include/access/xloginsert.h.html#LN29"><span class='Ref_to_Const'>REGBUF_FORCE_IMAGE</span></a><span class='Parentheses'>)</span> <span class='Operator'>&& </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>flags</span></a> <span class='Operator'>& </span><span class='Parentheses'>(</span><a href="../../../include/access/xloginsert.h.html#LN30"><span class='Ref_to_Const'>REGBUF_NO_IMAGE</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN103"><span class='Ref_to_Global_Var'>begininsert_called</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>block_id</span></a> <span class='Operator'>&GT;= </span><a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>block_id</span></a> <span class='Operator'>&GT;= </span><a href="xloginsert.c.html#LN63"><span class='Ref_to_Global_Var'>max_registered_buffers</span></a><span class='Parentheses'>) 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"too many registered buffers"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>block_id</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>block_id</span></a><span class='Delimiter'>]; 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN208"><span class='Ref_to_Proto'>BufferGetTag</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>buffer</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN45"><span class='Ref_to_Member'>rnode</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN46"><span class='Ref_to_Member'>forkno</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN47"><span class='Ref_to_Member'>block</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN48"><span class='Ref_to_Member'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>flags</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN52"><span class='Ref_to_Member'>rdata_tail</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN50"><span class='Ref_to_Member'>rdata_head</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN49"><span class='Ref_to_Member'>rdata_len</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check that this page hasn't already been registered with some other 
+     * block_id. 
+     */ 
+</span><span class='Directive'>#ifdef</span> USE_ASSERT_CHECKING 
+    <span class='Delimiter'>{ 
+</span><a name="LN241"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN241"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN241"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN241"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN245"></a>            <a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>regbuf_old</span> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN241"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN241"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>== </span><a href="xloginsert.c.html#LN212"><span class='Ref_to_Parameter'>block_id</span></a> <span class='Operator'>|| !</span><a href="xloginsert.c.html#LN245"><span class='Ref_To_Local'>regbuf_old</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN43"><span class='Ref_to_Member'>in_use</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/relfilenode.h.html#LN87"><span class='Ref_to_Macro'>RelFileNodeEquals</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN245"><span class='Ref_To_Local'>regbuf_old</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN45"><span class='Ref_to_Member'>rnode</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN45"><span class='Ref_to_Member'>rnode</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>                   <a href="xloginsert.c.html#LN245"><span class='Ref_To_Local'>regbuf_old</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN46"><span class='Ref_to_Member'>forkno</span></a> <span class='Operator'>!= </span><a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN46"><span class='Ref_to_Member'>forkno</span></a> <span class='Operator'>|| 
+</span>                   <a href="xloginsert.c.html#LN245"><span class='Ref_To_Local'>regbuf_old</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN47"><span class='Ref_to_Member'>block</span></a> <span class='Operator'>!= </span><a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN47"><span class='Ref_to_Member'>block</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="xloginsert.c.html#LN214"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN43"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogRegisterBuffer &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Like XLogRegisterBuffer, but for registering a block that's not in the 
+ * shared buffer pool (i.e. when you don't have a Buffer for it). 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN265"></a><span class='Declare_Function'>XLogRegisterBlock</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>block_id</span><span class='Delimiter'>, </span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forknum</span><span class='Delimiter'>, 
+</span><a name="LN266"></a>                  <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>blknum</span><span class='Delimiter'>, </span><a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a> <span class='Declare_Parameter'>page</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>flags</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN268"></a>    <a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>regbuf</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* This is currently only used to WAL-log a full-page image of a page */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN266"><span class='Ref_to_Parameter'>flags</span></a> <span class='Operator'>& </span><a href="../../../include/access/xloginsert.h.html#LN29"><span class='Ref_to_Const'>REGBUF_FORCE_IMAGE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN103"><span class='Ref_to_Global_Var'>begininsert_called</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN265"><span class='Ref_to_Parameter'>block_id</span></a> <span class='Operator'>&GT;= </span><a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a><span class='Parentheses'>) 
+</span>        <a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN265"><span class='Ref_to_Parameter'>block_id</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN265"><span class='Ref_to_Parameter'>block_id</span></a> <span class='Operator'>&GT;= </span><a href="xloginsert.c.html#LN63"><span class='Ref_to_Global_Var'>max_registered_buffers</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"too many registered buffers"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN265"><span class='Ref_to_Parameter'>block_id</span></a><span class='Delimiter'>]; 
+</span> 
+    <a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN45"><span class='Ref_to_Member'>rnode</span></a> <span class='Operator'>= *</span><a href="xloginsert.c.html#LN265"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN46"><span class='Ref_to_Member'>forkno</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN265"><span class='Ref_to_Parameter'>forknum</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN47"><span class='Ref_to_Member'>block</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN266"><span class='Ref_to_Parameter'>blknum</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN48"><span class='Ref_to_Member'>page</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN266"><span class='Ref_to_Parameter'>page</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN266"><span class='Ref_to_Parameter'>flags</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN52"><span class='Ref_to_Member'>rdata_tail</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN50"><span class='Ref_to_Member'>rdata_head</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN49"><span class='Ref_to_Member'>rdata_len</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check that this page hasn't already been registered with some other 
+     * block_id. 
+     */ 
+</span><span class='Directive'>#ifdef</span> USE_ASSERT_CHECKING 
+    <span class='Delimiter'>{ 
+</span><a name="LN296"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN296"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN296"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN296"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN300"></a>            <a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>regbuf_old</span> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN296"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN296"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>== </span><a href="xloginsert.c.html#LN265"><span class='Ref_to_Parameter'>block_id</span></a> <span class='Operator'>|| !</span><a href="xloginsert.c.html#LN300"><span class='Ref_To_Local'>regbuf_old</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN43"><span class='Ref_to_Member'>in_use</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/relfilenode.h.html#LN87"><span class='Ref_to_Macro'>RelFileNodeEquals</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN300"><span class='Ref_To_Local'>regbuf_old</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN45"><span class='Ref_to_Member'>rnode</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN45"><span class='Ref_to_Member'>rnode</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>                   <a href="xloginsert.c.html#LN300"><span class='Ref_To_Local'>regbuf_old</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN46"><span class='Ref_to_Member'>forkno</span></a> <span class='Operator'>!= </span><a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN46"><span class='Ref_to_Member'>forkno</span></a> <span class='Operator'>|| 
+</span>                   <a href="xloginsert.c.html#LN300"><span class='Ref_To_Local'>regbuf_old</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN47"><span class='Ref_to_Member'>block</span></a> <span class='Operator'>!= </span><a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN47"><span class='Ref_to_Member'>block</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="xloginsert.c.html#LN268"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN43"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogRegisterBlock &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Add data to the WAL record that's being constructed. 
+ * 
+ * The data is appended to the "main chunk", available at replay with 
+ * XLogRecGetData(). 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN322"></a><span class='Declare_Function'>XLogRegisterData</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>data</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>len</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN324"></a>    <a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rdata</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN103"><span class='Ref_to_Global_Var'>begininsert_called</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN100"><span class='Ref_to_Global_Var'>num_rdatas</span></a> <span class='Operator'>&GT;= </span><a href="xloginsert.c.html#LN101"><span class='Ref_to_Global_Var'>max_rdatas</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"too much WAL data"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN324"><span class='Ref_To_Local'>rdata</span></a> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN99"><span class='Ref_to_Global_Var'>rdatas</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN100"><span class='Ref_to_Global_Var'>num_rdatas</span></a><span class='Operator'>++</span><span class='Delimiter'>]; 
+</span> 
+    <a href="xloginsert.c.html#LN324"><span class='Ref_To_Local'>rdata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN243"><span class='Ref_to_Member'>data</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN322"><span class='Ref_to_Parameter'>data</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN324"><span class='Ref_To_Local'>rdata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN322"><span class='Ref_to_Parameter'>len</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * we use the mainrdata_last pointer to track the end of the chain, so no 
+     * need to clear 'next' here. 
+     */ 
+</span> 
+    <a href="xloginsert.c.html#LN72"><span class='Ref_to_Global_Var'>mainrdata_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN324"><span class='Ref_To_Local'>rdata</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN72"><span class='Ref_to_Global_Var'>mainrdata_last</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN324"><span class='Ref_To_Local'>rdata</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="xloginsert.c.html#LN73"><span class='Ref_to_Global_Var'>mainrdata_len</span></a> <span class='Operator'>+= </span><a href="xloginsert.c.html#LN322"><span class='Ref_to_Parameter'>len</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogRegisterData &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Add buffer-specific data to the WAL record that's being constructed. 
+ * 
+ * Block_id must reference a block previously registered with 
+ * XLogRegisterBuffer(). If this is called more than once for the same 
+ * block_id, the data is appended. 
+ * 
+ * The maximum amount of data that can be registered per block is 65535 
+ * bytes. That should be plenty; if you need more than BLCKSZ bytes to 
+ * reconstruct the changes to the page, you might as well just log a full 
+ * copy of it. (the "main data" that's not associated with a block is not 
+ * limited) 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN360"></a><span class='Declare_Function'>XLogRegisterBufData</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>block_id</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>data</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>len</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN362"></a>    <a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>regbuf</span><span class='Delimiter'>; 
+</span><a name="LN363"></a>    <a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rdata</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN103"><span class='Ref_to_Global_Var'>begininsert_called</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* find the registered buffer struct */ 
+</span>    <a href="xloginsert.c.html#LN362"><span class='Ref_To_Local'>regbuf</span></a> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN360"><span class='Ref_to_Parameter'>block_id</span></a><span class='Delimiter'>]; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="xloginsert.c.html#LN362"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN43"><span class='Ref_to_Member'>in_use</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"no block with id %d registered with WAL insertion"</span><span class='Delimiter'>, 
+</span>             <a href="xloginsert.c.html#LN360"><span class='Ref_to_Parameter'>block_id</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN100"><span class='Ref_to_Global_Var'>num_rdatas</span></a> <span class='Operator'>&GT;= </span><a href="xloginsert.c.html#LN101"><span class='Ref_to_Global_Var'>max_rdatas</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"too much WAL data"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN363"><span class='Ref_To_Local'>rdata</span></a> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN99"><span class='Ref_to_Global_Var'>rdatas</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN100"><span class='Ref_to_Global_Var'>num_rdatas</span></a><span class='Operator'>++</span><span class='Delimiter'>]; 
+</span> 
+    <a href="xloginsert.c.html#LN363"><span class='Ref_To_Local'>rdata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN243"><span class='Ref_to_Member'>data</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN360"><span class='Ref_to_Parameter'>data</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN363"><span class='Ref_To_Local'>rdata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN360"><span class='Ref_to_Parameter'>len</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="xloginsert.c.html#LN362"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN52"><span class='Ref_to_Member'>rdata_tail</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN363"><span class='Ref_To_Local'>rdata</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN362"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN52"><span class='Ref_to_Member'>rdata_tail</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN363"><span class='Ref_To_Local'>rdata</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN362"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN49"><span class='Ref_to_Member'>rdata_len</span></a> <span class='Operator'>+= </span><a href="xloginsert.c.html#LN360"><span class='Ref_to_Parameter'>len</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogRegisterBufData &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Set insert status flags for the upcoming WAL record. 
+ * 
+ * The flags that can be used here are: 
+ * - XLOG_INCLUDE_ORIGIN, to determine if the replication origin should be 
+ *   included in the record. 
+ * - XLOG_MARK_UNIMPORTANT, to signal that the record is not important for 
+ *   durability, which allows to avoid triggering WAL archiving and other 
+ *   background activity. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN396"></a><span class='Declare_Function'>XLogSetRecordFlags</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>flags</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN103"><span class='Ref_to_Global_Var'>begininsert_called</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN76"><span class='Ref_to_Global_Var'>curinsert_flags</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN396"><span class='Ref_to_Parameter'>flags</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Insert an XLOG record having the specified RMID and info bytes, with the 
+ * body of the record being the data and buffer references registered earlier 
+ * with XLogRegister* calls. 
+ * 
+ * Returns XLOG pointer to end of record (beginning of next record). 
+ * This can be used as LSN for data pages affected by the logged action. 
+ * (LSN is the XLOG point up to which the XLOG must be flushed to disk 
+ * before the data page can be written out.  This implements the basic 
+ * WAL rule "write the log before the data".) 
+ */ 
+</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> 
+<a name="LN414"></a><span class='Declare_Function'>XLogInsert</span><span class='Parentheses'>(</span><a href="../../../include/access/rmgr.h.html#LN10"><span class='Ref_to_Typedef'>RmgrId</span></a> <span class='Declare_Parameter'>rmid</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>info</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN416"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>EndPos</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* XLogBeginInsert() must have been called. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="xloginsert.c.html#LN103"><span class='Ref_to_Global_Var'>begininsert_called</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"XLogBeginInsert was not called"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The caller can set rmgr bits, XLR_SPECIAL_REL_UPDATE and 
+     * XLR_CHECK_CONSISTENCY; the rest are reserved for use by me. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="xloginsert.c.html#LN414"><span class='Ref_to_Parameter'>info</span></a> <span class='Operator'>& ~</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogrecord.h.html#LN62"><span class='Ref_to_Const'>XLR_RMGR_INFO_MASK</span></a> <span class='Operator'>| 
+</span>                  <a href="../../../include/access/xlogrecord.h.html#LN70"><span class='Ref_to_Const'>XLR_SPECIAL_REL_UPDATE</span></a> <span class='Operator'>| 
+</span>                  <a href="../../../include/access/xlogrecord.h.html#LN79"><span class='Ref_to_Const'>XLR_CHECK_CONSISTENCY</span></a><span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"invalid xlog info mask %02X"</span><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN414"><span class='Ref_to_Parameter'>info</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    TRACE_POSTGRESQL_WAL_INSERT<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN414"><span class='Ref_to_Parameter'>rmid</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN414"><span class='Ref_to_Parameter'>info</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * In bootstrap mode, we don't actually log anything but XLOG resources; 
+     * return a phony record pointer. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/miscadmin.h.html#LN369"><span class='Ref_to_Macro'>IsBootstrapProcessingMode</span></a><span class='Parentheses'>() </span><span class='Operator'>&& </span><a href="xloginsert.c.html#LN414"><span class='Ref_to_Parameter'>rmid</span></a> <span class='Operator'>!= </span>RM_XLOG_ID<span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN51"><span class='Ref_to_Proto'>XLogResetInsertion</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN416"><span class='Ref_To_Local'>EndPos</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlog_internal.h.html#LN71"><span class='Ref_to_Const'>SizeOfXLogLongPHD</span></a><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* start of 1st chkpt record */ 
+</span>        <span class='Control'>return</span> <a href="xloginsert.c.html#LN416"><span class='Ref_To_Local'>EndPos</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>do</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN446"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>RedoRecPtr</span><span class='Delimiter'>; 
+</span><a name="LN447"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>doPageWrites</span><span class='Delimiter'>; 
+</span><a name="LN448"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>fpw_lsn</span><span class='Delimiter'>; 
+</span><a name="LN449"></a>        <a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rdt</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Get values needed to decide whether to do full-page writes. Since 
+         * we don't yet have an insertion lock, these could change under us, 
+         * but XLogInsertRecord will recheck them once it has a lock. 
+         */ 
+</span>        <a href="../../../include/access/xlog.h.html#LN272"><span class='Ref_to_Proto'>GetFullPageWriteInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xloginsert.c.html#LN446"><span class='Ref_To_Local'>RedoRecPtr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN447"><span class='Ref_To_Local'>doPageWrites</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="xloginsert.c.html#LN449"><span class='Ref_To_Local'>rdt</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN108"><span class='Ref_to_Proto'>XLogRecordAssemble</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN414"><span class='Ref_to_Parameter'>rmid</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN414"><span class='Ref_to_Parameter'>info</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN446"><span class='Ref_To_Local'>RedoRecPtr</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN447"><span class='Ref_To_Local'>doPageWrites</span></a><span class='Delimiter'>, 
+</span>                                 <span class='Operator'>&</span><a href="xloginsert.c.html#LN448"><span class='Ref_To_Local'>fpw_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="xloginsert.c.html#LN416"><span class='Ref_To_Local'>EndPos</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlog.h.html#LN222"><span class='Ref_to_Proto'>XLogInsertRecord</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN449"><span class='Ref_To_Local'>rdt</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN448"><span class='Ref_To_Local'>fpw_lsn</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN76"><span class='Ref_to_Global_Var'>curinsert_flags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} </span><span class='Control'>while</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN416"><span class='Ref_To_Local'>EndPos</span></a> <span class='Operator'>== </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xloginsert.h.html#LN51"><span class='Ref_to_Proto'>XLogResetInsertion</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="xloginsert.c.html#LN416"><span class='Ref_To_Local'>EndPos</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogInsert &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Assemble a WAL record from the registered data and buffers into an 
+ * XLogRecData chain, ready for insertion with XLogInsertRecord(). 
+ * 
+ * The record header fields are filled in, except for the xl_prev field. The 
+ * calculated CRC does not include the record header yet. 
+ * 
+ * If there are any registered buffers, and a full-page image was not taken 
+ * of all of them, *fpw_lsn is set to the lowest LSN among such pages. This 
+ * signals that the assembled record is only good for insertion on the 
+ * assumption that the RedoRecPtr and doPageWrites values were up-to-date. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>* 
+</span><a name="LN482"></a><span class='Declare_Function'>XLogRecordAssemble</span><span class='Parentheses'>(</span><a href="../../../include/access/rmgr.h.html#LN10"><span class='Ref_to_Typedef'>RmgrId</span></a> <span class='Declare_Parameter'>rmid</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>info</span><span class='Delimiter'>, 
+</span><a name="LN483"></a>                   <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>RedoRecPtr</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>doPageWrites</span><span class='Delimiter'>, 
+</span><a name="LN484"></a>                   <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>fpw_lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN486"></a>    <a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rdt</span><span class='Delimiter'>; 
+</span><a name="LN487"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>total_len</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN488"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>block_id</span><span class='Delimiter'>; 
+</span><a name="LN489"></a>    <a href="../../../include/port/pg_crc32c.h.html#LN37"><span class='Ref_to_Typedef'>pg_crc32c</span></a>   <span class='Declare_Local'>rdata_crc</span><span class='Delimiter'>; 
+</span><a name="LN490"></a>    <a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>prev_regbuf</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN491"></a>    <a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rdt_datas_last</span><span class='Delimiter'>; 
+</span><a name="LN492"></a>    <a href="../../../include/access/xlogrecord.h.html#LN40"><span class='Ref_to_Struct'>XLogRecord</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rechdr</span><span class='Delimiter'>; 
+</span><a name="LN493"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>scratch</span> <span class='Operator'>= </span><a href="xloginsert.c.html#LN87"><span class='Ref_to_Global_Var'>hdr_scratch</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Note: this function can be called multiple times for the same record. 
+     * All the modifications we do to the rdata chains below must handle that. 
+     */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* The record begins with the fixed-size header */ 
+</span>    <a href="xloginsert.c.html#LN492"><span class='Ref_To_Local'>rechdr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/xlogrecord.h.html#LN40"><span class='Ref_to_Struct'>XLogRecord</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a> <span class='Operator'>+= </span><a href="../../../include/access/xlogrecord.h.html#LN54"><span class='Ref_to_Const'>SizeOfXLogRecord</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="xloginsert.c.html#LN86"><span class='Ref_to_Global_Var'>hdr_rdt</span></a><span class='Operator'>.</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN86"><span class='Ref_to_Global_Var'>hdr_rdt</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN86"><span class='Ref_to_Global_Var'>hdr_rdt</span></a><span class='Operator'>.</span><a href="../../../include/access/xlog_internal.h.html#LN243"><span class='Ref_to_Member'>data</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN87"><span class='Ref_to_Global_Var'>hdr_scratch</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Enforce consistency checks for this record if user is looking for it. 
+     * Do this before at the beginning of this routine to give the possibility 
+     * for callers of XLogInsert() to pass XLR_CHECK_CONSISTENCY directly for 
+     * a record. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlog.c.html#LN100"><span class='Ref_to_Global_Var'>wal_consistency_checking</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN482"><span class='Ref_to_Parameter'>rmid</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>        <a href="xloginsert.c.html#LN482"><span class='Ref_to_Parameter'>info</span></a> <span class='Operator'>|= </span><a href="../../../include/access/xlogrecord.h.html#LN79"><span class='Ref_to_Const'>XLR_CHECK_CONSISTENCY</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Make an rdata chain containing all the data portions of all block 
+     * references. This includes the data for full-page images. Also append 
+     * the headers for the block references in the scratch buffer. 
+     */ 
+</span>    <span class='Operator'>*</span><a href="xloginsert.c.html#LN484"><span class='Ref_to_Parameter'>fpw_lsn</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN488"><span class='Ref_To_Local'>block_id</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN488"><span class='Ref_To_Local'>block_id</span></a> <span class='Operator'>&LT; </span><a href="xloginsert.c.html#LN64"><span class='Ref_to_Global_Var'>max_registered_block_id</span></a><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN488"><span class='Ref_To_Local'>block_id</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN525"></a>        <a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>regbuf</span> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a><span class='Delimiter'>[</span><a href="xloginsert.c.html#LN488"><span class='Ref_To_Local'>block_id</span></a><span class='Delimiter'>]; 
+</span><a name="LN526"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>needs_backup</span><span class='Delimiter'>; 
+</span><a name="LN527"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>needs_data</span><span class='Delimiter'>; 
+</span><a name="LN528"></a>        <a href="../../../include/access/xlogrecord.h.html#LN91"><span class='Ref_to_Struct'>XLogRecordBlockHeader</span></a> <span class='Declare_Local'>bkpb</span><span class='Delimiter'>; 
+</span><a name="LN529"></a>        <a href="../../../include/access/xlogrecord.h.html#LN130"><span class='Ref_to_Struct'>XLogRecordBlockImageHeader</span></a> <span class='Declare_Local'>bimg</span><span class='Delimiter'>; 
+</span><a name="LN530"></a>        <a href="../../../include/access/xlogrecord.h.html#LN154"><span class='Ref_to_Struct'>XLogRecordBlockCompressHeader</span></a> <span class='Declare_Local'>cbimg</span> <span class='Operator'>= </span><span class='Delimiter'>{</span><span class='Number'>0</span><span class='Delimiter'>}; 
+</span><a name="LN531"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>samerel</span><span class='Delimiter'>; 
+</span><a name="LN532"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>is_compressed</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN533"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>include_image</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN43"><span class='Ref_to_Member'>in_use</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Determine if this block needs to be backed up */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../../include/access/xloginsert.h.html#LN29"><span class='Ref_to_Const'>REGBUF_FORCE_IMAGE</span></a><span class='Parentheses'>) 
+</span>            <a href="xloginsert.c.html#LN526"><span class='Ref_To_Local'>needs_backup</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../../include/access/xloginsert.h.html#LN30"><span class='Ref_to_Const'>REGBUF_NO_IMAGE</span></a><span class='Parentheses'>) 
+</span>            <a href="xloginsert.c.html#LN526"><span class='Ref_To_Local'>needs_backup</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="xloginsert.c.html#LN483"><span class='Ref_to_Parameter'>doPageWrites</span></a><span class='Parentheses'>) 
+</span>            <a href="xloginsert.c.html#LN526"><span class='Ref_To_Local'>needs_backup</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * We assume page LSN is first data on *every* page that can be 
+             * passed to XLogInsert, whether it has the standard page layout 
+             * or not. 
+             */ 
+</span><a name="LN552"></a>            <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>page_lsn</span> <span class='Operator'>= </span><a href="../../../include/storage/bufpage.h.html#LN362"><span class='Ref_to_Macro'>PageGetLSN</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN48"><span class='Ref_to_Member'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="xloginsert.c.html#LN526"><span class='Ref_To_Local'>needs_backup</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN552"><span class='Ref_To_Local'>page_lsn</span></a> <span class='Operator'>&LT;= </span><a href="xloginsert.c.html#LN483"><span class='Ref_to_Parameter'>RedoRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="xloginsert.c.html#LN526"><span class='Ref_To_Local'>needs_backup</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xloginsert.c.html#LN484"><span class='Ref_to_Parameter'>fpw_lsn</span></a> <span class='Operator'>== </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a> <span class='Operator'>|| </span><a href="xloginsert.c.html#LN552"><span class='Ref_To_Local'>page_lsn</span></a> <span class='Operator'>&LT; *</span><a href="xloginsert.c.html#LN484"><span class='Ref_to_Parameter'>fpw_lsn</span></a><span class='Parentheses'>) 
+</span>                    <span class='Operator'>*</span><a href="xloginsert.c.html#LN484"><span class='Ref_to_Parameter'>fpw_lsn</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN552"><span class='Ref_To_Local'>page_lsn</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Determine if the buffer data needs to included */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN49"><span class='Ref_to_Member'>rdata_len</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="xloginsert.c.html#LN527"><span class='Ref_To_Local'>needs_data</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../../include/access/xloginsert.h.html#LN37"><span class='Ref_to_Const'>REGBUF_KEEP_DATA</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <a href="xloginsert.c.html#LN527"><span class='Ref_To_Local'>needs_data</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="xloginsert.c.html#LN527"><span class='Ref_To_Local'>needs_data</span></a> <span class='Operator'>= !</span><a href="xloginsert.c.html#LN526"><span class='Ref_To_Local'>needs_backup</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="xloginsert.c.html#LN528"><span class='Ref_To_Local'>bkpb</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN93"><span class='Ref_to_Member'>id</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN488"><span class='Ref_To_Local'>block_id</span></a><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN528"><span class='Ref_To_Local'>bkpb</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN94"><span class='Ref_to_Member'>fork_flags</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN46"><span class='Ref_to_Member'>forkno</span></a><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN528"><span class='Ref_To_Local'>bkpb</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN95"><span class='Ref_to_Member'>data_length</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../../include/access/xloginsert.h.html#LN31"><span class='Ref_to_Const'>REGBUF_WILL_INIT</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="../../../include/access/xloginsert.h.html#LN31"><span class='Ref_to_Const'>REGBUF_WILL_INIT</span></a><span class='Parentheses'>)</span> 
+            <a href="xloginsert.c.html#LN528"><span class='Ref_To_Local'>bkpb</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN94"><span class='Ref_to_Member'>fork_flags</span></a> <span class='Operator'>|= </span><a href="../../../include/access/xlogrecord.h.html#LN181"><span class='Ref_to_Const'>BKPBLOCK_WILL_INIT</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If needs_backup is true or WAL checking is enabled for current 
+         * resource manager, log a full-page write for the current block. 
+         */ 
+</span>        <a href="xloginsert.c.html#LN533"><span class='Ref_To_Local'>include_image</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN526"><span class='Ref_To_Local'>needs_backup</span></a> <span class='Operator'>|| </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN482"><span class='Ref_to_Parameter'>info</span></a> <span class='Operator'>& </span><a href="../../../include/access/xlogrecord.h.html#LN79"><span class='Ref_to_Const'>XLR_CHECK_CONSISTENCY</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN533"><span class='Ref_To_Local'>include_image</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN585"></a>            <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span> <span class='Operator'>= </span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN48"><span class='Ref_to_Member'>page</span></a><span class='Delimiter'>; 
+</span><a name="LN586"></a>            <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>compressed_len</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * The page needs to be backed up, so calculate its hole length 
+             * and offset. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../../include/access/xloginsert.h.html#LN34"><span class='Ref_to_Const'>REGBUF_STANDARD</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* Assume we can omit data between pd_lower and pd_upper */ 
+</span><a name="LN595"></a>                <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>lower</span> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/storage/bufpage.h.html#LN161"><span class='Ref_to_Typedef'>PageHeader</span></a><span class='Parentheses'>) </span><a href="xloginsert.c.html#LN585"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>pd_lower<span class='Delimiter'>; 
+</span><a name="LN596"></a>                <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>upper</span> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/storage/bufpage.h.html#LN161"><span class='Ref_to_Typedef'>PageHeader</span></a><span class='Parentheses'>) </span><a href="xloginsert.c.html#LN585"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>pd_upper<span class='Delimiter'>; 
+</span> 
+                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN595"><span class='Ref_To_Local'>lower</span></a> <span class='Operator'>&GT;= </span><a href="../../../include/storage/bufpage.h.html#LN212"><span class='Ref_to_Const'>SizeOfPageHeaderData</span></a> <span class='Operator'>&& 
+</span>                    <a href="xloginsert.c.html#LN596"><span class='Ref_To_Local'>upper</span></a> <span class='Operator'>&GT; </span><a href="xloginsert.c.html#LN595"><span class='Ref_To_Local'>lower</span></a> <span class='Operator'>&& 
+</span>                    <a href="xloginsert.c.html#LN596"><span class='Ref_To_Local'>upper</span></a> <span class='Operator'>&LT;= </span>BLCKSZ<span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN133"><span class='Ref_to_Member'>hole_offset</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN595"><span class='Ref_To_Local'>lower</span></a><span class='Delimiter'>; 
+</span>                    <a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN596"><span class='Ref_To_Local'>upper</span></a> <span class='Operator'>- </span><a href="xloginsert.c.html#LN595"><span class='Ref_To_Local'>lower</span></a><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>                <span class='Control'>else</span> 
+                <span class='Delimiter'>{ 
+</span>                    <span class='Comment_Multi_Line'>/* No "hole" to compress out */ 
+</span>                    <a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN133"><span class='Ref_to_Member'>hole_offset</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>                    <a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if regbuf-&GT;flags&REGBUF_... &raquo; </span> 
+            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* Not a standard page header, don't try to eliminate "hole" */ 
+</span>                <a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN133"><span class='Ref_to_Member'>hole_offset</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>                <a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Try to compress a block image if wal_compression is enabled 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlog.c.html#LN98"><span class='Ref_to_Global_Var'>wal_compression</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="xloginsert.c.html#LN532"><span class='Ref_To_Local'>is_compressed</span></a> <span class='Operator'>= 
+</span>                    <a href="xloginsert.c.html#LN111"><span class='Ref_to_Proto'>XLogCompressBackupBlock</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN585"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN133"><span class='Ref_to_Member'>hole_offset</span></a><span class='Delimiter'>, 
+</span>                                            <a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a><span class='Delimiter'>, 
+</span>                                            <a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN59"><span class='Ref_to_Member'>compressed_page</span></a><span class='Delimiter'>, 
+</span>                                            <span class='Operator'>&</span><a href="xloginsert.c.html#LN586"><span class='Ref_To_Local'>compressed_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Fill in the remaining fields in the XLogRecordBlockHeader 
+             * struct 
+             */ 
+</span>            <a href="xloginsert.c.html#LN528"><span class='Ref_To_Local'>bkpb</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN94"><span class='Ref_to_Member'>fork_flags</span></a> <span class='Operator'>|= </span><a href="../../../include/access/xlogrecord.h.html#LN179"><span class='Ref_to_Const'>BKPBLOCK_HAS_IMAGE</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Construct XLogRecData entries for the page content. 
+             */ 
+</span>            <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN55"><span class='Ref_to_Member'>bkp_rdatas</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]; 
+</span>            <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; 
+</span> 
+            <a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN134"><span class='Ref_to_Member'>bimg_info</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) </span><span class='Operator'>? </span><span class='Number'>0</span> <span class='Operator'>: </span><a href="../../../include/access/xlogrecord.h.html#LN146"><span class='Ref_to_Const'>BKPIMAGE_HAS_HOLE</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * If WAL consistency checking is enabled for the resource manager 
+             * of this WAL record, a full-page image is included in the record 
+             * for the block modified. During redo, the full-page is replayed 
+             * only if BKPIMAGE_APPLY is set. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN526"><span class='Ref_To_Local'>needs_backup</span></a><span class='Parentheses'>) 
+</span>                <a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN134"><span class='Ref_to_Member'>bimg_info</span></a> <span class='Operator'>|= </span><a href="../../../include/access/xlogrecord.h.html#LN148"><span class='Ref_to_Const'>BKPIMAGE_APPLY</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN532"><span class='Ref_To_Local'>is_compressed</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN132"><span class='Ref_to_Member'>length</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN586"><span class='Ref_To_Local'>compressed_len</span></a><span class='Delimiter'>; 
+</span>                <a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN134"><span class='Ref_to_Member'>bimg_info</span></a> <span class='Operator'>|= </span><a href="../../../include/access/xlogrecord.h.html#LN147"><span class='Ref_to_Const'>BKPIMAGE_IS_COMPRESSED</span></a><span class='Delimiter'>; 
+</span> 
+                <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN243"><span class='Ref_to_Member'>data</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN59"><span class='Ref_to_Member'>compressed_page</span></a><span class='Delimiter'>; 
+</span>                <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN586"><span class='Ref_To_Local'>compressed_len</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN132"><span class='Ref_to_Member'>length</span></a> <span class='Operator'>= </span>BLCKSZ <span class='Operator'>- </span><a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN243"><span class='Ref_to_Member'>data</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN585"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>; 
+</span>                    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>= </span>BLCKSZ<span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>                <span class='Control'>else</span> 
+                <span class='Delimiter'>{ 
+</span>                    <span class='Comment_Multi_Line'>/* must skip the hole */ 
+</span>                    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN243"><span class='Ref_to_Member'>data</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN585"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>; 
+</span>                    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN133"><span class='Ref_to_Member'>hole_offset</span></a><span class='Delimiter'>; 
+</span> 
+                    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= &</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN55"><span class='Ref_to_Member'>bkp_rdatas</span></a><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span>                    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; 
+</span> 
+                    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN243"><span class='Ref_to_Member'>data</span></a> <span class='Operator'>= 
+</span>                        <a href="xloginsert.c.html#LN585"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>+ </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN133"><span class='Ref_to_Member'>hole_offset</span></a> <span class='Operator'>+ </span><a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>= 
+</span>                        BLCKSZ <span class='Operator'>- </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN133"><span class='Ref_to_Member'>hole_offset</span></a> <span class='Operator'>+ </span><a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+ 
+            <a href="xloginsert.c.html#LN487"><span class='Ref_To_Local'>total_len</span></a> <span class='Operator'>+= </span><a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN132"><span class='Ref_to_Member'>length</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if include_image &raquo; </span> 
+ 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN527"><span class='Ref_To_Local'>needs_data</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * Link the caller-supplied rdata chain for this buffer to the 
+             * overall list. 
+             */ 
+</span>            <a href="xloginsert.c.html#LN528"><span class='Ref_To_Local'>bkpb</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN94"><span class='Ref_to_Member'>fork_flags</span></a> <span class='Operator'>|= </span><a href="../../../include/access/xlogrecord.h.html#LN180"><span class='Ref_to_Const'>BKPBLOCK_HAS_DATA</span></a><span class='Delimiter'>; 
+</span>            <a href="xloginsert.c.html#LN528"><span class='Ref_To_Local'>bkpb</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN95"><span class='Ref_to_Member'>data_length</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN49"><span class='Ref_to_Member'>rdata_len</span></a><span class='Delimiter'>; 
+</span>            <a href="xloginsert.c.html#LN487"><span class='Ref_To_Local'>total_len</span></a> <span class='Operator'>+= </span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN49"><span class='Ref_to_Member'>rdata_len</span></a><span class='Delimiter'>; 
+</span> 
+            <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN50"><span class='Ref_to_Member'>rdata_head</span></a><span class='Delimiter'>; 
+</span>            <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN52"><span class='Ref_to_Member'>rdata_tail</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN490"><span class='Ref_To_Local'>prev_regbuf</span></a> <span class='Operator'>&& </span><a href="../../../include/storage/relfilenode.h.html#LN87"><span class='Ref_to_Macro'>RelFileNodeEquals</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN45"><span class='Ref_to_Member'>rnode</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN490"><span class='Ref_To_Local'>prev_regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN45"><span class='Ref_to_Member'>rnode</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="xloginsert.c.html#LN531"><span class='Ref_To_Local'>samerel</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="xloginsert.c.html#LN528"><span class='Ref_To_Local'>bkpb</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN94"><span class='Ref_to_Member'>fork_flags</span></a> <span class='Operator'>|= </span><a href="../../../include/access/xlogrecord.h.html#LN182"><span class='Ref_to_Const'>BKPBLOCK_SAME_REL</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+            <a href="xloginsert.c.html#LN531"><span class='Ref_To_Local'>samerel</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN490"><span class='Ref_To_Local'>prev_regbuf</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Ok, copy the header to the scratch buffer */ 
+</span>        memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN528"><span class='Ref_To_Local'>bkpb</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlogrecord.h.html#LN103"><span class='Ref_to_Const'>SizeOfXLogRecordBlockHeader</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a> <span class='Operator'>+= </span><a href="../../../include/access/xlogrecord.h.html#LN103"><span class='Ref_to_Const'>SizeOfXLogRecordBlockHeader</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN533"><span class='Ref_To_Local'>include_image</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN529"><span class='Ref_To_Local'>bimg</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlogrecord.h.html#LN142"><span class='Ref_to_Const'>SizeOfXLogRecordBlockImageHeader</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a> <span class='Operator'>+= </span><a href="../../../include/access/xlogrecord.h.html#LN142"><span class='Ref_to_Const'>SizeOfXLogRecordBlockImageHeader</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Operator'>.</span><a href="../../../include/access/xlogrecord.h.html#LN156"><span class='Ref_to_Member'>hole_length</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="xloginsert.c.html#LN532"><span class='Ref_To_Local'>is_compressed</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN530"><span class='Ref_To_Local'>cbimg</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/access/xlogrecord.h.html#LN159"><span class='Ref_to_Const'>SizeOfXLogRecordBlockCompressHeader</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a> <span class='Operator'>+= </span><a href="../../../include/access/xlogrecord.h.html#LN159"><span class='Ref_to_Const'>SizeOfXLogRecordBlockCompressHeader</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="xloginsert.c.html#LN531"><span class='Ref_To_Local'>samerel</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN45"><span class='Ref_to_Member'>rnode</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a> <span class='Operator'>+= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN525"><span class='Ref_To_Local'>regbuf</span></a><span class='Operator'>-&GT;</span><a href="xloginsert.c.html#LN47"><span class='Ref_to_Member'>block</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a> <span class='Operator'>+= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for block_id=0;block_id&LT;m... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* followed by the record's origin, if any */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="xloginsert.c.html#LN76"><span class='Ref_to_Global_Var'>curinsert_flags</span></a> <span class='Operator'>& </span><a href="../../../include/access/xlog.h.html#LN191"><span class='Ref_to_Const'>XLOG_INCLUDE_ORIGIN</span></a><span class='Parentheses'>) </span><span class='Operator'>&& 
+</span>        <a href="../../replication/logical/origin.c.html#LN149"><span class='Ref_to_Global_Var'>replorigin_session_origin</span></a> <span class='Operator'>!= </span><a href="../../../include/replication/origin.h.html#LN33"><span class='Ref_to_Const'>InvalidRepOriginId</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Operator'>++</span><span class='Parentheses'>) </span><span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>char</span><span class='Parentheses'>) </span><a href="../../../include/access/xlogrecord.h.html#LN224"><span class='Ref_to_Const'>XLR_BLOCK_ID_ORIGIN</span></a><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="../../replication/logical/origin.c.html#LN149"><span class='Ref_to_Global_Var'>replorigin_session_origin</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../replication/logical/origin.c.html#LN149"><span class='Ref_to_Global_Var'>replorigin_session_origin</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a> <span class='Operator'>+= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../replication/logical/origin.c.html#LN149"><span class='Ref_to_Global_Var'>replorigin_session_origin</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* followed by main data, if any */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN73"><span class='Ref_to_Global_Var'>mainrdata_len</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN73"><span class='Ref_to_Global_Var'>mainrdata_len</span></a> <span class='Operator'>&GT; </span><span class='Number'>255</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Operator'>*</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Operator'>++</span><span class='Parentheses'>) </span><span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>char</span><span class='Parentheses'>) </span><a href="../../../include/access/xlogrecord.h.html#LN223"><span class='Ref_to_Const'>XLR_BLOCK_ID_DATA_LONG</span></a><span class='Delimiter'>; 
+</span>            memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN73"><span class='Ref_to_Global_Var'>mainrdata_len</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a> <span class='Operator'>+= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Operator'>*</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Operator'>++</span><span class='Parentheses'>) </span><span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>char</span><span class='Parentheses'>) </span><a href="../../../include/access/xlogrecord.h.html#LN222"><span class='Ref_to_Const'>XLR_BLOCK_ID_DATA_SHORT</span></a><span class='Delimiter'>; 
+</span>            <span class='Operator'>*</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a><span class='Operator'>++</span><span class='Parentheses'>) </span><span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a><span class='Parentheses'>) </span><a href="xloginsert.c.html#LN73"><span class='Ref_to_Global_Var'>mainrdata_len</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN71"><span class='Ref_to_Global_Var'>mainrdata_head</span></a><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN72"><span class='Ref_to_Global_Var'>mainrdata_last</span></a><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN487"><span class='Ref_To_Local'>total_len</span></a> <span class='Operator'>+= </span><a href="xloginsert.c.html#LN73"><span class='Ref_to_Global_Var'>mainrdata_len</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="xloginsert.c.html#LN491"><span class='Ref_To_Local'>rdt_datas_last</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <a href="xloginsert.c.html#LN86"><span class='Ref_to_Global_Var'>hdr_rdt</span></a><span class='Operator'>.</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN493"><span class='Ref_To_Local'>scratch</span></a> <span class='Operator'>- </span><a href="xloginsert.c.html#LN87"><span class='Ref_to_Global_Var'>hdr_scratch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN487"><span class='Ref_To_Local'>total_len</span></a> <span class='Operator'>+= </span><a href="xloginsert.c.html#LN86"><span class='Ref_to_Global_Var'>hdr_rdt</span></a><span class='Operator'>.</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Calculate CRC of the data 
+     * 
+     * Note that the record header isn't added into the CRC initially since we 
+     * don't know the prev-link yet.  Thus, the CRC will represent the CRC of 
+     * the whole record in the order: rdata, then backup blocks, then record 
+     * header. 
+     */ 
+</span>    <a href="../../../include/port/pg_crc32c.h.html#LN40"><span class='Ref_to_Macro'>INIT_CRC32C</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN489"><span class='Ref_To_Local'>rdata_crc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port/pg_crc32c.h.html#LN45"><span class='Ref_to_Macro'>COMP_CRC32C</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN489"><span class='Ref_To_Local'>rdata_crc</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN87"><span class='Ref_to_Global_Var'>hdr_scratch</span></a> <span class='Operator'>+ </span><a href="../../../include/access/xlogrecord.h.html#LN54"><span class='Ref_to_Const'>SizeOfXLogRecord</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN86"><span class='Ref_to_Global_Var'>hdr_rdt</span></a><span class='Operator'>.</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>- </span><a href="../../../include/access/xlogrecord.h.html#LN54"><span class='Ref_to_Const'>SizeOfXLogRecord</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN486"><span class='Ref_To_Local'>rdt</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN86"><span class='Ref_to_Global_Var'>hdr_rdt</span></a><span class='Operator'>.</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN486"><span class='Ref_To_Local'>rdt</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="xloginsert.c.html#LN486"><span class='Ref_To_Local'>rdt</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN486"><span class='Ref_To_Local'>rdt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN242"><span class='Ref_to_Member'>next</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/port/pg_crc32c.h.html#LN45"><span class='Ref_to_Macro'>COMP_CRC32C</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN489"><span class='Ref_To_Local'>rdata_crc</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN486"><span class='Ref_To_Local'>rdt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN243"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN486"><span class='Ref_To_Local'>rdt</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlog_internal.h.html#LN244"><span class='Ref_to_Member'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Fill in the fields in the record header. Prev-link is filled in later, 
+     * once we know where in the WAL the record will be inserted. The CRC does 
+     * not include the record header yet. 
+     */ 
+</span>    <a href="xloginsert.c.html#LN492"><span class='Ref_To_Local'>rechdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogrecord.h.html#LN43"><span class='Ref_to_Member'>xl_xid</span></a> <span class='Operator'>= </span><a href="../../../include/access/xact.h.html#LN334"><span class='Ref_to_Proto'>GetCurrentTransactionIdIfAny</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN492"><span class='Ref_To_Local'>rechdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogrecord.h.html#LN42"><span class='Ref_to_Member'>xl_tot_len</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN487"><span class='Ref_To_Local'>total_len</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN492"><span class='Ref_To_Local'>rechdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogrecord.h.html#LN45"><span class='Ref_to_Member'>xl_info</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN482"><span class='Ref_to_Parameter'>info</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN492"><span class='Ref_To_Local'>rechdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogrecord.h.html#LN46"><span class='Ref_to_Member'>xl_rmid</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN482"><span class='Ref_to_Parameter'>rmid</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN492"><span class='Ref_To_Local'>rechdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogrecord.h.html#LN44"><span class='Ref_to_Member'>xl_prev</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN492"><span class='Ref_To_Local'>rechdr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogrecord.h.html#LN48"><span class='Ref_to_Member'>xl_crc</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN489"><span class='Ref_To_Local'>rdata_crc</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Operator'>&</span><a href="xloginsert.c.html#LN86"><span class='Ref_to_Global_Var'>hdr_rdt</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogRecordAssemble &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Create a compressed version of a backup block image. 
+ * 
+ * Returns FALSE if compression fails (i.e., compressed result is actually 
+ * bigger than original). Otherwise, returns TRUE and sets 'dlen' to 
+ * the length of compressed block image. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN804"></a><span class='Declare_Function'>XLogCompressBackupBlock</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>page</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>hole_offset</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>hole_length</span><span class='Delimiter'>, 
+</span><a name="LN805"></a>                        <span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>dest</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>dlen</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN807"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>orig_len</span> <span class='Operator'>= </span>BLCKSZ <span class='Operator'>- </span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>hole_length</span></a><span class='Delimiter'>; 
+</span><a name="LN808"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>len</span><span class='Delimiter'>; 
+</span><a name="LN809"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>extra_bytes</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN810"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>source</span><span class='Delimiter'>; 
+</span><a name="LN811"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>tmp</span><span class='Delimiter'>[</span>BLCKSZ<span class='Delimiter'>]; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>hole_length</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* must skip the hole */ 
+</span>        <a href="xloginsert.c.html#LN810"><span class='Ref_To_Local'>source</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN811"><span class='Ref_To_Local'>tmp</span></a><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN810"><span class='Ref_To_Local'>source</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>page</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>hole_offset</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN810"><span class='Ref_To_Local'>source</span></a> <span class='Operator'>+ </span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>hole_offset</span></a><span class='Delimiter'>, 
+</span>               <a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>page</span></a> <span class='Operator'>+ </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>hole_offset</span></a> <span class='Operator'>+ </span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>hole_length</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>               BLCKSZ <span class='Operator'>- </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>hole_length</span></a> <span class='Operator'>+ </span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>hole_offset</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Extra data needs to be stored in WAL record for the compressed 
+         * version of block image if the hole exists. 
+         */ 
+</span>        <a href="xloginsert.c.html#LN809"><span class='Ref_To_Local'>extra_bytes</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogrecord.h.html#LN159"><span class='Ref_to_Const'>SizeOfXLogRecordBlockCompressHeader</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <a href="xloginsert.c.html#LN810"><span class='Ref_To_Local'>source</span></a> <span class='Operator'>= </span><a href="xloginsert.c.html#LN804"><span class='Ref_to_Parameter'>page</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We recheck the actual size even if pglz_compress() reports success and 
+     * see if the number of bytes saved by compression is larger than the 
+     * length of extra data needed for the compressed version of block image. 
+     */ 
+</span>    <a href="xloginsert.c.html#LN808"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>= </span><a href="../../../include/common/pg_lzcompress.h.html#LN85"><span class='Ref_to_Proto'>pglz_compress</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN810"><span class='Ref_To_Local'>source</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN807"><span class='Ref_To_Local'>orig_len</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN805"><span class='Ref_to_Parameter'>dest</span></a><span class='Delimiter'>, </span><a href="../../../common/pg_lzcompress.c.html#LN229"><span class='Ref_to_Global_Var'>PGLZ_strategy_default</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN808"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>        <a href="xloginsert.c.html#LN808"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>+ </span><a href="xloginsert.c.html#LN809"><span class='Ref_To_Local'>extra_bytes</span></a> <span class='Operator'>&LT; </span><a href="xloginsert.c.html#LN807"><span class='Ref_To_Local'>orig_len</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="xloginsert.c.html#LN805"><span class='Ref_to_Parameter'>dlen</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a><span class='Parentheses'>) </span><a href="xloginsert.c.html#LN808"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* successful compression */ 
+</span>        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogCompressBackupBlock &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Determine whether the buffer referenced has to be backed up. 
+ * 
+ * Since we don't yet have the insert lock, fullPageWrites and forcePageWrites 
+ * could change later, so the result should be used for optimization purposes 
+ * only. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN854"></a><span class='Declare_Function'>XLogCheckBufferNeedsBackup</span><span class='Parentheses'>(</span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Parameter'>buffer</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN856"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>RedoRecPtr</span><span class='Delimiter'>; 
+</span><a name="LN857"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>doPageWrites</span><span class='Delimiter'>; 
+</span><a name="LN858"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xlog.h.html#LN272"><span class='Ref_to_Proto'>GetFullPageWriteInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xloginsert.c.html#LN856"><span class='Ref_To_Local'>RedoRecPtr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN857"><span class='Ref_To_Local'>doPageWrites</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="xloginsert.c.html#LN858"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN854"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN857"><span class='Ref_To_Local'>doPageWrites</span></a> <span class='Operator'>&& </span><a href="../../../include/storage/bufpage.h.html#LN362"><span class='Ref_to_Macro'>PageGetLSN</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN858"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT;= </span><a href="xloginsert.c.html#LN856"><span class='Ref_To_Local'>RedoRecPtr</span></a><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* buffer requires backup */ 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>;</span>               <span class='Comment_Single_Line'>/* buffer does not need to be backed up */ 
+</span><span class='Delimiter'>} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Write a backup block if needed when we are setting a hint. Note that 
+ * this may be called for a variety of page types, not just heaps. 
+ * 
+ * Callable while holding just share lock on the buffer content. 
+ * 
+ * We can't use the plain backup block mechanism since that relies on the 
+ * Buffer being exclusively locked. Since some modifications (setting LSN, hint 
+ * bits) are allowed in a sharelocked buffer that can lead to wal checksum 
+ * failures. So instead we copy the page and insert the copied data as normal 
+ * record data. 
+ * 
+ * We only need to do something if page has not yet been full page written in 
+ * this checkpoint round. The LSN of the inserted wal record is returned if we 
+ * had to write, InvalidXLogRecPtr otherwise. 
+ * 
+ * It is possible that multiple concurrent backends could attempt to write WAL 
+ * records. In that case, multiple copies of the same block would be recorded 
+ * in separate WAL records by different backends, though that is still OK from 
+ * a correctness perspective. 
+ */ 
+</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> 
+<a name="LN892"></a><span class='Declare_Function'>XLogSaveBufferForHint</span><span class='Parentheses'>(</span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Parameter'>buffer</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>buffer_std</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN894"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span><a name="LN895"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>lsn</span><span class='Delimiter'>; 
+</span><a name="LN896"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>RedoRecPtr</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Ensure no checkpoint can change our view of RedoRecPtr. 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../storage/lmgr/proc.c.html#LN67"><span class='Ref_to_Global_Var'>MyPgXact</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN219"><span class='Ref_to_Member'>delayChkpt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Update RedoRecPtr so that we can make the right decision 
+     */ 
+</span>    <a href="xloginsert.c.html#LN896"><span class='Ref_To_Local'>RedoRecPtr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlog.h.html#LN273"><span class='Ref_to_Proto'>GetRedoRecPtr</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We assume page LSN is first data on *every* page that can be passed to 
+     * XLogInsert, whether it has the standard page layout or not. Since we're 
+     * only holding a share-lock on the page, we must take the buffer header 
+     * lock when we look at the LSN. 
+     */ 
+</span>    <a href="xloginsert.c.html#LN895"><span class='Ref_To_Local'>lsn</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN202"><span class='Ref_to_Proto'>BufferGetLSNAtomic</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN892"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN895"><span class='Ref_To_Local'>lsn</span></a> <span class='Operator'>&LT;= </span><a href="xloginsert.c.html#LN896"><span class='Ref_To_Local'>RedoRecPtr</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN918"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>flags</span><span class='Delimiter'>; 
+</span><a name="LN919"></a>        <span class='Keyword'>char</span>        <span class='Declare_Local'>copied_buffer</span><span class='Delimiter'>[</span>BLCKSZ<span class='Delimiter'>]; 
+</span><a name="LN920"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>origdata</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/storage/bufmgr.h.html#LN126"><span class='Ref_to_Macro'>BufferGetBlock</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN892"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN921"></a>        <a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Local'>rnode</span><span class='Delimiter'>; 
+</span><a name="LN922"></a>        <a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a>  <span class='Declare_Local'>forkno</span><span class='Delimiter'>; 
+</span><a name="LN923"></a>        <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>blkno</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Copy buffer so we don't have to worry about concurrent hint bit or 
+         * lsn updates. We assume pd_lower/upper cannot be changed without an 
+         * exclusive lock, so the contents bkp are not racy. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN892"><span class='Ref_to_Parameter'>buffer_std</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Assume we can omit data between pd_lower and pd_upper */ 
+</span><a name="LN933"></a>            <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN892"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN934"></a>            <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>lower</span> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/storage/bufpage.h.html#LN161"><span class='Ref_to_Typedef'>PageHeader</span></a><span class='Parentheses'>) </span><a href="xloginsert.c.html#LN933"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>pd_lower<span class='Delimiter'>; 
+</span><a name="LN935"></a>            <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>upper</span> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/storage/bufpage.h.html#LN161"><span class='Ref_to_Typedef'>PageHeader</span></a><span class='Parentheses'>) </span><a href="xloginsert.c.html#LN933"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>pd_upper<span class='Delimiter'>; 
+</span> 
+            memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN919"><span class='Ref_To_Local'>copied_buffer</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN920"><span class='Ref_To_Local'>origdata</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN934"><span class='Ref_To_Local'>lower</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN919"><span class='Ref_To_Local'>copied_buffer</span></a> <span class='Operator'>+ </span><a href="xloginsert.c.html#LN935"><span class='Ref_To_Local'>upper</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN920"><span class='Ref_To_Local'>origdata</span></a> <span class='Operator'>+ </span><a href="xloginsert.c.html#LN935"><span class='Ref_To_Local'>upper</span></a><span class='Delimiter'>, </span>BLCKSZ <span class='Operator'>- </span><a href="xloginsert.c.html#LN935"><span class='Ref_To_Local'>upper</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+            memcpy<span class='Parentheses'>(</span><a href="xloginsert.c.html#LN919"><span class='Ref_To_Local'>copied_buffer</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN920"><span class='Ref_To_Local'>origdata</span></a><span class='Delimiter'>, </span>BLCKSZ<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="xloginsert.c.html#LN918"><span class='Ref_To_Local'>flags</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN29"><span class='Ref_to_Const'>REGBUF_FORCE_IMAGE</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN892"><span class='Ref_to_Parameter'>buffer_std</span></a><span class='Parentheses'>) 
+</span>            <a href="xloginsert.c.html#LN918"><span class='Ref_To_Local'>flags</span></a> <span class='Operator'>|= </span><a href="../../../include/access/xloginsert.h.html#LN34"><span class='Ref_to_Const'>REGBUF_STANDARD</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/bufmgr.h.html#LN208"><span class='Ref_to_Proto'>BufferGetTag</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN892"><span class='Ref_to_Parameter'>buffer</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN921"><span class='Ref_To_Local'>rnode</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN922"><span class='Ref_To_Local'>forkno</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN923"><span class='Ref_To_Local'>blkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN47"><span class='Ref_to_Proto'>XLogRegisterBlock</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN921"><span class='Ref_To_Local'>rnode</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN922"><span class='Ref_To_Local'>forkno</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN923"><span class='Ref_To_Local'>blkno</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN919"><span class='Ref_To_Local'>copied_buffer</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN918"><span class='Ref_To_Local'>flags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="xloginsert.c.html#LN894"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_XLOG_ID<span class='Delimiter'>, </span><a href="../../../include/catalog/pg_control.h.html#LN75"><span class='Ref_to_Const'>XLOG_FPI_FOR_HINT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if lsn&LT;=RedoRecPtr &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="xloginsert.c.html#LN894"><span class='Ref_To_Local'>recptr</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogSaveBufferForHint &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Write a WAL record containing a full image of a page. Caller is responsible 
+ * for writing the page to disk after calling this routine. 
+ * 
+ * Note: If you're using this function, you should be building pages in private 
+ * memory and writing them directly to smgr.  If you're using buffers, call 
+ * log_newpage_buffer instead. 
+ * 
+ * If the page follows the standard page layout, with a PageHeader and unused 
+ * space between pd_lower and pd_upper, set 'page_std' to TRUE. That allows 
+ * the unused space to be left out from the WAL record, making it smaller. 
+ */ 
+</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> 
+<a name="LN971"></a><span class='Declare_Function'>log_newpage</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forkNum</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>blkno</span><span class='Delimiter'>, 
+</span><a name="LN972"></a>            <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a> <span class='Declare_Parameter'>page</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>page_std</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN974"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>flags</span><span class='Delimiter'>; 
+</span><a name="LN975"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span><span class='Delimiter'>; 
+</span> 
+    <a href="xloginsert.c.html#LN974"><span class='Ref_To_Local'>flags</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN29"><span class='Ref_to_Const'>REGBUF_FORCE_IMAGE</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN972"><span class='Ref_to_Parameter'>page_std</span></a><span class='Parentheses'>) 
+</span>        <a href="xloginsert.c.html#LN974"><span class='Ref_To_Local'>flags</span></a> <span class='Operator'>|= </span><a href="../../../include/access/xloginsert.h.html#LN34"><span class='Ref_to_Const'>REGBUF_STANDARD</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN47"><span class='Ref_to_Proto'>XLogRegisterBlock</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN971"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN971"><span class='Ref_to_Parameter'>forkNum</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN971"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN972"><span class='Ref_to_Parameter'>page</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN974"><span class='Ref_To_Local'>flags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xloginsert.c.html#LN975"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_XLOG_ID<span class='Delimiter'>, </span><a href="../../../include/catalog/pg_control.h.html#LN76"><span class='Ref_to_Const'>XLOG_FPI</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The page may be uninitialized. If so, we can't set the LSN because that 
+     * would corrupt the page. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/bufpage.h.html#LN225"><span class='Ref_to_Macro'>PageIsNew</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN972"><span class='Ref_to_Parameter'>page</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/bufpage.h.html#LN364"><span class='Ref_to_Macro'>PageSetLSN</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN972"><span class='Ref_to_Parameter'>page</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN975"><span class='Ref_To_Local'>recptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="xloginsert.c.html#LN975"><span class='Ref_To_Local'>recptr</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end log_newpage &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Write a WAL record containing a full image of a page. 
+ * 
+ * Caller should initialize the buffer and mark it dirty before calling this 
+ * function.  This function will set the page LSN. 
+ * 
+ * If the page follows the standard page layout, with a PageHeader and unused 
+ * space between pd_lower and pd_upper, set 'page_std' to TRUE. That allows 
+ * the unused space to be left out from the WAL record, making it smaller. 
+ */ 
+</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> 
+<a name="LN1008"></a><span class='Declare_Function'>log_newpage_buffer</span><span class='Parentheses'>(</span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Parameter'>buffer</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>page_std</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1010"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN1008"><span class='Ref_to_Parameter'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN1011"></a>    <a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Local'>rnode</span><span class='Delimiter'>; 
+</span><a name="LN1012"></a>    <a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a>  <span class='Declare_Local'>forkNum</span><span class='Delimiter'>; 
+</span><a name="LN1013"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>blkno</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Shared buffers should be modified in a critical section. */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN36"><span class='Ref_to_Global_Var'>CritSectionCount</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN208"><span class='Ref_to_Proto'>BufferGetTag</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN1008"><span class='Ref_to_Parameter'>buffer</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN1011"><span class='Ref_To_Local'>rnode</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN1012"><span class='Ref_To_Local'>forkNum</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xloginsert.c.html#LN1013"><span class='Ref_To_Local'>blkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../../include/access/xloginsert.h.html#LN54"><span class='Ref_to_Proto'>log_newpage</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xloginsert.c.html#LN1011"><span class='Ref_To_Local'>rnode</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN1012"><span class='Ref_To_Local'>forkNum</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN1013"><span class='Ref_To_Local'>blkno</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN1010"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="xloginsert.c.html#LN1008"><span class='Ref_to_Parameter'>page_std</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Allocate working buffers needed for WAL record construction. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN1027"></a><span class='Declare_Function'>InitXLogInsert</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Initialize the working areas */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN106"><span class='Ref_to_Global_Var'>xloginsert_cxt</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="xloginsert.c.html#LN106"><span class='Ref_to_Global_Var'>xloginsert_cxt</span></a> <span class='Operator'>= </span><a href="../../../include/utils/memutils.h.html#LN145"><span class='Ref_to_Proto'>AllocSetContextCreate</span></a><span class='Parentheses'>(</span><a href="../../utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, 
+</span>                                               <span class='String'>"WAL record construction"</span><span class='Delimiter'>, 
+</span>                                               <a href="../../../include/utils/memutils.h.html#LN164"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_SIZES</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="xloginsert.c.html#LN62"><span class='Ref_to_Global_Var'>registered_buffers</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>            <a href="../../../include/utils/palloc.h.html#LN71"><span class='Ref_to_Proto'>MemoryContextAllocZero</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN106"><span class='Ref_to_Global_Var'>xloginsert_cxt</span></a><span class='Delimiter'>, 
+</span>                  <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN41"><span class='Ref_to_Typedef'>registered_buffer</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Parentheses'>(</span><a href="../../../include/access/xloginsert.h.html#LN25"><span class='Ref_to_Const'>XLR_NORMAL_MAX_BLOCK_ID</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN63"><span class='Ref_to_Global_Var'>max_registered_buffers</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN25"><span class='Ref_to_Const'>XLR_NORMAL_MAX_BLOCK_ID</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN99"><span class='Ref_to_Global_Var'>rdatas</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="xloginsert.c.html#LN99"><span class='Ref_to_Global_Var'>rdatas</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN70"><span class='Ref_to_Proto'>MemoryContextAlloc</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN106"><span class='Ref_to_Global_Var'>xloginsert_cxt</span></a><span class='Delimiter'>, 
+</span>                                    <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/xlog_internal.h.html#LN240"><span class='Ref_to_Struct'>XLogRecData</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="../../../include/access/xloginsert.h.html#LN26"><span class='Ref_to_Const'>XLR_NORMAL_RDATAS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xloginsert.c.html#LN101"><span class='Ref_to_Global_Var'>max_rdatas</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN26"><span class='Ref_to_Const'>XLR_NORMAL_RDATAS</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Allocate a buffer to hold the header information for a WAL record. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xloginsert.c.html#LN87"><span class='Ref_to_Global_Var'>hdr_scratch</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="xloginsert.c.html#LN87"><span class='Ref_to_Global_Var'>hdr_scratch</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN71"><span class='Ref_to_Proto'>MemoryContextAllocZero</span></a><span class='Parentheses'>(</span><a href="xloginsert.c.html#LN106"><span class='Ref_to_Global_Var'>xloginsert_cxt</span></a><span class='Delimiter'>, 
+</span>                                             <a href="xloginsert.c.html#LN91"><span class='Ref_to_Const'>HEADER_SCRATCH_SIZE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end InitXLogInsert &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

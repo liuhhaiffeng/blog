@@ -1,0 +1,421 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\transam\subtrans.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\transam\subtrans.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:30 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * subtrans.c 
+ *      PostgreSQL subtransaction-log manager 
+ * 
+ * The pg_subtrans manager is a pg_xact-like manager that stores the parent 
+ * transaction Id for each transaction.  It is a fundamental part of the 
+ * nested transactions implementation.  A main transaction has a parent 
+ * of InvalidTransactionId, and each subtransaction has its immediate parent. 
+ * The tree can easily be walked from child to parent, but not in the 
+ * opposite direction. 
+ * 
+ * This code is based on xact.c, but the robustness requirements 
+ * are completely different from pg_xact, because we only need to remember 
+ * pg_subtrans information for currently-open transactions.  Thus, there is 
+ * no need to preserve data over a crash and restart. 
+ * 
+ * There are no XLOG interactions since we do not care about preserving 
+ * data across crashes.  During database startup, we simply force the 
+ * currently-active page of SUBTRANS to zeroes. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * src/backend/access/transam/subtrans.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/slru.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/subtrans.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/transam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pg_trace.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/snapmgr.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Defines for SubTrans page sizes.  A page is the same BLCKSZ as is used 
+ * everywhere else in Postgres. 
+ * 
+ * Note: because TransactionIds are 32 bits and wrap around at 0xFFFFFFFF, 
+ * SubTrans page numbering also wraps around at 
+ * 0xFFFFFFFF/SUBTRANS_XACTS_PER_PAGE, and segment numbering at 
+ * 0xFFFFFFFF/SUBTRANS_XACTS_PER_PAGE/SLRU_PAGES_PER_SEGMENT.  We need take no 
+ * explicit notice of that fact in this module, except when comparing segment 
+ * and page numbers in TruncateSUBTRANS (see SubTransPagePrecedes) and zeroing 
+ * them in StartupSUBTRANS. 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* We need four bytes per xact */ 
+</span><a name="LN51"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>SUBTRANS_XACTS_PER_PAGE</span> <span class='Parentheses'>(</span>BLCKSZ <span class='Operator'>/ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>))</span> 
+ 
+<a name="LN53"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>TransactionIdToPage</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>xid</span><span class='Parentheses'>) ((</span><a href="subtrans.c.html#LN53"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>/ </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="subtrans.c.html#LN51"><span class='Ref_to_Const'>SUBTRANS_XACTS_PER_PAGE</span></a><span class='Parentheses'>)</span> 
+<a name="LN54"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>TransactionIdToEntry</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>xid</span><span class='Parentheses'>) ((</span><a href="subtrans.c.html#LN54"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>% </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="subtrans.c.html#LN51"><span class='Ref_to_Const'>SUBTRANS_XACTS_PER_PAGE</span></a><span class='Parentheses'>)</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Link to shared-memory data structures for SUBTRANS control 
+ */ 
+</span><a name="LN60"></a><span class='Keyword'>static </span><a href="../../../include/access/slru.h.html#LN116"><span class='Ref_to_Struct'>SlruCtlData</span></a> <span class='Declare_Var'>SubTransCtlData</span><span class='Delimiter'>; 
+</span> 
+<a name="LN62"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>SubTransCtl</span>  <span class='Parentheses'>(</span><span class='Operator'>&</span><a href="subtrans.c.html#LN60"><span class='Ref_to_Global_Var'>SubTransCtlData</span></a><span class='Parentheses'>) 
+</span> 
+ 
+<a name="LN65"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>ZeroSUBTRANSPage</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN66"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>SubTransPagePrecedes</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>page1</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>page2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Record the parent of a subtransaction in the subtrans log. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN73"></a><span class='Declare_Function'>SubTransSetParent</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>parent</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN75"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN73"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN76"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>entryno</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN54"><span class='Ref_to_Macro'>TransactionIdToEntry</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN73"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN77"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span><a name="LN78"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Local'>ptr</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN73"><span class='Ref_to_Parameter'>parent</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN170"><span class='Ref_to_Proto'>TransactionIdFollows</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN73"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN73"><span class='Ref_to_Parameter'>parent</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SubtransControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="subtrans.c.html#LN77"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="../../../include/access/slru.h.html#LN147"><span class='Ref_to_Proto'>SimpleLruReadPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN75"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><a href="subtrans.c.html#LN73"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="subtrans.c.html#LN78"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_buffer<span class='Delimiter'>[</span><a href="subtrans.c.html#LN77"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]; 
+</span>    <a href="subtrans.c.html#LN78"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>+= </span><a href="subtrans.c.html#LN76"><span class='Ref_To_Local'>entryno</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * It's possible we'll try to set the parent xid multiple times but we 
+     * shouldn't ever be changing the xid from one valid xid to another valid 
+     * xid, which would corrupt the data structure. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="subtrans.c.html#LN78"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>!= </span><a href="subtrans.c.html#LN73"><span class='Ref_to_Parameter'>parent</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="subtrans.c.html#LN78"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>== </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="subtrans.c.html#LN78"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN73"><span class='Ref_to_Parameter'>parent</span></a><span class='Delimiter'>; 
+</span>        <a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_dirty<span class='Delimiter'>[</span><a href="subtrans.c.html#LN77"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SubtransControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SubTransSetParent &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Interrogate the parent of a transaction in the subtrans log. 
+ */ 
+</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> 
+<a name="LN108"></a><span class='Declare_Function'>SubTransGetParent</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN110"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN108"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN111"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>entryno</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN54"><span class='Ref_to_Macro'>TransactionIdToEntry</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN108"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN112"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span><a name="LN113"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Local'>ptr</span><span class='Delimiter'>; 
+</span><a name="LN114"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>parent</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Can't ask about stuff that might not be around anymore */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN171"><span class='Ref_to_Proto'>TransactionIdFollowsOrEquals</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN108"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="../../utils/time/snapmgr.c.html#LN163"><span class='Ref_to_Global_Var'>TransactionXmin</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Bootstrap and frozen XIDs have no parent */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN41"><span class='Ref_to_Macro'>TransactionIdIsNormal</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN108"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* lock is acquired by SimpleLruReadPage_ReadOnly */ 
+</span> 
+    <a href="subtrans.c.html#LN112"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="../../../include/access/slru.h.html#LN149"><span class='Ref_to_Proto'>SimpleLruReadPage_ReadOnly</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN110"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN108"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="subtrans.c.html#LN113"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_buffer<span class='Delimiter'>[</span><a href="subtrans.c.html#LN112"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]; 
+</span>    <a href="subtrans.c.html#LN113"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>+= </span><a href="subtrans.c.html#LN111"><span class='Ref_To_Local'>entryno</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="subtrans.c.html#LN114"><span class='Ref_To_Local'>parent</span></a> <span class='Operator'>= *</span><a href="subtrans.c.html#LN113"><span class='Ref_To_Local'>ptr</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SubtransControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="subtrans.c.html#LN114"><span class='Ref_To_Local'>parent</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SubTransGetParent &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SubTransGetTopmostTransaction 
+ * 
+ * Returns the topmost transaction of the given transaction id. 
+ * 
+ * Because we cannot look back further than TransactionXmin, it is possible 
+ * that this function will lie and return an intermediate subtransaction ID 
+ * instead of the true topmost parent ID.  This is OK, because in practice 
+ * we only care about detecting whether the topmost parent is still running 
+ * or is part of a current snapshot's list of still-running transactions. 
+ * Therefore, any XID before TransactionXmin is as good as any other. 
+ */ 
+</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> 
+<a name="LN149"></a><span class='Declare_Function'>SubTransGetTopmostTransaction</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN151"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>parentXid</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN149"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, 
+</span><a name="LN152"></a>                <span class='Declare_Local'>previousXid</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN149"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Can't ask about stuff that might not be around anymore */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN171"><span class='Ref_to_Proto'>TransactionIdFollowsOrEquals</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN149"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="../../utils/time/snapmgr.c.html#LN163"><span class='Ref_to_Global_Var'>TransactionXmin</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN151"><span class='Ref_To_Local'>parentXid</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="subtrans.c.html#LN152"><span class='Ref_To_Local'>previousXid</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN151"><span class='Ref_To_Local'>parentXid</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN151"><span class='Ref_To_Local'>parentXid</span></a><span class='Delimiter'>, </span><a href="../../utils/time/snapmgr.c.html#LN163"><span class='Ref_to_Global_Var'>TransactionXmin</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <a href="subtrans.c.html#LN151"><span class='Ref_To_Local'>parentXid</span></a> <span class='Operator'>= </span><a href="../../../include/access/subtrans.h.html#LN17"><span class='Ref_to_Proto'>SubTransGetParent</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN151"><span class='Ref_To_Local'>parentXid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * By convention the parent xid gets allocated first, so should always 
+         * precede the child xid. Anything else points to a corrupted data 
+         * structure that could lead to an infinite loop, so exit. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN151"><span class='Ref_To_Local'>parentXid</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN152"><span class='Ref_To_Local'>previousXid</span></a><span class='Parentheses'>))</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"pg_subtrans contains invalid entry: xid %u points to parent xid %u"</span><span class='Delimiter'>, 
+</span>                 <a href="subtrans.c.html#LN152"><span class='Ref_To_Local'>previousXid</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN151"><span class='Ref_To_Local'>parentXid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN152"><span class='Ref_To_Local'>previousXid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="subtrans.c.html#LN152"><span class='Ref_To_Local'>previousXid</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SubTransGetTopmostTransaction &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Initialization of shared memory for SUBTRANS 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN184"></a><span class='Declare_Function'>SUBTRANSShmemSize</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="slru.c.html#LN143"><span class='Ref_to_Func'>SimpleLruShmemSize</span></a><span class='Parentheses'>(</span><a href="../../../include/access/subtrans.h.html#LN14"><span class='Ref_to_Const'>NUM_SUBTRANS_BUFFERS</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>void 
+</span><a name="LN190"></a><span class='Declare_Function'>SUBTRANSShmemInit</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Operator'>-&GT;</span>PagePrecedes <span class='Operator'>= </span><a href="subtrans.c.html#LN66"><span class='Ref_to_Proto'>SubTransPagePrecedes</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/slru.h.html#LN144"><span class='Ref_to_Proto'>SimpleLruInit</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Delimiter'>, </span><span class='String'>"subtrans"</span><span class='Delimiter'>, </span><a href="../../../include/access/subtrans.h.html#LN14"><span class='Ref_to_Const'>NUM_SUBTRANS_BUFFERS</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                  SubtransControlLock<span class='Delimiter'>, </span><span class='String'>"pg_subtrans"</span><span class='Delimiter'>, 
+</span>                  <a href="../../../include/storage/lwlock.h.html#LN199"><span class='Ref_to_EnumConst'>LWTRANCHE_SUBTRANS_BUFFERS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* Override default assumption that writes should be fsync'd */ 
+</span>    <a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Operator'>-&GT;</span>do_fsync <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * This func must be called ONCE on system install.  It creates 
+ * the initial SUBTRANS segment.  (The SUBTRANS directory is assumed to 
+ * have been created by the initdb shell script, and SUBTRANSShmemInit 
+ * must have been called already.) 
+ * 
+ * Note: it's not really necessary to create the initial segment now, 
+ * since slru.c would create it on first write anyway.  But we may as well 
+ * do it to be sure the directory is set up correctly. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN211"></a><span class='Declare_Function'>BootStrapSUBTRANS</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN213"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SubtransControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Create and zero the first page of the subtrans log */ 
+</span>    <a href="subtrans.c.html#LN213"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN65"><span class='Ref_to_Proto'>ZeroSUBTRANSPage</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Make sure it's written out */ 
+</span>    <a href="../../../include/access/slru.h.html#LN151"><span class='Ref_to_Proto'>SimpleLruWritePage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN213"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_dirty<span class='Delimiter'>[</span><a href="subtrans.c.html#LN213"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SubtransControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize (or reinitialize) a page of SUBTRANS to zeroes. 
+ * 
+ * The page is not actually written, just set up in shared memory. 
+ * The slot number of the new page is returned. 
+ * 
+ * Control lock must be held at entry, and will be held at exit. 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN236"></a><span class='Declare_Function'>ZeroSUBTRANSPage</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="../../../include/access/slru.h.html#LN146"><span class='Ref_to_Proto'>SimpleLruZeroPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN236"><span class='Ref_to_Parameter'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * This must be called ONCE during postmaster or standalone-backend startup, 
+ * after StartupXLOG has initialized ShmemVariableCache-&GT;nextXid. 
+ * 
+ * oldestActiveXID is the oldest XID of any prepared transaction, or nextXid 
+ * if there are none. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN249"></a><span class='Declare_Function'>StartupSUBTRANS</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestActiveXID</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN251"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>startPage</span><span class='Delimiter'>; 
+</span><a name="LN252"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>endPage</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Since we don't expect pg_subtrans to be valid across crashes, we 
+     * initialize the currently-active page(s) to zeroes during startup. 
+     * Whenever we advance into a new page, ExtendSUBTRANS will likewise zero 
+     * the new page without regard to whatever was previously on disk. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SubtransControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="subtrans.c.html#LN251"><span class='Ref_To_Local'>startPage</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN249"><span class='Ref_to_Parameter'>oldestActiveXID</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="subtrans.c.html#LN252"><span class='Ref_To_Local'>endPage</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN116"><span class='Ref_to_Member'>nextXid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="subtrans.c.html#LN251"><span class='Ref_To_Local'>startPage</span></a> <span class='Operator'>!= </span><a href="subtrans.c.html#LN252"><span class='Ref_To_Local'>endPage</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="subtrans.c.html#LN65"><span class='Ref_to_Proto'>ZeroSUBTRANSPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN251"><span class='Ref_To_Local'>startPage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="subtrans.c.html#LN251"><span class='Ref_To_Local'>startPage</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* must account for wraparound */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="subtrans.c.html#LN251"><span class='Ref_To_Local'>startPage</span></a> <span class='Operator'>&GT; </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN34"><span class='Ref_to_Const'>MaxTransactionId</span></a><span class='Parentheses'>))</span> 
+            <a href="subtrans.c.html#LN251"><span class='Ref_To_Local'>startPage</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="subtrans.c.html#LN65"><span class='Ref_to_Proto'>ZeroSUBTRANSPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN251"><span class='Ref_To_Local'>startPage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SubtransControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end StartupSUBTRANS &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * This must be called ONCE during postmaster or standalone-backend shutdown 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN282"></a><span class='Declare_Function'>ShutdownSUBTRANS</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Flush dirty SUBTRANS pages to disk 
+     * 
+     * This is not actually necessary from a correctness point of view. We do 
+     * it merely as a debugging aid. 
+     */ 
+</span>    TRACE_POSTGRESQL_SUBTRANS_CHECKPOINT_START<span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/slru.h.html#LN152"><span class='Ref_to_Proto'>SimpleLruFlush</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    TRACE_POSTGRESQL_SUBTRANS_CHECKPOINT_DONE<span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Perform a checkpoint --- either during shutdown, or on-the-fly 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN299"></a><span class='Declare_Function'>CheckPointSUBTRANS</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Flush dirty SUBTRANS pages to disk 
+     * 
+     * This is not actually necessary from a correctness point of view. We do 
+     * it merely to improve the odds that writing of dirty pages is done by 
+     * the checkpoint process and not by backends. 
+     */ 
+</span>    TRACE_POSTGRESQL_SUBTRANS_CHECKPOINT_START<span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/slru.h.html#LN152"><span class='Ref_to_Proto'>SimpleLruFlush</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    TRACE_POSTGRESQL_SUBTRANS_CHECKPOINT_DONE<span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Make sure that SUBTRANS has room for a newly-allocated XID. 
+ * 
+ * NB: this is called while holding XidGenLock.  We want it to be very fast 
+ * most of the time; even when it's not so fast, no actual I/O need happen 
+ * unless we're forced to write out a dirty subtrans page to make room 
+ * in shared memory. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN323"></a><span class='Declare_Function'>ExtendSUBTRANS</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>newestXact</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN325"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * No work except at first XID of a page.  But beware: just after 
+     * wraparound, the first XID of page zero is FirstNormalTransactionId. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="subtrans.c.html#LN54"><span class='Ref_to_Macro'>TransactionIdToEntry</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN323"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>        <span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN42"><span class='Ref_to_Macro'>TransactionIdEquals</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN323"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Delimiter'>, </span><a href="../../../include/access/transam.h.html#LN33"><span class='Ref_to_Const'>FirstNormalTransactionId</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <a href="subtrans.c.html#LN325"><span class='Ref_To_Local'>pageno</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN323"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SubtransControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Zero the page */ 
+</span>    <a href="subtrans.c.html#LN65"><span class='Ref_to_Proto'>ZeroSUBTRANSPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN325"><span class='Ref_To_Local'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SubtransControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExtendSUBTRANS &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Remove all SUBTRANS segments before the one holding the passed transaction ID 
+ * 
+ * This is normally called during checkpoint, with oldestXact being the 
+ * oldest TransactionXmin of any running transaction. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN353"></a><span class='Declare_Function'>TruncateSUBTRANS</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestXact</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN355"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>cutoffPage</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The cutoff point is the start of the segment containing oldestXact. We 
+     * pass the *page* containing oldestXact to SimpleLruTruncate.  We step 
+     * back one transaction to avoid passing a cutoff page that hasn't been 
+     * created yet in the rare case that oldestXact would be the first item on 
+     * a page and oldestXact == next XID.  In that case, if we didn't subtract 
+     * one, we'd trigger SimpleLruTruncate's wraparound detection. 
+     */ 
+</span>    <a href="../../../include/access/transam.h.html#LN55"><span class='Ref_to_Macro'>TransactionIdRetreat</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN353"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="subtrans.c.html#LN355"><span class='Ref_To_Local'>cutoffPage</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN353"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/slru.h.html#LN153"><span class='Ref_to_Proto'>SimpleLruTruncate</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN62"><span class='Ref_to_Const'>SubTransCtl</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN355"><span class='Ref_To_Local'>cutoffPage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Decide which of two SUBTRANS page numbers is "older" for truncation purposes. 
+ * 
+ * We need to use comparison of TransactionIds here in order to do the right 
+ * thing with wraparound XID arithmetic.  However, if we are asked about 
+ * page number zero, we don't want to hand InvalidTransactionId to 
+ * TransactionIdPrecedes: it'll get weird about permanent xact IDs.  So, 
+ * offset both xids by FirstNormalTransactionId to avoid that. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN382"></a><span class='Declare_Function'>SubTransPagePrecedes</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>page1</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>page2</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN384"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid1</span><span class='Delimiter'>; 
+</span><a name="LN385"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid2</span><span class='Delimiter'>; 
+</span> 
+    <a href="subtrans.c.html#LN384"><span class='Ref_To_Local'>xid1</span></a> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="subtrans.c.html#LN382"><span class='Ref_to_Parameter'>page1</span></a><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="subtrans.c.html#LN51"><span class='Ref_to_Const'>SUBTRANS_XACTS_PER_PAGE</span></a><span class='Delimiter'>; 
+</span>    <a href="subtrans.c.html#LN384"><span class='Ref_To_Local'>xid1</span></a> <span class='Operator'>+= </span><a href="../../../include/access/transam.h.html#LN33"><span class='Ref_to_Const'>FirstNormalTransactionId</span></a><span class='Delimiter'>; 
+</span>    <a href="subtrans.c.html#LN385"><span class='Ref_To_Local'>xid2</span></a> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="subtrans.c.html#LN382"><span class='Ref_to_Parameter'>page2</span></a><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="subtrans.c.html#LN51"><span class='Ref_to_Const'>SUBTRANS_XACTS_PER_PAGE</span></a><span class='Delimiter'>; 
+</span>    <a href="subtrans.c.html#LN385"><span class='Ref_To_Local'>xid2</span></a> <span class='Operator'>+= </span><a href="../../../include/access/transam.h.html#LN33"><span class='Ref_to_Const'>FirstNormalTransactionId</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="subtrans.c.html#LN384"><span class='Ref_To_Local'>xid1</span></a><span class='Delimiter'>, </span><a href="subtrans.c.html#LN385"><span class='Ref_To_Local'>xid2</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

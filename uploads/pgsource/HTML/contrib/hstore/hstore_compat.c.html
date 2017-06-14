@@ -1,0 +1,395 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>contrib\hstore\hstore_compat.c</title>
+<LINK REL=StyleSheet HREF="../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>contrib\hstore\hstore_compat.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:25 2017
+</td></tr>
+<tr><td><a href='../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/* 
+ * contrib/hstore/hstore_compat.c 
+ * 
+ * Notes on old/new hstore format disambiguation. 
+ * 
+ * There are three formats to consider: 
+ * 1) old contrib/hstore (referred to as hstore-old) 
+ * 2) prerelease pgfoundry hstore 
+ * 3) new contrib/hstore 
+ * 
+ * (2) and (3) are identical except for the HS_FLAG_NEWVERSION 
+ * bit, which is set in (3) but not (2). 
+ * 
+ * Values that are already in format (3), or which are 
+ * unambiguously in format (2), are handled by the first 
+ * "return immediately" test in hstoreUpgrade(). 
+ * 
+ * To stress a point: we ONLY get here with possibly-ambiguous 
+ * values if we're doing some sort of in-place migration from an 
+ * old prerelease pgfoundry hstore-new; and we explicitly don't 
+ * support that without fixing up any potentially padded values 
+ * first. Most of the code here is serious overkill, but the 
+ * performance penalty isn't serious (especially compared to the 
+ * palloc() that we have to do anyway) and the belt-and-braces 
+ * validity checks provide some reassurance. (If for some reason 
+ * we get a value that would have worked on the old code, but 
+ * which would be botched by the conversion code, the validity 
+ * checks will fail it first so we get an error rather than bad 
+ * data.) 
+ * 
+ * Note also that empty hstores are the same in (2) and (3), so 
+ * there are some special-case paths for them. 
+ * 
+ * We tell the difference between formats (2) and (3) as follows (but 
+ * note that there are some edge cases where we can't tell; see 
+ * comments in hstoreUpgrade): 
+ * 
+ * First, since there must be at least one entry, we look at 
+ * how the bits line up. The new format looks like: 
+ * 
+ * 10kkkkkkkkkkkkkkkkkkkkkkkkkkkkkk  (k..k = keylen) 
+ * 0nvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv  (v..v = keylen+vallen) 
+ * 
+ * The old format looks like one of these, depending on endianness 
+ * and bitfield layout: (k..k = keylen, v..v = vallen, p..p = pos, 
+ * n = isnull) 
+ * 
+ * kkkkkkkkkkkkkkkkvvvvvvvvvvvvvvvv 
+ * nppppppppppppppppppppppppppppppp 
+ * 
+ * kkkkkkkkkkkkkkkkvvvvvvvvvvvvvvvv 
+ * pppppppppppppppppppppppppppppppn 
+ * 
+ * vvvvvvvvvvvvvvvvkkkkkkkkkkkkkkkk 
+ * nppppppppppppppppppppppppppppppp 
+ * 
+ * vvvvvvvvvvvvvvvvkkkkkkkkkkkkkkkk 
+ * pppppppppppppppppppppppppppppppn   (usual i386 format) 
+ * 
+ * If the entry is in old format, for the first entry "pos" must be 0. 
+ * We can obviously see that either keylen or vallen must be &GT;32768 
+ * for there to be any ambiguity (which is why lengths less than that 
+ * are fasttracked in hstore.h) Since "pos"==0, the "v" field in the 
+ * new-format interpretation can only be 0 or 1, which constrains all 
+ * but three bits of the old-format's k and v fields. But in addition 
+ * to all of this, the data length implied by the keylen and vallen 
+ * must fit in the varlena size. So the only ambiguous edge case for 
+ * hstores with only one entry occurs between a new-format entry with 
+ * an excess (~32k) of padding, and an old-format entry. But we know 
+ * which format to use in that case based on how we were compiled, so 
+ * no actual data corruption can occur. 
+ * 
+ * If there is more than one entry, the requirement that keys do not 
+ * decrease in length, and that positions increase contiguously, and 
+ * that the end of the data not be beyond the end of the varlena 
+ * itself, disambiguates in almost all other cases. There is a small 
+ * set of ambiguous cases which could occur if the old-format value 
+ * has a large excess of padding and just the right pattern of key 
+ * sizes, but these are also handled based on how we were compiled. 
+ * 
+ * The otherwise undocumented function hstore_version_diag is provided 
+ * for testing purposes. 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+ 
+<span class='Keyword'>#include </span><span class='String'>"hstore.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * This is the structure used for entries in the old contrib/hstore 
+ * implementation. Notice that this is the same size as the new entry 
+ * (two 32-bit words per key/value pair) and that the header is the 
+ * same, so the old and new versions of ARRPTR, STRPTR, CALCDATASIZE 
+ * etc. are compatible. 
+ * 
+ * If the above statement isn't true on some bizarre platform, we're 
+ * a bit hosed (see StaticAssertStmt in hstoreValidOldFormat). 
+ */ 
+</span><span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN100"></a>    <a href="../../src/include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Member'>keylen</span><span class='Delimiter'>; 
+</span><a name="LN101"></a>    <a href="../../src/include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Member'>vallen</span><span class='Delimiter'>; 
+</span>    <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> 
+<a name="LN103"></a>                <span class='Declare_Member'>valisnull</span><span class='Operator'>:</span><span class='Number'>1</span><span class='Delimiter'>, 
+</span><a name="LN104"></a>                <span class='Declare_Member'>pos</span><span class='Operator'>:</span><span class='Number'>31</span><span class='Delimiter'>; 
+</span><a name="LN105"></a>} <span class='Declare_Typedef'>HOldEntry</span><span class='Delimiter'>; 
+</span> 
+<a name="LN107"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>hstoreValidNewFormat</span><span class='Parentheses'>(</span><a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>hs</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN108"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>hstoreValidOldFormat</span><span class='Parentheses'>(</span><a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>hs</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Validity test for a new-format hstore. 
+ *  0 = not valid 
+ *  1 = valid but with "slop" in the length 
+ *  2 = exactly valid 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN118"></a><span class='Declare_Function'>hstoreValidNewFormat</span><span class='Parentheses'>(</span><a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>hs</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN120"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>count</span> <span class='Operator'>= </span><a href="hstore.h.html#LN60"><span class='Ref_to_Macro'>HS_COUNT</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN118"><span class='Ref_to_Parameter'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN121"></a>    <a href="hstore.h.html#LN17"><span class='Ref_to_Typedef'>HEntry</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>entries</span> <span class='Operator'>= </span><a href="../intarray/_int.h.html#LN13"><span class='Ref_to_Macro'>ARRPTR</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN118"><span class='Ref_to_Parameter'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN122"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>buflen</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN120"><span class='Ref_To_Local'>count</span></a><span class='Parentheses'>) </span><span class='Operator'>? </span><a href="hstore.h.html#LN29"><span class='Ref_to_Macro'>HSE_ENDPOS</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN121"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><span class='Number'>2</span> <span class='Operator'>* </span><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN120"><span class='Ref_To_Local'>count</span></a><span class='Parentheses'>) </span><span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Parentheses'>)</span> <span class='Operator'>: </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN123"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>vsize</span> <span class='Operator'>= </span><a href="hstore.h.html#LN71"><span class='Ref_to_Macro'>CALCDATASIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN120"><span class='Ref_To_Local'>count</span></a><span class='Delimiter'>, </span><a href="hstore_compat.c.html#LN122"><span class='Ref_To_Local'>buflen</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN124"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN118"><span class='Ref_to_Parameter'>hs</span></a><span class='Operator'>-&GT;</span><a href="hstore.h.html#LN46"><span class='Ref_to_Member'>size_</span></a> <span class='Operator'>& </span><a href="hstore.h.html#LN58"><span class='Ref_to_Const'>HS_FLAG_NEWVERSION</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>2</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN120"><span class='Ref_To_Local'>count</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>2</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="hstore.h.html#LN27"><span class='Ref_to_Macro'>HSE_ISFIRST</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN121"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN123"><span class='Ref_To_Local'>vsize</span></a> <span class='Operator'>&GT; </span><a href="../../src/include/postgres.h.html#LN303"><span class='Ref_to_Macro'>VARSIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN118"><span class='Ref_to_Parameter'>hs</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* entry position must be nondecreasing */ 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><span class='Number'>2</span> <span class='Operator'>* </span><a href="hstore_compat.c.html#LN120"><span class='Ref_To_Local'>count</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore.h.html#LN27"><span class='Ref_to_Macro'>HSE_ISFIRST</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN121"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span> 
+            <span class='Operator'>|| </span><span class='Parentheses'>(</span><a href="hstore.h.html#LN29"><span class='Ref_to_Macro'>HSE_ENDPOS</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN121"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="hstore.h.html#LN29"><span class='Ref_to_Macro'>HSE_ENDPOS</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN121"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Parentheses'>)))</span> 
+            <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* key length must be nondecreasing and keys must not be null */ 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="hstore_compat.c.html#LN120"><span class='Ref_To_Local'>count</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore.h.html#LN80"><span class='Ref_to_Macro'>HSTORE_KEYLEN</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN121"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>, </span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="hstore.h.html#LN80"><span class='Ref_to_Macro'>HSTORE_KEYLEN</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN121"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>, </span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>))</span> 
+            <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore.h.html#LN28"><span class='Ref_to_Macro'>HSE_ISNULL</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN121"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><span class='Number'>2</span> <span class='Operator'>* </span><a href="hstore_compat.c.html#LN124"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>))</span> 
+            <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN123"><span class='Ref_To_Local'>vsize</span></a> <span class='Operator'>!= </span><a href="../../src/include/postgres.h.html#LN303"><span class='Ref_to_Macro'>VARSIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN118"><span class='Ref_to_Parameter'>hs</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Number'>2</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end hstoreValidNewFormat &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Validity test for an old-format hstore. 
+ *  0 = not valid 
+ *  1 = valid but with "slop" in the length 
+ *  2 = exactly valid 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN170"></a><span class='Declare_Function'>hstoreValidOldFormat</span><span class='Parentheses'>(</span><a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>hs</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN172"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>count</span> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN170"><span class='Ref_to_Parameter'>hs</span></a><span class='Operator'>-&GT;</span><a href="hstore.h.html#LN46"><span class='Ref_to_Member'>size_</span></a><span class='Delimiter'>; 
+</span><a name="LN173"></a>    <a href="hstore_compat.c.html#LN98"><span class='Ref_to_Typedef'>HOldEntry</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>entries</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN98"><span class='Ref_to_Typedef'>HOldEntry</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../intarray/_int.h.html#LN13"><span class='Ref_to_Macro'>ARRPTR</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN170"><span class='Ref_to_Parameter'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN174"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>vsize</span><span class='Delimiter'>; 
+</span><a name="LN175"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>lastpos</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN176"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN170"><span class='Ref_to_Parameter'>hs</span></a><span class='Operator'>-&GT;</span><a href="hstore.h.html#LN46"><span class='Ref_to_Member'>size_</span></a> <span class='Operator'>& </span><a href="hstore.h.html#LN58"><span class='Ref_to_Const'>HS_FLAG_NEWVERSION</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* New format uses an HEntry for key and another for value */ 
+</span>    <a href="../../src/include/c.h.html#LN751"><span class='Ref_to_Macro'>StaticAssertStmt</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN98"><span class='Ref_to_Typedef'>HOldEntry</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>2</span> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="hstore.h.html#LN17"><span class='Ref_to_Typedef'>HEntry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <span class='String'>"old hstore format is not upward-compatible"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN172"><span class='Ref_To_Local'>count</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>2</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN172"><span class='Ref_To_Local'>count</span></a> <span class='Operator'>&GT; </span><span class='Number'>0xFFFFFFF</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore.h.html#LN71"><span class='Ref_to_Macro'>CALCDATASIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN172"><span class='Ref_To_Local'>count</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><a href="../../src/include/postgres.h.html#LN303"><span class='Ref_to_Macro'>VARSIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN170"><span class='Ref_to_Parameter'>hs</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN173"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN104"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* key length must be nondecreasing */ 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="hstore_compat.c.html#LN172"><span class='Ref_To_Local'>count</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN173"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN100"><span class='Ref_to_Member'>keylen</span></a> <span class='Operator'>&LT; </span><a href="hstore_compat.c.html#LN173"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN100"><span class='Ref_to_Member'>keylen</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * entry position must be strictly increasing, except for the first entry 
+     * (which can be ""=&GT;"" and thus zero-length); and all entries must be 
+     * properly contiguous 
+     */ 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="hstore_compat.c.html#LN172"><span class='Ref_To_Local'>count</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN173"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN104"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>!= </span><a href="hstore_compat.c.html#LN175"><span class='Ref_To_Local'>lastpos</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="hstore_compat.c.html#LN175"><span class='Ref_To_Local'>lastpos</span></a> <span class='Operator'>+= </span><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN173"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN100"><span class='Ref_to_Member'>keylen</span></a> 
+                    <span class='Operator'>+ </span><span class='Parentheses'>((</span><a href="hstore_compat.c.html#LN173"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN103"><span class='Ref_to_Member'>valisnull</span></a><span class='Parentheses'>) </span><span class='Operator'>? </span><span class='Number'>0</span> <span class='Operator'>: </span><a href="hstore_compat.c.html#LN173"><span class='Ref_To_Local'>entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN176"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN101"><span class='Ref_to_Member'>vallen</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="hstore_compat.c.html#LN174"><span class='Ref_To_Local'>vsize</span></a> <span class='Operator'>= </span><a href="hstore.h.html#LN71"><span class='Ref_to_Macro'>CALCDATASIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN172"><span class='Ref_To_Local'>count</span></a><span class='Delimiter'>, </span><a href="hstore_compat.c.html#LN175"><span class='Ref_To_Local'>lastpos</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN174"><span class='Ref_To_Local'>vsize</span></a> <span class='Operator'>&GT; </span><a href="../../src/include/postgres.h.html#LN303"><span class='Ref_to_Macro'>VARSIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN170"><span class='Ref_to_Parameter'>hs</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN174"><span class='Ref_To_Local'>vsize</span></a> <span class='Operator'>!= </span><a href="../../src/include/postgres.h.html#LN303"><span class='Ref_to_Macro'>VARSIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN170"><span class='Ref_to_Parameter'>hs</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Number'>2</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end hstoreValidOldFormat &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * hstoreUpgrade: PG_DETOAST_DATUM plus support for conversion of old hstores 
+ */ 
+</span><a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a> <span class='Operator'>* 
+</span><a name="LN235"></a><span class='Declare_Function'>hstoreUpgrade</span><span class='Parentheses'>(</span><a href="../../src/include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>orig</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN237"></a>    <a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>hs</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../src/include/fmgr.h.html#LN204"><span class='Ref_to_Macro'>PG_DETOAST_DATUM</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN235"><span class='Ref_to_Parameter'>orig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN238"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>valid_new</span><span class='Delimiter'>; 
+</span><a name="LN239"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>valid_old</span><span class='Delimiter'>; 
+</span><a name="LN240"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>writable</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Return immediately if no conversion needed */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Operator'>-&GT;</span><a href="hstore.h.html#LN46"><span class='Ref_to_Member'>size_</span></a> <span class='Operator'>& </span><a href="hstore.h.html#LN58"><span class='Ref_to_Const'>HS_FLAG_NEWVERSION</span></a><span class='Parentheses'>)</span> <span class='Operator'>|| 
+</span>        <a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Operator'>-&GT;</span><a href="hstore.h.html#LN46"><span class='Ref_to_Member'>size_</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>        <span class='Parentheses'>(</span><a href="../../src/include/postgres.h.html#LN303"><span class='Ref_to_Macro'>VARSIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>)</span> <span class='Operator'>&LT; </span><span class='Number'>32768</span> <span class='Operator'>&& </span><a href="hstore.h.html#LN27"><span class='Ref_to_Macro'>HSE_ISFIRST</span></a><span class='Parentheses'>((</span><a href="../intarray/_int.h.html#LN13"><span class='Ref_to_Macro'>ARRPTR</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Parentheses'>))))</span> 
+        <span class='Control'>return</span> <a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="hstore_compat.c.html#LN238"><span class='Ref_To_Local'>valid_new</span></a> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN107"><span class='Ref_to_Proto'>hstoreValidNewFormat</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="hstore_compat.c.html#LN239"><span class='Ref_To_Local'>valid_old</span></a> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN108"><span class='Ref_to_Proto'>hstoreValidOldFormat</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* Do we have a writable copy? */ 
+</span>    <a href="hstore_compat.c.html#LN240"><span class='Ref_To_Local'>writable</span></a> <span class='Operator'>= </span><span class='Parentheses'>((</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a> <span class='Operator'>!= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../src/include/postgres.h.html#LN554"><span class='Ref_to_Macro'>DatumGetPointer</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN235"><span class='Ref_to_Parameter'>orig</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="hstore_compat.c.html#LN239"><span class='Ref_To_Local'>valid_old</span></a> <span class='Operator'>|| </span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Operator'>-&GT;</span><a href="hstore.h.html#LN46"><span class='Ref_to_Member'>size_</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN238"><span class='Ref_To_Local'>valid_new</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * force the "new version" flag and the correct varlena length, 
+             * but only if we have a writable copy already (which we almost 
+             * always will, since short new-format values won't come through 
+             * here) 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN240"><span class='Ref_To_Local'>writable</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="hstore.h.html#LN61"><span class='Ref_to_Macro'>HS_SETCOUNT</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>, </span><a href="hstore.h.html#LN60"><span class='Ref_to_Macro'>HS_COUNT</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>                <a href="hstore.h.html#LN142"><span class='Ref_to_Macro'>HS_FIXSIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>, </span><a href="hstore.h.html#LN60"><span class='Ref_to_Macro'>HS_COUNT</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>return</span> <a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"invalid hstore value found"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !valid_old||hs-&GT;size_... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * this is the tricky edge case. It is only possible in some quite extreme 
+     * cases (the hstore must have had a lot of wasted padding space at the 
+     * end). But the only way a "new" hstore value could get here is if we're 
+     * upgrading in place from a pre-release version of hstore-new (NOT 
+     * contrib/hstore), so we work off the following assumptions: 1. If you're 
+     * moving from old contrib/hstore to hstore-new, you're required to fix up 
+     * any potential conflicts first, e.g. by running ALTER TABLE ... USING 
+     * col::text::hstore; on all hstore columns before upgrading. 2. If you're 
+     * moving from old contrib/hstore to new contrib/hstore, then "new" values 
+     * are impossible here 3. If you're moving from pre-release hstore-new to 
+     * hstore-new, then "old" values are impossible here 4. If you're moving 
+     * from pre-release hstore-new to new contrib/hstore, you're not doing so 
+     * as an in-place upgrade, so there is no issue So the upshot of all this 
+     * is that we can treat all the edge cases as "new" if we're being built 
+     * as hstore-new, and "old" if we're being built as contrib/hstore. 
+     * 
+     * XXX the WARNING can probably be downgraded to DEBUG1 once this has been 
+     * beta-tested. But for now, it would be very useful to know if anyone can 
+     * actually reach this case in a non-contrived setting. 
+     */ 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN238"><span class='Ref_To_Local'>valid_new</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><span class='Directive'>#if</span> HSTORE_IS_HSTORE_NEW 
+        <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><span class='String'>"ambiguous hstore value resolved as hstore-new"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * force the "new version" flag and the correct varlena length, but 
+         * only if we have a writable copy already (which we almost always 
+         * will, since short new-format values won't come through here) 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN240"><span class='Ref_To_Local'>writable</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="hstore.h.html#LN61"><span class='Ref_to_Macro'>HS_SETCOUNT</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>, </span><a href="hstore.h.html#LN60"><span class='Ref_to_Macro'>HS_COUNT</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="hstore.h.html#LN142"><span class='Ref_to_Macro'>HS_FIXSIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>, </span><a href="hstore.h.html#LN60"><span class='Ref_to_Macro'>HS_COUNT</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>return</span> <a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>; 
+</span><span class='Directive'>#else</span> 
+        <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><span class='String'>"ambiguous hstore value resolved as hstore-old"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if valid_new &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * must have an old-style value. Overwrite it in place as a new-style one, 
+     * making sure we have a writable copy first. 
+     */ 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="hstore_compat.c.html#LN240"><span class='Ref_To_Local'>writable</span></a><span class='Parentheses'>) 
+</span>        <a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../src/include/fmgr.h.html#LN206"><span class='Ref_to_Macro'>PG_DETOAST_DATUM_COPY</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN235"><span class='Ref_to_Parameter'>orig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN328"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>count</span> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Operator'>-&GT;</span><a href="hstore.h.html#LN46"><span class='Ref_to_Member'>size_</span></a><span class='Delimiter'>; 
+</span><a name="LN329"></a>        <a href="hstore.h.html#LN17"><span class='Ref_to_Typedef'>HEntry</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>new_entries</span> <span class='Operator'>= </span><a href="../intarray/_int.h.html#LN13"><span class='Ref_to_Macro'>ARRPTR</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN330"></a>        <a href="hstore_compat.c.html#LN98"><span class='Ref_to_Typedef'>HOldEntry</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>old_entries</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN98"><span class='Ref_to_Typedef'>HOldEntry</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../intarray/_int.h.html#LN13"><span class='Ref_to_Macro'>ARRPTR</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN331"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN331"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="hstore_compat.c.html#LN331"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="hstore_compat.c.html#LN328"><span class='Ref_To_Local'>count</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="hstore_compat.c.html#LN331"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN335"></a>            <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>pos</span> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN330"><span class='Ref_To_Local'>old_entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN331"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN104"><span class='Ref_to_Member'>pos</span></a><span class='Delimiter'>; 
+</span><a name="LN336"></a>            <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>keylen</span> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN330"><span class='Ref_To_Local'>old_entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN331"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN100"><span class='Ref_to_Member'>keylen</span></a><span class='Delimiter'>; 
+</span><a name="LN337"></a>            <a href="../../src/include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>vallen</span> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN330"><span class='Ref_To_Local'>old_entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN331"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN101"><span class='Ref_to_Member'>vallen</span></a><span class='Delimiter'>; 
+</span><a name="LN338"></a>            <span class='Keyword'>bool</span>        <span class='Declare_Local'>isnull</span> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN330"><span class='Ref_To_Local'>old_entries</span></a><span class='Delimiter'>[</span><a href="hstore_compat.c.html#LN331"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore_compat.c.html#LN103"><span class='Ref_to_Member'>valisnull</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN338"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>) 
+</span>                <a href="hstore_compat.c.html#LN337"><span class='Ref_To_Local'>vallen</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+            <a href="hstore_compat.c.html#LN329"><span class='Ref_To_Local'>new_entries</span></a><span class='Delimiter'>[</span><span class='Number'>2</span> <span class='Operator'>* </span><a href="hstore_compat.c.html#LN331"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore.h.html#LN19"><span class='Ref_to_Member'>entry</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN335"><span class='Ref_To_Local'>pos</span></a> <span class='Operator'>+ </span><a href="hstore_compat.c.html#LN336"><span class='Ref_To_Local'>keylen</span></a><span class='Parentheses'>) </span><span class='Operator'>& </span><a href="hstore.h.html#LN24"><span class='Ref_to_Const'>HENTRY_POSMASK</span></a><span class='Delimiter'>; 
+</span>            <a href="hstore_compat.c.html#LN329"><span class='Ref_To_Local'>new_entries</span></a><span class='Delimiter'>[</span><span class='Number'>2</span> <span class='Operator'>* </span><a href="hstore_compat.c.html#LN331"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore.h.html#LN19"><span class='Ref_to_Member'>entry</span></a> <span class='Operator'>= </span><span class='Parentheses'>(((</span><a href="hstore_compat.c.html#LN335"><span class='Ref_To_Local'>pos</span></a> <span class='Operator'>+ </span><a href="hstore_compat.c.html#LN336"><span class='Ref_To_Local'>keylen</span></a> <span class='Operator'>+ </span><a href="hstore_compat.c.html#LN337"><span class='Ref_To_Local'>vallen</span></a><span class='Parentheses'>) </span><span class='Operator'>& </span><a href="hstore.h.html#LN24"><span class='Ref_to_Const'>HENTRY_POSMASK</span></a><span class='Parentheses'>)</span> 
+                                            <span class='Operator'>| </span><span class='Parentheses'>((</span><a href="hstore_compat.c.html#LN338"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>) </span><span class='Operator'>? </span><a href="hstore.h.html#LN23"><span class='Ref_to_Const'>HENTRY_ISNULL</span></a> <span class='Operator'>: </span><span class='Number'>0</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN328"><span class='Ref_To_Local'>count</span></a><span class='Parentheses'>) 
+</span>            <a href="hstore_compat.c.html#LN329"><span class='Ref_To_Local'>new_entries</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="hstore.h.html#LN19"><span class='Ref_to_Member'>entry</span></a> <span class='Operator'>|= </span><a href="hstore.h.html#LN22"><span class='Ref_to_Const'>HENTRY_ISFIRST</span></a><span class='Delimiter'>; 
+</span>        <a href="hstore.h.html#LN61"><span class='Ref_to_Macro'>HS_SETCOUNT</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>, </span><a href="hstore_compat.c.html#LN328"><span class='Ref_To_Local'>count</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="hstore.h.html#LN142"><span class='Ref_to_Macro'>HS_FIXSIZE</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>, </span><a href="hstore_compat.c.html#LN328"><span class='Ref_To_Local'>count</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="hstore_compat.c.html#LN237"><span class='Ref_To_Local'>hs</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end hstoreUpgrade &raquo; </span> 
+ 
+ 
+<a name="LN358"></a><span class='Declare_Prototype'>PG_FUNCTION_INFO_V1</span><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN359"><span class='Ref_to_Func'>hstore_version_diag</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a href="../../src/include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN360"></a><span class='Declare_Function'>hstore_version_diag</span><span class='Parentheses'>(</span><a href="../../src/include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN362"></a>    <a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>hs</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="hstore.h.html#LN43"><span class='Ref_to_Typedef'>HStore</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../src/include/fmgr.h.html#LN204"><span class='Ref_to_Macro'>PG_DETOAST_DATUM</span></a><span class='Parentheses'>(</span><a href="../../src/include/fmgr.h.html#LN232"><span class='Ref_to_Macro'>PG_GETARG_DATUM</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span><a name="LN363"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>valid_new</span> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN107"><span class='Ref_to_Proto'>hstoreValidNewFormat</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN362"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN364"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>valid_old</span> <span class='Operator'>= </span><a href="hstore_compat.c.html#LN108"><span class='Ref_to_Proto'>hstoreValidOldFormat</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN362"><span class='Ref_To_Local'>hs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../src/include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><a href="hstore_compat.c.html#LN364"><span class='Ref_To_Local'>valid_old</span></a> <span class='Operator'>* </span><span class='Number'>10</span> <span class='Operator'>+ </span><a href="hstore_compat.c.html#LN363"><span class='Ref_To_Local'>valid_new</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

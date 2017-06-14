@@ -1,0 +1,867 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\port\sysv_shmem.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\port\sysv_shmem.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:45 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * sysv_shmem.c 
+ *    Implement shared memory using SysV facilities 
+ * 
+ * These routines used to be a fairly thin layer on top of SysV shared 
+ * memory functionality.  With the addition of anonymous-shmem logic, 
+ * they're a bit fatter now.  We still require a SysV shmem block to 
+ * exist, though, because mmap'd shmem provides no way to find out how 
+ * many processes are attached, which we need for interlocking purposes. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/port/sysv_shmem.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;signal.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/file.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/mman.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/stat.h&GT;</span> 
+<span class='Directive'>#ifdef</span> HAVE_SYS_IPC_H 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/ipc.h&GT;</span> 
+<span class='Directive'>#endif</span> 
+<span class='Directive'>#ifdef</span> HAVE_SYS_SHM_H 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/shm.h&GT;</span> 
+<span class='Directive'>#endif</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"portability/mem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/dsm.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/fd.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/pg_shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/guc.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * As of PostgreSQL 9.3, we normally allocate only a very small amount of 
+ * System V shared memory, and only for the purposes of providing an 
+ * interlock to protect the data directory.  The real shared memory block 
+ * is allocated using mmap().  This works around the problem that many 
+ * systems have very low limits on the amount of System V shared memory 
+ * that can be allocated.  Even a limit of a few megabytes will be enough 
+ * to run many copies of PostgreSQL without needing to adjust system settings. 
+ * 
+ * We assume that no one will attempt to run PostgreSQL 9.3 or later on 
+ * systems that are ancient enough that anonymous shared memory is not 
+ * supported, such as pre-2.4 versions of Linux.  If that turns out to be 
+ * false, we might need to add compile and/or run-time tests here and do this 
+ * only if the running kernel supports it. 
+ * 
+ * However, we must always disable this logic in the EXEC_BACKEND case, and 
+ * fall back to the old method of allocating the entire segment using System V 
+ * shared memory, because there's no way to attach an anonymous mmap'd segment 
+ * to a process after exec().  Since EXEC_BACKEND is intended only for 
+ * developer use, this shouldn't be a big problem.  Because of this, we do 
+ * not worry about supporting anonymous shmem in the EXEC_BACKEND cases below. 
+ */ 
+</span><span class='Directive'>#ifndef</span> EXEC_BACKEND 
+<a name="LN65"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>USE_ANONYMOUS_SHMEM</span> 
+<span class='Directive'>#endif</span> 
+ 
+ 
+<a name="LN69"></a><span class='Control'>typedef</span> <a href="../../include/port/win32.h.html#LN252"><span class='Ref_to_Typedef'>key_t</span></a> <span class='Declare_Typedef'>IpcMemoryKey</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* shared memory key passed to shmget(2) */ 
+</span><a name="LN70"></a><span class='Control'>typedef</span> <span class='Keyword'>int </span><span class='Declare_Typedef'>IpcMemoryId</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* shared memory ID returned by shmget(2) */ 
+</span> 
+ 
+<a name="LN73"></a><span class='Keyword'>unsigned long </span><span class='Declare_Var'>UsedShmemSegID</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN74"></a><span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Var'>UsedShmemSegAddr</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="sysv_shmem.c.html#LN65"><span class='Ref_to_Const'>USE_ANONYMOUS_SHMEM</span></a> 
+<a name="LN77"></a><span class='Keyword'>static </span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Var'>AnonymousShmemSize</span><span class='Delimiter'>; 
+</span><a name="LN78"></a><span class='Keyword'>static void </span><span class='Operator'>*</span><span class='Declare_Var'>AnonymousShmem</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+<a name="LN81"></a><span class='Keyword'>static void </span><span class='Operator'>*</span><span class='Declare_Prototype'>InternalIpcMemoryCreate</span><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN69"><span class='Ref_to_Typedef'>IpcMemoryKey</span></a> <span class='Declare_Parameter'>memKey</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN82"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>IpcMemoryDetach</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>shmaddr</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN83"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>IpcMemoryDelete</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>shmId</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN84"></a><span class='Keyword'>static </span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>PGSharedMemoryAttach</span><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN69"><span class='Ref_to_Typedef'>IpcMemoryKey</span></a> <span class='Declare_Parameter'>key</span><span class='Delimiter'>, 
+</span><a name="LN85"></a>                     <a href="sysv_shmem.c.html#LN70"><span class='Ref_to_Typedef'>IpcMemoryId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>shmid</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ *  InternalIpcMemoryCreate(memKey, size) 
+ * 
+ * Attempt to create a new shared memory segment with the specified key. 
+ * Will fail (return NULL) if such a segment already exists.  If successful, 
+ * attach the segment to the current process and return its attached address. 
+ * On success, callbacks are registered with on_shmem_exit to detach and 
+ * delete the segment when on_shmem_exit is called. 
+ * 
+ * If we fail with a failure code other than collision-with-existing-segment, 
+ * print out an error and abort.  Other types of errors are not recoverable. 
+ */ 
+</span><span class='Keyword'>static void </span><span class='Operator'>* 
+</span><a name="LN101"></a><span class='Declare_Function'>InternalIpcMemoryCreate</span><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN69"><span class='Ref_to_Typedef'>IpcMemoryKey</span></a> <span class='Declare_Parameter'>memKey</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN103"></a>    <a href="sysv_shmem.c.html#LN70"><span class='Ref_to_Typedef'>IpcMemoryId</span></a> <span class='Declare_Local'>shmid</span><span class='Delimiter'>; 
+</span><a name="LN104"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>requestedAddress</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN105"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>memAddress</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Normally we just pass requestedAddress = NULL to shmat(), allowing the 
+     * system to choose where the segment gets mapped.  But in an EXEC_BACKEND 
+     * build, it's possible for whatever is chosen in the postmaster to not 
+     * work for backends, due to variations in address space layout.  As a 
+     * rather klugy workaround, allow the user to specify the address to use 
+     * via setting the environment variable PG_SHMEM_ADDR.  (If this were of 
+     * interest for anything except debugging, we'd probably create a cleaner 
+     * and better-documented way to set it, such as a GUC.) 
+     */ 
+</span><span class='Directive'>#ifdef</span> EXEC_BACKEND 
+    <span class='Delimiter'>{ 
+</span><a name="LN119"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>pg_shmem_addr</span> <span class='Operator'>= </span>getenv<span class='Parentheses'>(</span><span class='String'>"PG_SHMEM_ADDR"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN119"><span class='Ref_To_Local'>pg_shmem_addr</span></a><span class='Parentheses'>) 
+</span>            <a href="sysv_shmem.c.html#LN104"><span class='Ref_To_Local'>requestedAddress</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span>strtoul<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN119"><span class='Ref_To_Local'>pg_shmem_addr</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a> <span class='Operator'>= </span>shmget<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN101"><span class='Ref_to_Parameter'>memKey</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN101"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN106"><span class='Ref_to_Const'>IPC_CREAT</span></a> <span class='Operator'>| </span><a href="../../include/port/win32.h.html#LN107"><span class='Ref_to_Const'>IPC_EXCL</span></a> <span class='Operator'>| </span><a href="../../include/portability/mem.h.html#LN14"><span class='Ref_to_Const'>IPCProtection</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN130"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>shmget_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Fail quietly if error indicates a collision with existing segment. 
+         * One would expect EEXIST, given that we said IPC_EXCL, but perhaps 
+         * we could get a permission violation instead?  Also, EIDRM might 
+         * occur if an old seg is slated for destruction but not gone yet. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN130"><span class='Ref_To_Local'>shmget_errno</span></a> <span class='Operator'>== </span>EEXIST <span class='Operator'>|| </span><a href="sysv_shmem.c.html#LN130"><span class='Ref_To_Local'>shmget_errno</span></a> <span class='Operator'>== </span>EACCES 
+<span class='Directive'>#ifdef</span> <a href="../../include/port/win32.h.html#LN114"><span class='Ref_to_Const'>EIDRM</span></a> 
+            <span class='Operator'>|| </span><a href="sysv_shmem.c.html#LN130"><span class='Ref_To_Local'>shmget_errno</span></a> <span class='Operator'>== </span><a href="../../include/port/win32.h.html#LN114"><span class='Ref_to_Const'>EIDRM</span></a> 
+<span class='Directive'>#endif</span> 
+            <span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Some BSD-derived kernels are known to return EINVAL, not EEXIST, if 
+         * there is an existing segment but it's smaller than "size" (this is 
+         * a result of poorly-thought-out ordering of error tests). To 
+         * distinguish between collision and invalid size in such cases, we 
+         * make a second try with size = 0.  These kernels do not test size 
+         * against SHMMIN in the preexisting-segment case, so we will not get 
+         * EINVAL a second time if there is such a segment. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN130"><span class='Ref_To_Local'>shmget_errno</span></a> <span class='Operator'>== </span>EINVAL<span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a> <span class='Operator'>= </span>shmget<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN101"><span class='Ref_to_Parameter'>memKey</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN106"><span class='Ref_to_Const'>IPC_CREAT</span></a> <span class='Operator'>| </span><a href="../../include/port/win32.h.html#LN107"><span class='Ref_to_Const'>IPC_EXCL</span></a> <span class='Operator'>| </span><a href="../../include/portability/mem.h.html#LN14"><span class='Ref_to_Const'>IPCProtection</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* As above, fail quietly if we verify a collision */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span>errno <span class='Operator'>== </span>EEXIST <span class='Operator'>|| </span>errno <span class='Operator'>== </span>EACCES 
+<span class='Directive'>#ifdef</span> <a href="../../include/port/win32.h.html#LN114"><span class='Ref_to_Const'>EIDRM</span></a> 
+                    <span class='Operator'>|| </span>errno <span class='Operator'>== </span><a href="../../include/port/win32.h.html#LN114"><span class='Ref_to_Const'>EIDRM</span></a> 
+<span class='Directive'>#endif</span> 
+                    <span class='Parentheses'>) 
+</span>                    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>                <span class='Comment_Multi_Line'>/* Otherwise, fall through to report the original error */ 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * On most platforms we cannot get here because SHMMIN is 
+                 * greater than zero.  However, if we do succeed in creating a 
+                 * zero-size segment, free it and then fall through to report 
+                 * the original error. 
+                 */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span>shmctl<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN105"><span class='Ref_to_Const'>IPC_RMID</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+                    <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, </span><span class='String'>"shmctl(%d, %d, 0) failed: %m"</span><span class='Delimiter'>, 
+</span>                         <span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN105"><span class='Ref_to_Const'>IPC_RMID</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if shmget_errno==EINVAL &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* 
+         * Else complain and abort. 
+         * 
+         * Note: at this point EINVAL should mean that either SHMMIN or SHMMAX 
+         * is violated.  SHMALL violation might be reported as either ENOMEM 
+         * (BSDen) or ENOSPC (Linux); the Single Unix Spec fails to say which 
+         * it should be.  SHMMNI violation is ENOSPC, per spec.  Just plain 
+         * not-enough-RAM is ENOMEM. 
+         */ 
+</span>        errno <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN130"><span class='Ref_To_Local'>shmget_errno</span></a><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not create shared memory segment: %m"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>          <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Failed system call was shmget(key=%lu, size=%zu, 0%o)."</span><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><span class='Keyword'>unsigned long</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN101"><span class='Ref_to_Parameter'>memKey</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN101"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>, 
+</span>                    <a href="../../include/port/win32.h.html#LN106"><span class='Ref_to_Const'>IPC_CREAT</span></a> <span class='Operator'>| </span><a href="../../include/port/win32.h.html#LN107"><span class='Ref_to_Const'>IPC_EXCL</span></a> <span class='Operator'>| </span><a href="../../include/portability/mem.h.html#LN14"><span class='Ref_to_Const'>IPCProtection</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN130"><span class='Ref_To_Local'>shmget_errno</span></a> <span class='Operator'>== </span>EINVAL<span class='Parentheses'>)</span> <span class='Operator'>? 
+</span>                 <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"This error usually means that PostgreSQL's request for a shared memory "</span> 
+         <span class='String'>"segment exceeded your kernel's SHMMAX parameter, or possibly that "</span> 
+                         <span class='String'>"it is less than "</span> 
+                         <span class='String'>"your kernel's SHMMIN parameter.\n"</span> 
+        <span class='String'>"The PostgreSQL documentation contains more information about shared "</span> 
+                         <span class='String'>"memory configuration."</span><span class='Parentheses'>)</span> <span class='Operator'>: </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                 <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN130"><span class='Ref_To_Local'>shmget_errno</span></a> <span class='Operator'>== </span>ENOMEM<span class='Parentheses'>)</span> <span class='Operator'>? 
+</span>                 <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"This error usually means that PostgreSQL's request for a shared "</span> 
+                         <span class='String'>"memory segment exceeded your kernel's SHMALL parameter.  You might need "</span> 
+                         <span class='String'>"to reconfigure the kernel with larger SHMALL.\n"</span> 
+        <span class='String'>"The PostgreSQL documentation contains more information about shared "</span> 
+                         <span class='String'>"memory configuration."</span><span class='Parentheses'>)</span> <span class='Operator'>: </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                 <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN130"><span class='Ref_To_Local'>shmget_errno</span></a> <span class='Operator'>== </span>ENOSPC<span class='Parentheses'>)</span> <span class='Operator'>? 
+</span>                 <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"This error does *not* mean that you have run out of disk space.  "</span> 
+                         <span class='String'>"It occurs either if all available shared memory IDs have been taken, "</span> 
+                         <span class='String'>"in which case you need to raise the SHMMNI parameter in your kernel, "</span> 
+          <span class='String'>"or because the system's overall limit for shared memory has been "</span> 
+                         <span class='String'>"reached.\n"</span> 
+        <span class='String'>"The PostgreSQL documentation contains more information about shared "</span> 
+                         <span class='String'>"memory configuration."</span><span class='Parentheses'>)</span> <span class='Operator'>: </span><span class='Number'>0</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if shmid&LT;0 &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Register on-exit routine to delete the new segment */ 
+</span>    <a href="../../include/storage/ipc.h.html#LN69"><span class='Ref_to_Proto'>on_shmem_exit</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN83"><span class='Ref_to_Proto'>IpcMemoryDelete</span></a><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN484"><span class='Ref_to_Macro'>Int32GetDatum</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* OK, should be able to attach to the segment */ 
+</span>    <a href="sysv_shmem.c.html#LN105"><span class='Ref_To_Local'>memAddress</span></a> <span class='Operator'>= </span>shmat<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN104"><span class='Ref_To_Local'>requestedAddress</span></a><span class='Delimiter'>, </span><a href="../../include/portability/mem.h.html#LN17"><span class='Ref_to_Const'>PG_SHMAT_FLAGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN105"><span class='Ref_To_Local'>memAddress</span></a> <span class='Operator'>== </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"shmat(id=%d, addr=%p, flags=0x%x) failed: %m"</span><span class='Delimiter'>, 
+</span>             <a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN104"><span class='Ref_To_Local'>requestedAddress</span></a><span class='Delimiter'>, </span><a href="../../include/portability/mem.h.html#LN17"><span class='Ref_to_Const'>PG_SHMAT_FLAGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Register on-exit routine to detach new segment before deleting */ 
+</span>    <a href="../../include/storage/ipc.h.html#LN69"><span class='Ref_to_Proto'>on_shmem_exit</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN82"><span class='Ref_to_Proto'>IpcMemoryDetach</span></a><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN561"><span class='Ref_to_Macro'>PointerGetDatum</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN105"><span class='Ref_To_Local'>memAddress</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Store shmem key and ID in data directory lockfile.  Format to try to 
+     * keep it the same length always (trailing junk in the lockfile won't 
+     * hurt, but might confuse humans). 
+     */ 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN240"></a>        <span class='Keyword'>char</span>        <span class='Declare_Local'>line</span><span class='Delimiter'>[</span><span class='Number'>64</span><span class='Delimiter'>]; 
+</span> 
+        <a href="../../include/port.h.html#LN170"><span class='Ref_to_Macro'>sprintf</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN240"><span class='Ref_To_Local'>line</span></a><span class='Delimiter'>, </span><span class='String'>"%9lu %9lu"</span><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><span class='Keyword'>unsigned long</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN101"><span class='Ref_to_Parameter'>memKey</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>unsigned long</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN103"><span class='Ref_To_Local'>shmid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/miscadmin.h.html#LN462"><span class='Ref_to_Proto'>AddToDataDirLockFile</span></a><span class='Parentheses'>(</span><a href="../../include/miscadmin.h.html#LN456"><span class='Ref_to_Const'>LOCK_FILE_LINE_SHMEM_KEY</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN240"><span class='Ref_To_Local'>line</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="sysv_shmem.c.html#LN105"><span class='Ref_To_Local'>memAddress</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end InternalIpcMemoryCreate &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/****************************************************************************/ 
+/*  IpcMemoryDetach(status, shmaddr)    removes a shared memory segment     */ 
+/*                                      from process' address space         */ 
+/*  (called as an on_shmem_exit callback, hence funny argument list)        */ 
+/****************************************************************************/ 
+</span><span class='Keyword'>static void 
+</span><a name="LN256"></a><span class='Declare_Function'>IpcMemoryDetach</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>shmaddr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Detach System V shared memory block. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>shmdt<span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN554"><span class='Ref_to_Macro'>DatumGetPointer</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN256"><span class='Ref_to_Parameter'>shmaddr</span></a><span class='Parentheses'>))</span> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, </span><span class='String'>"shmdt(%p) failed: %m"</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN554"><span class='Ref_to_Macro'>DatumGetPointer</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN256"><span class='Ref_to_Parameter'>shmaddr</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/****************************************************************************/ 
+/*  IpcMemoryDelete(status, shmId)      deletes a shared memory segment     */ 
+/*  (called as an on_shmem_exit callback, hence funny argument list)        */ 
+/****************************************************************************/ 
+</span><span class='Keyword'>static void 
+</span><a name="LN268"></a><span class='Declare_Function'>IpcMemoryDelete</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>shmId</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>shmctl<span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN477"><span class='Ref_to_Macro'>DatumGetInt32</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN268"><span class='Ref_to_Parameter'>shmId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN105"><span class='Ref_to_Const'>IPC_RMID</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, </span><span class='String'>"shmctl(%d, %d, 0) failed: %m"</span><span class='Delimiter'>, 
+</span>             <a href="../../include/postgres.h.html#LN477"><span class='Ref_to_Macro'>DatumGetInt32</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN268"><span class='Ref_to_Parameter'>shmId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN105"><span class='Ref_to_Const'>IPC_RMID</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * PGSharedMemoryIsInUse 
+ * 
+ * Is a previously-existing shmem segment still existing and in use? 
+ * 
+ * The point of this exercise is to detect the case where a prior postmaster 
+ * crashed, but it left child backends that are still running.  Therefore 
+ * we only care about shmem segments that are associated with the intended 
+ * DataDir.  This is an important consideration since accidental matches of 
+ * shmem segment IDs are reasonably common. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN287"></a><span class='Declare_Function'>PGSharedMemoryIsInUse</span><span class='Parentheses'>(</span><span class='Keyword'>unsigned long </span><span class='Declare_Parameter'>id1</span><span class='Delimiter'>, </span><span class='Keyword'>unsigned long </span><span class='Declare_Parameter'>id2</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN289"></a>    <a href="sysv_shmem.c.html#LN70"><span class='Ref_to_Typedef'>IpcMemoryId</span></a> <span class='Declare_Local'>shmId</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN70"><span class='Ref_to_Typedef'>IpcMemoryId</span></a><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN287"><span class='Ref_to_Parameter'>id2</span></a><span class='Delimiter'>; 
+</span><a name="LN290"></a>    <span class='Control'>struct</span> shmid_ds <span class='Declare_Local'>shmStat</span><span class='Delimiter'>; 
+</span><a name="LN291"></a>    <span class='Control'>struct</span> <a href="../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a> <span class='Declare_Local'>statbuf</span><span class='Delimiter'>; 
+</span><a name="LN292"></a>    <a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Local'>hdr</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We detect whether a shared memory segment is in use by seeing whether 
+     * it (a) exists and (b) has any processes attached to it. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>shmctl<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN289"><span class='Ref_To_Local'>shmId</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN110"><span class='Ref_to_Const'>IPC_STAT</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN290"><span class='Ref_To_Local'>shmStat</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * EINVAL actually has multiple possible causes documented in the 
+         * shmctl man page, but we assume it must mean the segment no longer 
+         * exists. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>errno <span class='Operator'>== </span>EINVAL<span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * EACCES implies that the segment belongs to some other userid, which 
+         * means it is not a Postgres shmem segment (or at least, not one that 
+         * is relevant to our data directory). 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>errno <span class='Operator'>== </span>EACCES<span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Some Linux kernel versions (in fact, all of them as of July 2007) 
+         * sometimes return EIDRM when EINVAL is correct.  The Linux kernel 
+         * actually does not have any internal state that would justify 
+         * returning EIDRM, so we can get away with assuming that EIDRM is 
+         * equivalent to EINVAL on that platform. 
+         */ 
+</span><span class='Directive'>#ifdef</span> <a href="../../include/port/linux.h.html#LN13"><span class='Ref_to_Const'>HAVE_LINUX_EIDRM_BUG</span></a> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span>errno <span class='Operator'>== </span><a href="../../include/port/win32.h.html#LN114"><span class='Ref_to_Const'>EIDRM</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+        <span class='Comment_Multi_Line'>/* 
+         * Otherwise, we had better assume that the segment is in use. The 
+         * only likely case is EIDRM, which implies that the segment has been 
+         * IPC_RMID'd but there are still processes attached to it. 
+         */ 
+</span>        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if shmctl(shmId,IPC_STAT... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* If it has no attached processes, it's not in use */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN290"><span class='Ref_To_Local'>shmStat</span></a><span class='Operator'>.</span>shm_nattch <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Try to attach to the segment and see if it matches our data directory. 
+     * This avoids shmid-conflict problems on machines that are running 
+     * several postmasters under the same userid. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN59"><span class='Ref_to_Global_Var'>DataDir</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN291"><span class='Ref_To_Local'>statbuf</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* if can't stat, be conservative */ 
+</span> 
+    <a href="sysv_shmem.c.html#LN292"><span class='Ref_To_Local'>hdr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span>shmat<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN289"><span class='Ref_To_Local'>shmId</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><a href="../../include/portability/mem.h.html#LN17"><span class='Ref_to_Const'>PG_SHMAT_FLAGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN292"><span class='Ref_To_Local'>hdr</span></a> <span class='Operator'>== </span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* if can't attach, be conservative */ 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN292"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN30"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>!= </span><a href="../../include/storage/pg_shmem.h.html#LN31"><span class='Ref_to_Const'>PGShmemMagic</span></a> <span class='Operator'>|| 
+</span>        <a href="sysv_shmem.c.html#LN292"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN38"><span class='Ref_to_Member'>device</span></a> <span class='Operator'>!= </span><a href="sysv_shmem.c.html#LN291"><span class='Ref_To_Local'>statbuf</span></a><span class='Operator'>.</span>st_dev <span class='Operator'>|| 
+</span>        <a href="sysv_shmem.c.html#LN292"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN39"><span class='Ref_to_Member'>inode</span></a> <span class='Operator'>!= </span><a href="sysv_shmem.c.html#LN291"><span class='Ref_To_Local'>statbuf</span></a><span class='Operator'>.</span>st_ino<span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * It's either not a Postgres segment, or not one for my data 
+         * directory.  In either case it poses no threat. 
+         */ 
+</span>        shmdt<span class='Parentheses'>((</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN292"><span class='Ref_To_Local'>hdr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Trouble --- looks a lot like there's still live backends */ 
+</span>    shmdt<span class='Parentheses'>((</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN292"><span class='Ref_To_Local'>hdr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end PGSharedMemoryIsInUse &raquo; </span> 
+ 
+<span class='Directive'>#ifdef</span> <a href="sysv_shmem.c.html#LN65"><span class='Ref_to_Const'>USE_ANONYMOUS_SHMEM</span></a> 
+ 
+<span class='Directive'>#ifdef</span> MAP_HUGETLB 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Identify the huge page size to use. 
+ * 
+ * Some Linux kernel versions have a bug causing mmap() to fail on requests 
+ * that are not a multiple of the hugepage size.  Versions without that bug 
+ * instead silently round the request up to the next hugepage multiple --- 
+ * and then munmap() fails when we give it a size different from that. 
+ * So we have to round our request up to a multiple of the actual hugepage 
+ * size to avoid trouble. 
+ * 
+ * Doing the round-up ourselves also lets us make use of the extra memory, 
+ * rather than just wasting it.  Currently, we just increase the available 
+ * space recorded in the shmem header, which will make the extra usable for 
+ * purposes such as additional locktable entries.  Someday, for very large 
+ * hugepage sizes, we might want to think about more invasive strategies, 
+ * such as increasing shared_buffers to absorb the extra space. 
+ * 
+ * Returns the (real or assumed) page size into *hugepagesize, 
+ * and the hugepage-related mmap flags to use into *mmap_flags. 
+ * 
+ * Currently *mmap_flags is always just MAP_HUGETLB.  Someday, on systems 
+ * that support it, we might OR in additional bits to specify a particular 
+ * non-default huge page size. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN400"></a><span class='Declare_Function'>GetHugePageSize</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>hugepagesize</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>mmap_flags</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * If we fail to find out the system's default huge page size, assume it 
+     * is 2MB.  This will work fine when the actual size is less.  If it's 
+     * more, we might get mmap() or munmap() failures due to unaligned 
+     * requests; but at this writing, there are no reports of any non-Linux 
+     * systems being picky about that. 
+     */ 
+</span>    <span class='Operator'>*</span><a href="sysv_shmem.c.html#LN400"><span class='Ref_to_Parameter'>hugepagesize</span></a> <span class='Operator'>= </span><span class='Number'>2</span> <span class='Operator'>* </span><span class='Number'>1024</span> <span class='Operator'>* </span><span class='Number'>1024</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="sysv_shmem.c.html#LN400"><span class='Ref_to_Parameter'>mmap_flags</span></a> <span class='Operator'>= </span>MAP_HUGETLB<span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * System-dependent code to find out the default huge page size. 
+     * 
+     * On Linux, read /proc/meminfo looking for a line like "Hugepagesize: 
+     * nnnn kB".  Ignore any failures, falling back to the preset default. 
+     */ 
+</span><span class='Directive'>#ifdef</span> __linux__ 
+    <span class='Delimiter'>{ 
+</span><a name="LN420"></a>        FILE       <span class='Operator'>*</span><span class='Declare_Local'>fp</span> <span class='Operator'>= </span><a href="../../include/storage/fd.h.html#LN83"><span class='Ref_to_Proto'>AllocateFile</span></a><span class='Parentheses'>(</span><span class='String'>"/proc/meminfo"</span><span class='Delimiter'>, </span><span class='String'>"r"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN421"></a>        <span class='Keyword'>char</span>        <span class='Declare_Local'>buf</span><span class='Delimiter'>[</span><span class='Number'>128</span><span class='Delimiter'>]; 
+</span><a name="LN422"></a>        <span class='Keyword'>unsigned int </span><span class='Declare_Local'>sz</span><span class='Delimiter'>; 
+</span><a name="LN423"></a>        <span class='Keyword'>char</span>        <span class='Declare_Local'>ch</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN420"><span class='Ref_To_Local'>fp</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>while</span> <span class='Parentheses'>(</span>fgets<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN421"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN421"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN420"><span class='Ref_To_Local'>fp</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span>sscanf<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN421"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='String'>"Hugepagesize: %u %c"</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN422"><span class='Ref_To_Local'>sz</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN423"><span class='Ref_To_Local'>ch</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>2</span><span class='Parentheses'>)</span> 
+                <span class='Delimiter'>{ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN423"><span class='Ref_To_Local'>ch</span></a> <span class='Operator'>== </span><span class='String'>'k'</span><span class='Parentheses'>) 
+</span>                    <span class='Delimiter'>{ 
+</span>                        <span class='Operator'>*</span><a href="sysv_shmem.c.html#LN400"><span class='Ref_to_Parameter'>hugepagesize</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN422"><span class='Ref_To_Local'>sz</span></a> <span class='Operator'>* </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a><span class='Parentheses'>) </span><span class='Number'>1024</span><span class='Delimiter'>; 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                    <span class='Delimiter'>} 
+</span>                    <span class='Comment_Multi_Line'>/* We could accept other units besides kB, if needed */ 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>            <a href="../../include/storage/fd.h.html#LN84"><span class='Ref_to_Proto'>FreeFile</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN420"><span class='Ref_To_Local'>fp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* __linux__ */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end GetHugePageSize &raquo; </span> 
+ 
+<span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* MAP_HUGETLB */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Creates an anonymous mmap()ed shared memory segment. 
+ * 
+ * Pass the requested size in *size.  This function will modify *size to the 
+ * actual size of the allocation, if it ends up allocating a segment that is 
+ * larger than requested. 
+ */ 
+</span><span class='Keyword'>static void </span><span class='Operator'>* 
+</span><a name="LN455"></a><span class='Declare_Function'>CreateAnonymousSegment</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN457"></a>    <a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>allocsize</span> <span class='Operator'>= *</span><a href="sysv_shmem.c.html#LN455"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span><a name="LN458"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>ptr</span> <span class='Operator'>= </span><a href="../../include/portability/mem.h.html#LN44"><span class='Ref_to_Const'>MAP_FAILED</span></a><span class='Delimiter'>; 
+</span><a name="LN459"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>mmap_errno</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifndef</span> MAP_HUGETLB 
+    <span class='Comment_Multi_Line'>/* PGSharedMemoryCreate should have dealt with this case */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../utils/misc/guc.c.html#LN486"><span class='Ref_to_Global_Var'>huge_pages</span></a> <span class='Operator'>!= </span><a href="../../include/storage/pg_shmem.h.html#LN50"><span class='Ref_to_EnumConst'>HUGE_PAGES_ON</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#else</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../utils/misc/guc.c.html#LN486"><span class='Ref_to_Global_Var'>huge_pages</span></a> <span class='Operator'>== </span><a href="../../include/storage/pg_shmem.h.html#LN50"><span class='Ref_to_EnumConst'>HUGE_PAGES_ON</span></a> <span class='Operator'>|| </span><a href="../utils/misc/guc.c.html#LN486"><span class='Ref_to_Global_Var'>huge_pages</span></a> <span class='Operator'>== </span><a href="../../include/storage/pg_shmem.h.html#LN51"><span class='Ref_to_EnumConst'>HUGE_PAGES_TRY</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Round up the request size to a suitable large value. 
+         */ 
+</span><a name="LN470"></a>        <a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>hugepagesize</span><span class='Delimiter'>; 
+</span><a name="LN471"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>mmap_flags</span><span class='Delimiter'>; 
+</span> 
+        <a href="sysv_shmem.c.html#LN399"><span class='Ref_to_Func'>GetHugePageSize</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN470"><span class='Ref_To_Local'>hugepagesize</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN471"><span class='Ref_To_Local'>mmap_flags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN457"><span class='Ref_To_Local'>allocsize</span></a> <span class='Operator'>% </span><a href="sysv_shmem.c.html#LN470"><span class='Ref_To_Local'>hugepagesize</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="sysv_shmem.c.html#LN457"><span class='Ref_To_Local'>allocsize</span></a> <span class='Operator'>+= </span><a href="sysv_shmem.c.html#LN470"><span class='Ref_To_Local'>hugepagesize</span></a> <span class='Operator'>- </span><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN457"><span class='Ref_To_Local'>allocsize</span></a> <span class='Operator'>% </span><a href="sysv_shmem.c.html#LN470"><span class='Ref_To_Local'>hugepagesize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="sysv_shmem.c.html#LN458"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>= </span>mmap<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN457"><span class='Ref_To_Local'>allocsize</span></a><span class='Delimiter'>, </span>PROT_READ <span class='Operator'>| </span>PROT_WRITE<span class='Delimiter'>, 
+</span>                   <a href="../../include/portability/mem.h.html#LN40"><span class='Ref_to_Const'>PG_MMAP_FLAGS</span></a> <span class='Operator'>| </span><a href="sysv_shmem.c.html#LN471"><span class='Ref_To_Local'>mmap_flags</span></a><span class='Delimiter'>, </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="sysv_shmem.c.html#LN459"><span class='Ref_To_Local'>mmap_errno</span></a> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../utils/misc/guc.c.html#LN486"><span class='Ref_to_Global_Var'>huge_pages</span></a> <span class='Operator'>== </span><a href="../../include/storage/pg_shmem.h.html#LN51"><span class='Ref_to_EnumConst'>HUGE_PAGES_TRY</span></a> <span class='Operator'>&& </span><a href="sysv_shmem.c.html#LN458"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>== </span><a href="../../include/portability/mem.h.html#LN44"><span class='Ref_to_Const'>MAP_FAILED</span></a><span class='Parentheses'>) 
+</span>            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><span class='String'>"mmap(%zu) with MAP_HUGETLB failed, huge pages disabled: %m"</span><span class='Delimiter'>, 
+</span>                 <a href="sysv_shmem.c.html#LN457"><span class='Ref_To_Local'>allocsize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if huge_pages==HUGE_PAGE... &raquo; </span> 
+<span class='Directive'>#endif</span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN458"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>== </span><a href="../../include/portability/mem.h.html#LN44"><span class='Ref_to_Const'>MAP_FAILED</span></a> <span class='Operator'>&& </span><a href="../utils/misc/guc.c.html#LN486"><span class='Ref_to_Global_Var'>huge_pages</span></a> <span class='Operator'>!= </span><a href="../../include/storage/pg_shmem.h.html#LN50"><span class='Ref_to_EnumConst'>HUGE_PAGES_ON</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Use the original size, not the rounded-up value, when falling back 
+         * to non-huge pages. 
+         */ 
+</span>        <a href="sysv_shmem.c.html#LN457"><span class='Ref_To_Local'>allocsize</span></a> <span class='Operator'>= *</span><a href="sysv_shmem.c.html#LN455"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span>        <a href="sysv_shmem.c.html#LN458"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>= </span>mmap<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN457"><span class='Ref_To_Local'>allocsize</span></a><span class='Delimiter'>, </span>PROT_READ <span class='Operator'>| </span>PROT_WRITE<span class='Delimiter'>, 
+</span>                   <a href="../../include/portability/mem.h.html#LN40"><span class='Ref_to_Const'>PG_MMAP_FLAGS</span></a><span class='Delimiter'>, </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="sysv_shmem.c.html#LN459"><span class='Ref_To_Local'>mmap_errno</span></a> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN458"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>== </span><a href="../../include/portability/mem.h.html#LN44"><span class='Ref_to_Const'>MAP_FAILED</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        errno <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN459"><span class='Ref_To_Local'>mmap_errno</span></a><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not map anonymous shared memory: %m"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN459"><span class='Ref_To_Local'>mmap_errno</span></a> <span class='Operator'>== </span>ENOMEM<span class='Parentheses'>) </span><span class='Operator'>? 
+</span>                 <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"This error usually means that PostgreSQL's request "</span> 
+                    <span class='String'>"for a shared memory segment exceeded available memory, "</span> 
+                     <span class='String'>"swap space, or huge pages. To reduce the request size "</span> 
+                         <span class='String'>"(currently %zu bytes), reduce PostgreSQL's shared "</span> 
+                       <span class='String'>"memory usage, perhaps by reducing shared_buffers or "</span> 
+                         <span class='String'>"max_connections."</span><span class='Delimiter'>, 
+</span>                         <span class='Operator'>*</span><a href="sysv_shmem.c.html#LN455"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>) </span><span class='Operator'>: </span><span class='Number'>0</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Operator'>*</span><a href="sysv_shmem.c.html#LN455"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN457"><span class='Ref_To_Local'>allocsize</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="sysv_shmem.c.html#LN458"><span class='Ref_To_Local'>ptr</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end CreateAnonymousSegment &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * AnonymousShmemDetach --- detach from an anonymous mmap'd block 
+ * (called as an on_shmem_exit callback, hence funny argument list) 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN523"></a><span class='Declare_Function'>AnonymousShmemDetach</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Release anonymous shared memory block, if any. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>munmap<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN77"><span class='Ref_to_Global_Var'>AnonymousShmemSize</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, </span><span class='String'>"munmap(%p, %zu) failed: %m"</span><span class='Delimiter'>, 
+</span>                 <a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN77"><span class='Ref_to_Global_Var'>AnonymousShmemSize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* USE_ANONYMOUS_SHMEM */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * PGSharedMemoryCreate 
+ * 
+ * Create a shared memory segment of the given size and initialize its 
+ * standard header.  Also, register an on_shmem_exit callback to release 
+ * the storage. 
+ * 
+ * Dead Postgres segments are recycled if found, but we do not fail upon 
+ * collision with non-Postgres shmem segments.  The idea here is to detect and 
+ * re-use keys that may have been assigned by a crashed postmaster or backend. 
+ * 
+ * makePrivate means to always create a new segment, rather than attach to 
+ * or recycle any existing segment. 
+ * 
+ * The port number is passed for possible use as a key (for SysV, we use 
+ * it to generate the starting shmem key).  In a standalone backend, 
+ * zero will be passed. 
+ */ 
+</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>* 
+</span><a name="LN556"></a><span class='Declare_Function'>PGSharedMemoryCreate</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>makePrivate</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>port</span><span class='Delimiter'>, 
+</span><a name="LN557"></a>                     <a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>**</span><span class='Declare_Parameter'>shim</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN559"></a>    <a href="sysv_shmem.c.html#LN69"><span class='Ref_to_Typedef'>IpcMemoryKey</span></a> <span class='Declare_Local'>NextShmemSegID</span><span class='Delimiter'>; 
+</span><a name="LN560"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>memAddress</span><span class='Delimiter'>; 
+</span><a name="LN561"></a>    <a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Local'>hdr</span><span class='Delimiter'>; 
+</span><a name="LN562"></a>    <a href="sysv_shmem.c.html#LN70"><span class='Ref_to_Typedef'>IpcMemoryId</span></a> <span class='Declare_Local'>shmid</span><span class='Delimiter'>; 
+</span><a name="LN563"></a>    <span class='Control'>struct</span> <a href="../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a> <span class='Declare_Local'>statbuf</span><span class='Delimiter'>; 
+</span><a name="LN564"></a>    <a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>sysvsize</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Complain if hugepages demanded but we can't possibly support them */ 
+</span><span class='Directive'>#if</span> <span class='Operator'>!</span>defined<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN65"><span class='Ref_to_Const'>USE_ANONYMOUS_SHMEM</span></a><span class='Parentheses'>) </span><span class='Operator'>|| !</span>defined<span class='Parentheses'>(</span>MAP_HUGETLB<span class='Parentheses'>) 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../utils/misc/guc.c.html#LN486"><span class='Ref_to_Global_Var'>huge_pages</span></a> <span class='Operator'>== </span><a href="../../include/storage/pg_shmem.h.html#LN50"><span class='Ref_to_EnumConst'>HUGE_PAGES_ON</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"huge pages not supported on this platform"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Comment_Multi_Line'>/* Room for a header? */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN556"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>&GT; </span><a href="../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="sysv_shmem.c.html#LN65"><span class='Ref_to_Const'>USE_ANONYMOUS_SHMEM</span></a> 
+    <a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN454"><span class='Ref_to_Func'>CreateAnonymousSegment</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN556"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="sysv_shmem.c.html#LN77"><span class='Ref_to_Global_Var'>AnonymousShmemSize</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN556"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Register on-exit routine to unmap the anonymous segment */ 
+</span>    <a href="../../include/storage/ipc.h.html#LN69"><span class='Ref_to_Proto'>on_shmem_exit</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN522"><span class='Ref_to_Func'>AnonymousShmemDetach</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>) </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now we need only allocate a minimal-sized SysV shmem block. */ 
+</span>    <a href="sysv_shmem.c.html#LN564"><span class='Ref_To_Local'>sysvsize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#else</span> 
+    <a href="sysv_shmem.c.html#LN564"><span class='Ref_To_Local'>sysvsize</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN556"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Comment_Multi_Line'>/* Make sure PGSharedMemoryAttach doesn't fail without need */ 
+</span>    <a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Loop till we find a free IPC key */ 
+</span>    <a href="sysv_shmem.c.html#LN559"><span class='Ref_To_Local'>NextShmemSegID</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN556"><span class='Ref_to_Parameter'>port</span></a> <span class='Operator'>* </span><span class='Number'>1000</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN559"><span class='Ref_To_Local'>NextShmemSegID</span></a><span class='Operator'>++</span><span class='Delimiter'>;; </span><a href="sysv_shmem.c.html#LN559"><span class='Ref_To_Local'>NextShmemSegID</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Try to create new segment */ 
+</span>        <a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN81"><span class='Ref_to_Proto'>InternalIpcMemoryCreate</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN559"><span class='Ref_To_Local'>NextShmemSegID</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN564"><span class='Ref_To_Local'>sysvsize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>;</span>              <span class='Comment_Single_Line'>/* successful create and attach */ 
+</span> 
+        <span class='Comment_Multi_Line'>/* Check shared memory and possibly remove and recreate */ 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN556"><span class='Ref_to_Parameter'>makePrivate</span></a><span class='Parentheses'>)</span>        <span class='Comment_Single_Line'>/* a standalone backend shouldn't do this */ 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN84"><span class='Ref_to_Proto'>PGSharedMemoryAttach</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN559"><span class='Ref_To_Local'>NextShmemSegID</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN562"><span class='Ref_To_Local'>shmid</span></a><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+            <span class='Control'>continue</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* can't attach, not one of mine */ 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If I am not the creator and it belongs to an extant process, 
+         * continue. 
+         */ 
+</span>        <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN32"><span class='Ref_to_Member'>creatorPID</span></a> <span class='Operator'>!= </span>getpid<span class='Parentheses'>())</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/port.h.html#LN210"><span class='Ref_to_Macro'>kill</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN32"><span class='Ref_to_Member'>creatorPID</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span>errno <span class='Operator'>!= </span>ESRCH<span class='Parentheses'>)</span> 
+            <span class='Delimiter'>{ 
+</span>                shmdt<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>continue</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* segment belongs to a live process */ 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * The segment appears to be from a dead Postgres process, or from a 
+         * previous cycle of life in this same process.  Zap it, if possible, 
+         * and any associated dynamic shared memory segments, as well. This 
+         * probably shouldn't fail, but if it does, assume the segment belongs 
+         * to someone else after all, and continue quietly. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN35"><span class='Ref_to_Member'>dsm_control</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="../../include/storage/dsm.h.html#LN26"><span class='Ref_to_Proto'>dsm_cleanup_using_control_segment</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN35"><span class='Ref_to_Member'>dsm_control</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        shmdt<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>shmctl<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN562"><span class='Ref_To_Local'>shmid</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN105"><span class='Ref_to_Const'>IPC_RMID</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Now try again to create the segment. 
+         */ 
+</span>        <a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN81"><span class='Ref_to_Proto'>InternalIpcMemoryCreate</span></a><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN559"><span class='Ref_To_Local'>NextShmemSegID</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN564"><span class='Ref_To_Local'>sysvsize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>;</span>              <span class='Comment_Single_Line'>/* successful create and attach */ 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Can only get here if some other process managed to create the same 
+         * shmem key before we did.  Let him have that one, loop around to try 
+         * next key. 
+         */ 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for NextShmemSegID++;;Nex... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * OK, we created a new segment.  Mark it as created by this process. The 
+     * order of assignments here is critical so that another Postgres process 
+     * can't see the header as valid but belonging to an invalid PID! 
+     */ 
+</span>    <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a><span class='Delimiter'>; 
+</span>    <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN32"><span class='Ref_to_Member'>creatorPID</span></a> <span class='Operator'>= </span>getpid<span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN30"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>= </span><a href="../../include/storage/pg_shmem.h.html#LN31"><span class='Ref_to_Const'>PGShmemMagic</span></a><span class='Delimiter'>; 
+</span>    <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN35"><span class='Ref_to_Member'>dsm_control</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Fill in the data directory ID info, too */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN59"><span class='Ref_to_Global_Var'>DataDir</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN563"><span class='Ref_To_Local'>statbuf</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not stat data directory \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="../utils/init/globals.c.html#LN59"><span class='Ref_to_Global_Var'>DataDir</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN38"><span class='Ref_to_Member'>device</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN563"><span class='Ref_To_Local'>statbuf</span></a><span class='Operator'>.</span>st_dev<span class='Delimiter'>; 
+</span>    <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN39"><span class='Ref_to_Member'>inode</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN563"><span class='Ref_To_Local'>statbuf</span></a><span class='Operator'>.</span>st_ino<span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Initialize space allocation status for segment. 
+     */ 
+</span>    <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN33"><span class='Ref_to_Member'>totalsize</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN556"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span>    <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN34"><span class='Ref_to_Member'>freeoffset</span></a> <span class='Operator'>= </span><a href="../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="sysv_shmem.c.html#LN557"><span class='Ref_to_Parameter'>shim</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Save info for possible future use */ 
+</span>    <a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN560"><span class='Ref_To_Local'>memAddress</span></a><span class='Delimiter'>; 
+</span>    <a href="win32_shmem.c.html#LN19"><span class='Ref_to_Global_Var'>UsedShmemSegID</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>unsigned long</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN559"><span class='Ref_To_Local'>NextShmemSegID</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If AnonymousShmem is NULL here, then we're not using anonymous shared 
+     * memory, and should return a pointer to the System V shared memory 
+     * block. Otherwise, the System V shared memory block is only a shim, and 
+     * we must return a pointer to the real block. 
+     */ 
+</span><span class='Directive'>#ifdef</span> <a href="sysv_shmem.c.html#LN65"><span class='Ref_to_Const'>USE_ANONYMOUS_SHMEM</span></a> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Delimiter'>; 
+</span>    memcpy<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a><span class='Delimiter'>; 
+</span><span class='Directive'>#else</span> 
+    <span class='Control'>return</span> <a href="sysv_shmem.c.html#LN561"><span class='Ref_To_Local'>hdr</span></a><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end PGSharedMemoryCreate &raquo; </span> 
+ 
+<span class='Directive'>#ifdef</span> EXEC_BACKEND 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * PGSharedMemoryReAttach 
+ * 
+ * This is called during startup of a postmaster child process to re-attach to 
+ * an already existing shared memory segment.  This is needed only in the 
+ * EXEC_BACKEND case; otherwise postmaster children inherit the shared memory 
+ * segment attachment via fork(). 
+ * 
+ * UsedShmemSegID and UsedShmemSegAddr are implicit parameters to this 
+ * routine.  The caller must have already restored them to the postmaster's 
+ * values. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN713"></a><span class='Declare_Function'>PGSharedMemoryReAttach</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN715"></a>    <a href="sysv_shmem.c.html#LN70"><span class='Ref_to_Typedef'>IpcMemoryId</span></a> <span class='Declare_Local'>shmid</span><span class='Delimiter'>; 
+</span><a name="LN716"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>hdr</span><span class='Delimiter'>; 
+</span><a name="LN717"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>origUsedShmemSegAddr</span> <span class='Operator'>= </span><a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> __CYGWIN__ 
+    <span class='Comment_Multi_Line'>/* cygipc (currently) appears to not detach on exec. */ 
+</span>    <a href="../../include/storage/pg_shmem.h.html#LN69"><span class='Ref_to_Proto'>PGSharedMemoryDetach</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN717"><span class='Ref_To_Local'>origUsedShmemSegAddr</span></a><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, </span><span class='String'>"attaching to %p"</span><span class='Delimiter'>, </span><a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="sysv_shmem.c.html#LN716"><span class='Ref_To_Local'>hdr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN84"><span class='Ref_to_Proto'>PGSharedMemoryAttach</span></a><span class='Parentheses'>((</span><a href="sysv_shmem.c.html#LN69"><span class='Ref_to_Typedef'>IpcMemoryKey</span></a><span class='Parentheses'>) </span><a href="win32_shmem.c.html#LN19"><span class='Ref_to_Global_Var'>UsedShmemSegID</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="sysv_shmem.c.html#LN715"><span class='Ref_To_Local'>shmid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN716"><span class='Ref_To_Local'>hdr</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"could not reattach to shared memory (key=%d, addr=%p): %m"</span><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="win32_shmem.c.html#LN19"><span class='Ref_to_Global_Var'>UsedShmemSegID</span></a><span class='Delimiter'>, </span><a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN716"><span class='Ref_To_Local'>hdr</span></a> <span class='Operator'>!= </span><a href="sysv_shmem.c.html#LN717"><span class='Ref_To_Local'>origUsedShmemSegAddr</span></a><span class='Parentheses'>) 
+</span>        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"reattaching to shared memory returned unexpected address (got %p, expected %p)"</span><span class='Delimiter'>, 
+</span>             <a href="sysv_shmem.c.html#LN716"><span class='Ref_To_Local'>hdr</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN717"><span class='Ref_To_Local'>origUsedShmemSegAddr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/dsm.h.html#LN32"><span class='Ref_to_Proto'>dsm_set_control_handle</span></a><span class='Parentheses'>(((</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN716"><span class='Ref_To_Local'>hdr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>dsm_control<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a> <span class='Operator'>= </span><a href="sysv_shmem.c.html#LN716"><span class='Ref_To_Local'>hdr</span></a><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* probably redundant */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end PGSharedMemoryReAttach &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * PGSharedMemoryNoReAttach 
+ * 
+ * This is called during startup of a postmaster child process when we choose 
+ * *not* to re-attach to the existing shared memory segment.  We must clean up 
+ * to leave things in the appropriate state.  This is not used in the non 
+ * EXEC_BACKEND case, either. 
+ * 
+ * The child process startup logic might or might not call PGSharedMemoryDetach 
+ * after this; make sure that it will be a no-op if called. 
+ * 
+ * UsedShmemSegID and UsedShmemSegAddr are implicit parameters to this 
+ * routine.  The caller must have already restored them to the postmaster's 
+ * values. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN757"></a><span class='Declare_Function'>PGSharedMemoryNoReAttach</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> __CYGWIN__ 
+    <span class='Comment_Multi_Line'>/* cygipc (currently) appears to not detach on exec. */ 
+</span>    <a href="../../include/storage/pg_shmem.h.html#LN69"><span class='Ref_to_Proto'>PGSharedMemoryDetach</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Comment_Multi_Line'>/* For cleanliness, reset UsedShmemSegAddr to show we're not attached. */ 
+</span>    <a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* And the same for UsedShmemSegID. */ 
+</span>    <a href="win32_shmem.c.html#LN19"><span class='Ref_to_Global_Var'>UsedShmemSegID</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* EXEC_BACKEND */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * PGSharedMemoryDetach 
+ * 
+ * Detach from the shared memory segment, if still attached.  This is not 
+ * intended to be called explicitly by the process that originally created the 
+ * segment (it will have on_shmem_exit callback(s) registered to do that). 
+ * Rather, this is for subprocesses that have inherited an attachment and want 
+ * to get rid of it. 
+ * 
+ * UsedShmemSegID and UsedShmemSegAddr are implicit parameters to this 
+ * routine, also AnonymousShmem and AnonymousShmemSize. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN788"></a><span class='Declare_Function'>PGSharedMemoryDetach</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>((</span>shmdt<span class='Parentheses'>(</span><a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+<span class='Directive'>#if</span> defined<span class='Parentheses'>(</span>EXEC_BACKEND<span class='Parentheses'>)</span> <span class='Operator'>&& </span>defined<span class='Parentheses'>(</span>__CYGWIN__<span class='Parentheses'>)</span> 
+        <span class='Comment_Multi_Line'>/* Work-around for cygipc exec bug */ 
+</span>            <span class='Operator'>&& </span>shmdt<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> <span class='Operator'>&LT; </span><span class='Number'>0</span> 
+<span class='Directive'>#endif</span> 
+            <span class='Parentheses'>)</span> 
+            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, </span><span class='String'>"shmdt(%p) failed: %m"</span><span class='Delimiter'>, </span><a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="sysv_shmem.c.html#LN65"><span class='Ref_to_Const'>USE_ANONYMOUS_SHMEM</span></a> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>munmap<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN77"><span class='Ref_to_Global_Var'>AnonymousShmemSize</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, </span><span class='String'>"munmap(%p, %zu) failed: %m"</span><span class='Delimiter'>, 
+</span>                 <a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN77"><span class='Ref_to_Global_Var'>AnonymousShmemSize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="sysv_shmem.c.html#LN78"><span class='Ref_to_Global_Var'>AnonymousShmem</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end PGSharedMemoryDetach &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Attach to shared memory and make sure it has a Postgres header 
+ * 
+ * Returns attach address if OK, else NULL 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>* 
+</span><a name="LN820"></a><span class='Declare_Function'>PGSharedMemoryAttach</span><span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN69"><span class='Ref_to_Typedef'>IpcMemoryKey</span></a> <span class='Declare_Parameter'>key</span><span class='Delimiter'>, </span><a href="sysv_shmem.c.html#LN70"><span class='Ref_to_Typedef'>IpcMemoryId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>shmid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN822"></a>    <a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Local'>hdr</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>((</span><span class='Operator'>*</span><a href="sysv_shmem.c.html#LN820"><span class='Ref_to_Parameter'>shmid</span></a> <span class='Operator'>= </span>shmget<span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN820"><span class='Ref_to_Parameter'>key</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>))</span> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <a href="sysv_shmem.c.html#LN822"><span class='Ref_To_Local'>hdr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span>shmat<span class='Parentheses'>(</span><span class='Operator'>*</span><a href="sysv_shmem.c.html#LN820"><span class='Ref_to_Parameter'>shmid</span></a><span class='Delimiter'>, </span><a href="win32_shmem.c.html#LN20"><span class='Ref_to_Global_Var'>UsedShmemSegAddr</span></a><span class='Delimiter'>, </span><a href="../../include/portability/mem.h.html#LN17"><span class='Ref_to_Const'>PG_SHMAT_FLAGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN822"><span class='Ref_To_Local'>hdr</span></a> <span class='Operator'>== </span><span class='Parentheses'>(</span><a href="../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* failed: must be some other app's */ 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="sysv_shmem.c.html#LN822"><span class='Ref_To_Local'>hdr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/pg_shmem.h.html#LN30"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>!= </span><a href="../../include/storage/pg_shmem.h.html#LN31"><span class='Ref_to_Const'>PGShmemMagic</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        shmdt<span class='Parentheses'>((</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="sysv_shmem.c.html#LN822"><span class='Ref_To_Local'>hdr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* segment belongs to a non-Postgres app */ 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="sysv_shmem.c.html#LN822"><span class='Ref_To_Local'>hdr</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end PGSharedMemoryAttach &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

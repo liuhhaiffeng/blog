@@ -1,0 +1,1191 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\storage\ipc\dsm.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\storage\ipc\dsm.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:49 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * dsm.c 
+ *    manage dynamic shared memory segments 
+ * 
+ * This file provides a set of services to make programming with dynamic 
+ * shared memory segments more convenient.  Unlike the low-level 
+ * facilities provided by dsm_impl.h and dsm_impl.c, mappings and segments 
+ * created using this module will be cleaned up automatically.  Mappings 
+ * will be removed when the resource owner under which they were created 
+ * is cleaned up, unless dsm_pin_mapping() is used, in which case they 
+ * have session lifespan.  Segments will be removed when there are no 
+ * remaining mappings, or at postmaster shutdown in any case.  After a 
+ * hard postmaster crash, remaining segments will be removed, if they 
+ * still exist, at the next postmaster startup. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/storage/ipc/dsm.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;fcntl.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+<span class='Directive'>#ifndef</span> <a href="../../../include/c.h.html#LN61"><span class='Ref_to_Const'>WIN32</span></a> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/mman.h&GT;</span> 
+<span class='Directive'>#endif</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/stat.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"lib/ilist.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/dsm.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/pg_shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/guc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/resowner_private.h"</span> 
+ 
+<a name="LN45"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PG_DYNSHMEM_CONTROL_MAGIC</span>       <span class='Number'>0x9a503d32</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * There's no point in getting too cheap here, because the minimum allocation 
+ * is one OS page, which is probably at least 4KB and could easily be as high 
+ * as 64KB.  Each currently sizeof(dsm_control_item), currently 8 bytes. 
+ */ 
+</span><a name="LN52"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PG_DYNSHMEM_FIXED_SLOTS</span>         <span class='Number'>64</span> 
+<a name="LN53"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PG_DYNSHMEM_SLOTS_PER_BACKEND</span>   <span class='Number'>2</span> 
+ 
+<a name="LN55"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INVALID_CONTROL_SLOT</span>        <span class='Parentheses'>((</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+ 
+<span class='Comment_Multi_Line'>/* Backend-local tracking for on-detach callbacks. */ 
+</span><a name="LN58"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>dsm_segment_detach_callback</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN60"></a>    <a href="../../../include/storage/dsm.h.html#LN55"><span class='Ref_to_Typedef'>on_dsm_detach_callback</span></a> <span class='Declare_Member'>function</span><span class='Delimiter'>; 
+</span><a name="LN61"></a>    <a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Member'>arg</span><span class='Delimiter'>; 
+</span><a name="LN62"></a>    <a href="../../../include/lib/ilist.h.html#LN190"><span class='Ref_to_Struct'>slist_node</span></a>  <span class='Declare_Member'>node</span><span class='Delimiter'>; 
+</span><a name="LN63"></a>} <span class='Declare_Typedef'>dsm_segment_detach_callback</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Backend-local state for a dynamic shared memory segment. */ 
+</span><a name="LN66"></a><span class='Control'>struct</span> <span class='Declare_Struct'>dsm_segment</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN68"></a>    <a href="../../../include/lib/ilist.h.html#LN120"><span class='Ref_to_Struct'>dlist_node</span></a>  <span class='Declare_Member'>node</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* List link in dsm_segment_list. */ 
+</span><a name="LN69"></a>    <a href="../../../include/utils/resowner.h.html#LN26"><span class='Ref_to_Typedef'>ResourceOwner</span></a> <span class='Declare_Member'>resowner</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* Resource owner. */ 
+</span><a name="LN70"></a>    <a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a>  <span class='Declare_Member'>handle</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* Segment name. */ 
+</span><a name="LN71"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>control_slot</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* Slot in control segment. */ 
+</span><a name="LN72"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Member'>impl_private</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* Implementation-specific private data. */ 
+</span><a name="LN73"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Member'>mapped_address</span><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* Mapping address, or NULL if unmapped. */ 
+</span><a name="LN74"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Member'>mapped_size</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* Size of our mapping. */ 
+</span><a name="LN75"></a>    <a href="../../../include/lib/ilist.h.html#LN202"><span class='Ref_to_Struct'>slist_head</span></a>  <span class='Declare_Member'>on_detach</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* On-detach callbacks. */ 
+</span><span class='Delimiter'>}; 
+</span> 
+<span class='Comment_Multi_Line'>/* Shared-memory state for a dynamic shared memory segment. */ 
+</span><a name="LN79"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>dsm_control_item</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN81"></a>    <a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a>  <span class='Declare_Member'>handle</span><span class='Delimiter'>; 
+</span><a name="LN82"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>refcnt</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* 2+ = active, 1 = moribund, 0 = gone */ 
+</span><a name="LN83"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Member'>impl_private_pm_handle</span><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* only needed on Windows */ 
+</span><a name="LN84"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>pinned</span><span class='Delimiter'>; 
+</span><a name="LN85"></a>} <span class='Declare_Typedef'>dsm_control_item</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Layout of the dynamic shared memory control segment. */ 
+</span><a name="LN88"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>dsm_control_header</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN90"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>magic</span><span class='Delimiter'>; 
+</span><a name="LN91"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>nitems</span><span class='Delimiter'>; 
+</span><a name="LN92"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>maxitems</span><span class='Delimiter'>; 
+</span><a name="LN93"></a>    <a href="dsm.c.html#LN79"><span class='Ref_to_Struct'>dsm_control_item</span></a> <span class='Declare_Member'>item</span><span class='Delimiter'>[</span>FLEXIBLE_ARRAY_MEMBER<span class='Delimiter'>]; 
+</span><a name="LN94"></a>} <span class='Declare_Typedef'>dsm_control_header</span><span class='Delimiter'>; 
+</span> 
+<a name="LN96"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>dsm_cleanup_for_mmap</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN97"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>dsm_postmaster_shutdown</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>code</span><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN98"></a><span class='Keyword'>static </span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>dsm_create_descriptor</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN99"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>dsm_control_segment_sane</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN88"><span class='Ref_to_Struct'>dsm_control_header</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>control</span><span class='Delimiter'>, 
+</span><a name="LN100"></a>                         <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>mapped_size</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN101"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a> <span class='Declare_Prototype'>dsm_control_bytes_needed</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Parameter'>nitems</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Has this backend initialized the dynamic shared memory system yet? */ 
+</span><a name="LN104"></a><span class='Keyword'>static bool </span><span class='Declare_Var'>dsm_init_done</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * List of dynamic shared memory segments used by this backend. 
+ * 
+ * At process exit time, we must decrement the reference count of each 
+ * segment we have attached; this list makes it possible to find all such 
+ * segments. 
+ * 
+ * This list should always be empty in the postmaster.  We could probably 
+ * allow the postmaster to map dynamic shared memory segments before it 
+ * begins to start child processes, provided that each process adjusted 
+ * the reference counts for those segments in the control segment at 
+ * startup time, but there's no obvious need for such a facility, which 
+ * would also be complex to handle in the EXEC_BACKEND case.  Once the 
+ * postmaster has begun spawning children, there's an additional problem: 
+ * each new mapping would require an update to the control segment, 
+ * which requires locking, in which the postmaster must not be involved. 
+ */ 
+</span><a name="LN123"></a><span class='Keyword'>static </span><a href="../../../include/lib/ilist.h.html#LN134"><span class='Ref_to_Struct'>dlist_head</span></a> <span class='Declare_Var'>dsm_segment_list</span> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN247"><span class='Ref_to_Macro'>DLIST_STATIC_INIT</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN123"><span class='Ref_to_Global_Var'>dsm_segment_list</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Control segment information. 
+ * 
+ * Unlike ordinary shared memory segments, the control segment is not 
+ * reference counted; instead, it lasts for the postmaster's entire 
+ * life cycle.  For simplicity, it doesn't have a dsm_segment object either. 
+ */ 
+</span><a name="LN132"></a><span class='Keyword'>static </span><a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a> <span class='Declare_Var'>dsm_control_handle</span><span class='Delimiter'>; 
+</span><a name="LN133"></a><span class='Keyword'>static </span><a href="dsm.c.html#LN88"><span class='Ref_to_Struct'>dsm_control_header</span></a> <span class='Operator'>*</span><span class='Declare_Var'>dsm_control</span><span class='Delimiter'>; 
+</span><a name="LN134"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Var'>dsm_control_mapped_size</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN135"></a><span class='Keyword'>static void </span><span class='Operator'>*</span><span class='Declare_Var'>dsm_control_impl_private</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Start up the dynamic shared memory system. 
+ * 
+ * This is called just once during each cluster lifetime, at postmaster 
+ * startup time. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN144"></a><span class='Declare_Function'>dsm_postmaster_startup</span><span class='Parentheses'>(</span><a href="../../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>shim</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN146"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>dsm_control_address</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN147"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>maxitems</span><span class='Delimiter'>; 
+</span><a name="LN148"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>segsize</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If dynamic shared memory is disabled, there's nothing to do. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm_impl.c.html#LN111"><span class='Ref_to_Global_Var'>dynamic_shared_memory_type</span></a> <span class='Operator'>== </span><a href="../../../include/storage/dsm_impl.h.html#LN16"><span class='Ref_to_Const'>DSM_IMPL_NONE</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we're using the mmap implementations, clean up any leftovers. 
+     * Cleanup isn't needed on Windows, and happens earlier in startup for 
+     * POSIX and System V shared memory, via a direct call to 
+     * dsm_cleanup_using_control_segment. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm_impl.c.html#LN111"><span class='Ref_to_Global_Var'>dynamic_shared_memory_type</span></a> <span class='Operator'>== </span><a href="../../../include/storage/dsm_impl.h.html#LN20"><span class='Ref_to_Const'>DSM_IMPL_MMAP</span></a><span class='Parentheses'>) 
+</span>        <a href="dsm.c.html#LN96"><span class='Ref_to_Proto'>dsm_cleanup_for_mmap</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Determine size for new control segment. */ 
+</span>    <a href="dsm.c.html#LN147"><span class='Ref_To_Local'>maxitems</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN52"><span class='Ref_to_Const'>PG_DYNSHMEM_FIXED_SLOTS</span></a> 
+        <span class='Operator'>+ </span><a href="dsm.c.html#LN53"><span class='Ref_to_Const'>PG_DYNSHMEM_SLOTS_PER_BACKEND</span></a> <span class='Operator'>* </span><a href="../../utils/init/globals.c.html#LN126"><span class='Ref_to_Global_Var'>MaxBackends</span></a><span class='Delimiter'>; 
+</span>    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, </span><span class='String'>"dynamic shared memory system will support %u segments"</span><span class='Delimiter'>, 
+</span>         <a href="dsm.c.html#LN147"><span class='Ref_To_Local'>maxitems</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN148"><span class='Ref_To_Local'>segsize</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN101"><span class='Ref_to_Proto'>dsm_control_bytes_needed</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN147"><span class='Ref_To_Local'>maxitems</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Loop until we find an unused identifier for the new control segment. We 
+     * sometimes use 0 as a sentinel value indicating that no control segment 
+     * is known to exist, so avoid using that value for a real control 
+     * segment. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN146"><span class='Ref_To_Local'>dsm_control_address</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN134"><span class='Ref_to_Global_Var'>dsm_control_mapped_size</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a> <span class='Operator'>= </span><a href="../../../port/random.c.html#LN20"><span class='Ref_to_Func'>random</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a> <span class='Operator'>== </span><a href="../../../include/storage/dsm.h.html#LN22"><span class='Ref_to_Const'>DSM_HANDLE_INVALID</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN59"><span class='Ref_to_EnumConst'>DSM_OP_CREATE</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN148"><span class='Ref_To_Local'>segsize</span></a><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="dsm.c.html#LN135"><span class='Ref_to_Global_Var'>dsm_control_impl_private</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN146"><span class='Ref_To_Local'>dsm_control_address</span></a><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="dsm.c.html#LN134"><span class='Ref_to_Global_Var'>dsm_control_mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN146"><span class='Ref_To_Local'>dsm_control_address</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/ipc.h.html#LN69"><span class='Ref_to_Proto'>on_shmem_exit</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN97"><span class='Ref_to_Proto'>dsm_postmaster_shutdown</span></a><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN561"><span class='Ref_to_Macro'>PointerGetDatum</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN144"><span class='Ref_to_Parameter'>shim</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, 
+</span>         <span class='String'>"created dynamic shared memory control segment %u (%zu bytes)"</span><span class='Delimiter'>, 
+</span>         <a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN148"><span class='Ref_To_Local'>segsize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN144"><span class='Ref_to_Parameter'>shim</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN35"><span class='Ref_to_Member'>dsm_control</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize control segment. */ 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN90"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN45"><span class='Ref_to_Const'>PG_DYNSHMEM_CONTROL_MAGIC</span></a><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN91"><span class='Ref_to_Member'>nitems</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN92"><span class='Ref_to_Member'>maxitems</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN147"><span class='Ref_To_Local'>maxitems</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_postmaster_startup &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Determine whether the control segment from the previous postmaster 
+ * invocation still exists.  If so, remove the dynamic shared memory 
+ * segments to which it refers, and then the control segment itself. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN209"></a><span class='Declare_Function'>dsm_cleanup_using_control_segment</span><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a> <span class='Declare_Parameter'>old_control_handle</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN211"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>mapped_address</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN212"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>junk_mapped_address</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN213"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>impl_private</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN214"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>junk_impl_private</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN215"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>mapped_size</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN216"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>junk_mapped_size</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN217"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>nitems</span><span class='Delimiter'>; 
+</span><a name="LN218"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN219"></a>    <a href="dsm.c.html#LN88"><span class='Ref_to_Struct'>dsm_control_header</span></a> <span class='Operator'>*</span><span class='Declare_Local'>old_control</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If dynamic shared memory is disabled, there's nothing to do. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm_impl.c.html#LN111"><span class='Ref_to_Global_Var'>dynamic_shared_memory_type</span></a> <span class='Operator'>== </span><a href="../../../include/storage/dsm_impl.h.html#LN16"><span class='Ref_to_Const'>DSM_IMPL_NONE</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Try to attach the segment.  If this fails, it probably just means that 
+     * the operating system has been rebooted and the segment no longer 
+     * exists, or an unrelated process has used the same shm ID.  So just fall 
+     * out quietly. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN60"><span class='Ref_to_EnumConst'>DSM_OP_ATTACH</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN209"><span class='Ref_to_Parameter'>old_control_handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN213"><span class='Ref_To_Local'>impl_private</span></a><span class='Delimiter'>, 
+</span>                     <span class='Operator'>&</span><a href="dsm.c.html#LN211"><span class='Ref_To_Local'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN215"><span class='Ref_To_Local'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We've managed to reattach it, but the contents might not be sane. If 
+     * they aren't, we disregard the segment after all. 
+     */ 
+</span>    <a href="dsm.c.html#LN219"><span class='Ref_To_Local'>old_control</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="dsm.c.html#LN88"><span class='Ref_to_Struct'>dsm_control_header</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="dsm.c.html#LN211"><span class='Ref_To_Local'>mapped_address</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="dsm.c.html#LN99"><span class='Ref_to_Proto'>dsm_control_segment_sane</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN219"><span class='Ref_To_Local'>old_control</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN215"><span class='Ref_To_Local'>mapped_size</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN61"><span class='Ref_to_EnumConst'>DSM_OP_DETACH</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN209"><span class='Ref_to_Parameter'>old_control_handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN213"><span class='Ref_To_Local'>impl_private</span></a><span class='Delimiter'>, 
+</span>                    <span class='Operator'>&</span><a href="dsm.c.html#LN211"><span class='Ref_To_Local'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN215"><span class='Ref_To_Local'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * OK, the control segment looks basically valid, so we can use it to get 
+     * a list of segments that need to be removed. 
+     */ 
+</span>    <a href="dsm.c.html#LN217"><span class='Ref_To_Local'>nitems</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN219"><span class='Ref_To_Local'>old_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN91"><span class='Ref_to_Member'>nitems</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN218"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="dsm.c.html#LN218"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="dsm.c.html#LN217"><span class='Ref_To_Local'>nitems</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="dsm.c.html#LN218"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN254"></a>        <a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a>  <span class='Declare_Local'>handle</span><span class='Delimiter'>; 
+</span><a name="LN255"></a>        <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>refcnt</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If the reference count is 0, the slot is actually unused. */ 
+</span>        <a href="dsm.c.html#LN255"><span class='Ref_To_Local'>refcnt</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN219"><span class='Ref_To_Local'>old_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN218"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN255"><span class='Ref_To_Local'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Log debugging information. */ 
+</span>        <a href="dsm.c.html#LN254"><span class='Ref_To_Local'>handle</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN219"><span class='Ref_To_Local'>old_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN218"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN81"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>; 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, </span><span class='String'>"cleaning up orphaned dynamic shared memory with ID %u (reference count %u)"</span><span class='Delimiter'>, 
+</span>             <a href="dsm.c.html#LN254"><span class='Ref_To_Local'>handle</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN255"><span class='Ref_To_Local'>refcnt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Destroy the referenced segment. */ 
+</span>        <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN63"><span class='Ref_to_EnumConst'>DSM_OP_DESTROY</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN254"><span class='Ref_To_Local'>handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN214"><span class='Ref_To_Local'>junk_impl_private</span></a><span class='Delimiter'>, 
+</span>                    <span class='Operator'>&</span><a href="dsm.c.html#LN212"><span class='Ref_To_Local'>junk_mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN216"><span class='Ref_To_Local'>junk_mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Destroy the old control segment, too. */ 
+</span>    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, 
+</span>         <span class='String'>"cleaning up dynamic shared memory control segment with ID %u"</span><span class='Delimiter'>, 
+</span>         <a href="dsm.c.html#LN209"><span class='Ref_to_Parameter'>old_control_handle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN63"><span class='Ref_to_EnumConst'>DSM_OP_DESTROY</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN209"><span class='Ref_to_Parameter'>old_control_handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN213"><span class='Ref_To_Local'>impl_private</span></a><span class='Delimiter'>, 
+</span>                <span class='Operator'>&</span><a href="dsm.c.html#LN211"><span class='Ref_To_Local'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN215"><span class='Ref_To_Local'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_cleanup_using_control_segment &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * When we're using the mmap shared memory implementation, "shared memory" 
+ * segments might even manage to survive an operating system reboot. 
+ * But there's no guarantee as to exactly what will survive: some segments 
+ * may survive, and others may not, and the contents of some may be out 
+ * of date.  In particular, the control segment may be out of date, so we 
+ * can't rely on it to figure out what to remove.  However, since we know 
+ * what directory contains the files we used as shared memory, we can simply 
+ * scan the directory and blow everything away that shouldn't be there. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN291"></a><span class='Declare_Function'>dsm_cleanup_for_mmap</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN293"></a>    <a href="../../../port/dirent.c.html#LN24"><span class='Ref_to_Struct'>DIR</span></a>        <span class='Operator'>*</span><span class='Declare_Local'>dir</span><span class='Delimiter'>; 
+</span><a name="LN294"></a>    <span class='Control'>struct</span> <a href="../../../include/port/win32_msvc/dirent.h.html#LN8"><span class='Ref_to_Struct'>dirent</span></a> <span class='Operator'>*</span><span class='Declare_Local'>dent</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Open the directory; can't use AllocateDir in postmaster. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="dsm.c.html#LN293"><span class='Ref_To_Local'>dir</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN91"><span class='Ref_to_Proto'>AllocateDir</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN50"><span class='Ref_to_Const'>PG_DYNSHMEM_DIR</span></a><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not open directory \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="../../../include/storage/dsm_impl.h.html#LN50"><span class='Ref_to_Const'>PG_DYNSHMEM_DIR</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Scan for something with a name of the correct format. */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="dsm.c.html#LN294"><span class='Ref_To_Local'>dent</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN92"><span class='Ref_to_Proto'>ReadDir</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN293"><span class='Ref_To_Local'>dir</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/dsm_impl.h.html#LN50"><span class='Ref_to_Const'>PG_DYNSHMEM_DIR</span></a><span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>strncmp<span class='Parentheses'>(</span><a href="dsm.c.html#LN294"><span class='Ref_To_Local'>dent</span></a><span class='Operator'>-&GT;</span><a href="../../../include/port/win32_msvc/dirent.h.html#LN13"><span class='Ref_to_Member'>d_name</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/dsm_impl.h.html#LN51"><span class='Ref_to_Const'>PG_DYNSHMEM_MMAP_FILE_PREFIX</span></a><span class='Delimiter'>, 
+</span>                    strlen<span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN51"><span class='Ref_to_Const'>PG_DYNSHMEM_MMAP_FILE_PREFIX</span></a><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN309"></a>            <span class='Keyword'>char</span>        <span class='Declare_Local'>buf</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a> <span class='Operator'>+ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN50"><span class='Ref_to_Const'>PG_DYNSHMEM_DIR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>]; 
+</span> 
+            <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN309"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN309"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../../include/storage/dsm_impl.h.html#LN50"><span class='Ref_to_Const'>PG_DYNSHMEM_DIR</span></a> <span class='String'>"/%s"</span><span class='Delimiter'>, </span><a href="dsm.c.html#LN294"><span class='Ref_To_Local'>dent</span></a><span class='Operator'>-&GT;</span><a href="../../../include/port/win32_msvc/dirent.h.html#LN13"><span class='Ref_to_Member'>d_name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, </span><span class='String'>"removing file \"%s\""</span><span class='Delimiter'>, </span><a href="dsm.c.html#LN309"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* We found a matching file; so remove it. */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../timezone/private.h.html#LN59"><span class='Ref_to_Proto'>unlink</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN309"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <span class='Delimiter'>{ 
+</span><a name="LN318"></a>                <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span><span class='Delimiter'>; 
+</span> 
+                <a href="dsm.c.html#LN318"><span class='Ref_To_Local'>save_errno</span></a> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span>                <a href="../../../include/port/win32_msvc/dirent.h.html#LN20"><span class='Ref_to_Proto'>closedir</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN293"><span class='Ref_To_Local'>dir</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                errno <span class='Operator'>= </span><a href="dsm.c.html#LN318"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+</span> 
+                <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                         <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not remove file \"%s\": %m"</span><span class='Delimiter'>, </span><a href="dsm.c.html#LN309"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if strncmp(dent-&GT;d_name,... &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while (dent=ReadDir(dir,PG_... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Cleanup complete. */ 
+</span>    <a href="../../../include/storage/fd.h.html#LN93"><span class='Ref_to_Proto'>FreeDir</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN293"><span class='Ref_To_Local'>dir</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_cleanup_for_mmap &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * At shutdown time, we iterate over the control segment and remove all 
+ * remaining dynamic shared memory segments.  We avoid throwing errors here; 
+ * the postmaster is shutting down either way, and this is just non-critical 
+ * resource cleanup. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN342"></a><span class='Declare_Function'>dsm_postmaster_shutdown</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>code</span><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN344"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>nitems</span><span class='Delimiter'>; 
+</span><a name="LN345"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN346"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>dsm_control_address</span><span class='Delimiter'>; 
+</span><a name="LN347"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>junk_mapped_address</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN348"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>junk_impl_private</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN349"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>junk_mapped_size</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN350"></a>    <a href="../../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Declare_Local'>shim</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/pg_shmem.h.html#LN28"><span class='Ref_to_Struct'>PGShmemHeader</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/postgres.h.html#LN554"><span class='Ref_to_Macro'>DatumGetPointer</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN342"><span class='Ref_to_Parameter'>arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If some other backend exited uncleanly, it might have corrupted the 
+     * control segment while it was dying.  In that case, we warn and ignore 
+     * the contents of the control segment.  This may end up leaving behind 
+     * stray shared memory segments, but there's not much we can do about that 
+     * if the metadata is gone. 
+     */ 
+</span>    <a href="dsm.c.html#LN344"><span class='Ref_To_Local'>nitems</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN91"><span class='Ref_to_Member'>nitems</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="dsm.c.html#LN99"><span class='Ref_to_Proto'>dsm_control_segment_sane</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN134"><span class='Ref_to_Global_Var'>dsm_control_mapped_size</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"dynamic shared memory control segment is corrupt"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Remove any remaining segments. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN345"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="dsm.c.html#LN345"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="dsm.c.html#LN344"><span class='Ref_To_Local'>nitems</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="dsm.c.html#LN345"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN370"></a>        <a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a>  <span class='Declare_Local'>handle</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If the reference count is 0, the slot is actually unused. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN345"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Log debugging information. */ 
+</span>        <a href="dsm.c.html#LN370"><span class='Ref_To_Local'>handle</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN345"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN81"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>; 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, </span><span class='String'>"cleaning up orphaned dynamic shared memory with ID %u"</span><span class='Delimiter'>, 
+</span>             <a href="dsm.c.html#LN370"><span class='Ref_To_Local'>handle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Destroy the segment. */ 
+</span>        <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN63"><span class='Ref_to_EnumConst'>DSM_OP_DESTROY</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN370"><span class='Ref_To_Local'>handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN348"><span class='Ref_To_Local'>junk_impl_private</span></a><span class='Delimiter'>, 
+</span>                    <span class='Operator'>&</span><a href="dsm.c.html#LN347"><span class='Ref_To_Local'>junk_mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN349"><span class='Ref_To_Local'>junk_mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Remove the control segment itself. */ 
+</span>    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, 
+</span>         <span class='String'>"cleaning up dynamic shared memory control segment with ID %u"</span><span class='Delimiter'>, 
+</span>         <a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN346"><span class='Ref_To_Local'>dsm_control_address</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN63"><span class='Ref_to_EnumConst'>DSM_OP_DESTROY</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                <span class='Operator'>&</span><a href="dsm.c.html#LN135"><span class='Ref_to_Global_Var'>dsm_control_impl_private</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN346"><span class='Ref_To_Local'>dsm_control_address</span></a><span class='Delimiter'>, 
+</span>                <span class='Operator'>&</span><a href="dsm.c.html#LN134"><span class='Ref_to_Global_Var'>dsm_control_mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN346"><span class='Ref_To_Local'>dsm_control_address</span></a><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN350"><span class='Ref_To_Local'>shim</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/pg_shmem.h.html#LN35"><span class='Ref_to_Member'>dsm_control</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_postmaster_shutdown &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Prepare this backend for dynamic shared memory usage.  Under EXEC_BACKEND, 
+ * we must reread the state file and map the control segment; in other cases, 
+ * we'll have inherited the postmaster's mapping and global variables. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN404"></a><span class='Declare_Function'>dsm_backend_startup</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* If dynamic shared memory is disabled, reject this. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm_impl.c.html#LN111"><span class='Ref_to_Global_Var'>dynamic_shared_memory_type</span></a> <span class='Operator'>== </span><a href="../../../include/storage/dsm_impl.h.html#LN16"><span class='Ref_to_Const'>DSM_IMPL_NONE</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"dynamic shared memory is disabled"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Set dynamic_shared_memory_type to a value other than \"none\"."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> EXEC_BACKEND 
+    <span class='Delimiter'>{ 
+</span><a name="LN415"></a>        <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>control_address</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Attach control segment. */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN60"><span class='Ref_to_EnumConst'>DSM_OP_ATTACH</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                    <span class='Operator'>&</span><a href="dsm.c.html#LN135"><span class='Ref_to_Global_Var'>dsm_control_impl_private</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN415"><span class='Ref_To_Local'>control_address</span></a><span class='Delimiter'>, 
+</span>                    <span class='Operator'>&</span><a href="dsm.c.html#LN134"><span class='Ref_to_Global_Var'>dsm_control_mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN415"><span class='Ref_To_Local'>control_address</span></a><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* If control segment doesn't look sane, something is badly wrong. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="dsm.c.html#LN99"><span class='Ref_to_Proto'>dsm_control_segment_sane</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN134"><span class='Ref_to_Global_Var'>dsm_control_mapped_size</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN61"><span class='Ref_to_EnumConst'>DSM_OP_DETACH</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="dsm.c.html#LN135"><span class='Ref_to_Global_Var'>dsm_control_impl_private</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN415"><span class='Ref_To_Local'>control_address</span></a><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="dsm.c.html#LN134"><span class='Ref_to_Global_Var'>dsm_control_mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INTERNAL_ERROR<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>              <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"dynamic shared memory control segment is not valid"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="dsm.c.html#LN104"><span class='Ref_to_Global_Var'>dsm_init_done</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_backend_startup &raquo; </span> 
+ 
+<span class='Directive'>#ifdef</span> EXEC_BACKEND 
+<span class='Comment_Multi_Line'>/* 
+ * When running under EXEC_BACKEND, we get a callback here when the main 
+ * shared memory segment is re-attached, so that we can record the control 
+ * handle retrieved from it. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN446"></a><span class='Declare_Function'>dsm_set_control_handle</span><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a> <span class='Declare_Parameter'>h</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="dsm.c.html#LN446"><span class='Ref_to_Parameter'>h</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN446"><span class='Ref_to_Parameter'>h</span></a><span class='Delimiter'>; 
+} 
+</span><span class='Directive'>#endif</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Create a new dynamic shared memory segment. 
+ * 
+ * If there is a non-NULL CurrentResourceOwner, the new segment is associated 
+ * with it and must be detached before the resource owner releases, or a 
+ * warning will be logged.  If CurrentResourceOwner is NULL, the segment 
+ * remains attached until explicitely detached or the session ends. 
+ * Creating with a NULL CurrentResourceOwner is equivalent to creating 
+ * with a non-NULL CurrentResourceOwner and then calling dsm_pin_mapping. 
+ */ 
+</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>* 
+</span><a name="LN464"></a><span class='Declare_Function'>dsm_create</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>flags</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN466"></a>    <a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Local'>seg</span><span class='Delimiter'>; 
+</span><a name="LN467"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN468"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>nitems</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Unsafe in postmaster (and pointless in a stand-alone backend). */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="dsm.c.html#LN104"><span class='Ref_to_Global_Var'>dsm_init_done</span></a><span class='Parentheses'>) 
+</span>        <a href="dsm.c.html#LN403"><span class='Ref_to_Func'>dsm_backend_startup</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Create a new segment descriptor. */ 
+</span>    <a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN98"><span class='Ref_to_Proto'>dsm_create_descriptor</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Loop until we find an unused segment identifier. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL </span><span class='Operator'>&& </span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>= </span><a href="../../../port/random.c.html#LN20"><span class='Ref_to_Func'>random</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>== </span><a href="../../../include/storage/dsm.h.html#LN22"><span class='Ref_to_Const'>DSM_HANDLE_INVALID</span></a><span class='Parentheses'>)</span>  <span class='Comment_Single_Line'>/* Reserve sentinel */ 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN59"><span class='Ref_to_EnumConst'>DSM_OP_CREATE</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN464"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Lock the control segment so we can register the new segment. */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Search the control segment for an unused slot. */ 
+</span>    <a href="dsm.c.html#LN468"><span class='Ref_To_Local'>nitems</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN91"><span class='Ref_to_Member'>nitems</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN467"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="dsm.c.html#LN467"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="dsm.c.html#LN468"><span class='Ref_To_Local'>nitems</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="dsm.c.html#LN467"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN467"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN467"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN81"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* refcnt of 1 triggers destruction, so start at 2 */ 
+</span>            <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN467"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>= </span><span class='Number'>2</span><span class='Delimiter'>; 
+</span>            <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN467"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN83"><span class='Ref_to_Member'>impl_private_pm_handle</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>            <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN467"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN84"><span class='Ref_to_Member'>pinned</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN467"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Verify that we can support an additional mapping. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN468"><span class='Ref_To_Local'>nitems</span></a> <span class='Operator'>&GT;= </span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN92"><span class='Ref_to_Member'>maxitems</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="dsm.c.html#LN464"><span class='Ref_to_Parameter'>flags</span></a> <span class='Operator'>& </span><a href="../../../include/storage/dsm.h.html#LN19"><span class='Ref_to_Const'>DSM_CREATE_NULL_IF_MAXSEGMENTS</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN63"><span class='Ref_to_EnumConst'>DSM_OP_DESTROY</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>                <a href="../../../include/utils/resowner_private.h.html#LN87"><span class='Ref_to_Proto'>ResourceOwnerForgetDSM</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/lib/ilist.h.html#LN356"><span class='Ref_to_Func'>dlist_delete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN68"><span class='Ref_to_Member'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_RESOURCES<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"too many dynamic shared memory segments"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Enter the handle into a new array slot. */ 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN468"><span class='Ref_To_Local'>nitems</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN81"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* refcnt of 1 triggers destruction, so start at 2 */ 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN468"><span class='Ref_To_Local'>nitems</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>= </span><span class='Number'>2</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN468"><span class='Ref_To_Local'>nitems</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN83"><span class='Ref_to_Member'>impl_private_pm_handle</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN468"><span class='Ref_To_Local'>nitems</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN84"><span class='Ref_to_Member'>pinned</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN468"><span class='Ref_To_Local'>nitems</span></a><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN91"><span class='Ref_to_Member'>nitems</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="dsm.c.html#LN466"><span class='Ref_To_Local'>seg</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_create &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Attach a dynamic shared memory segment. 
+ * 
+ * See comments for dsm_segment_handle() for an explanation of how this 
+ * is intended to be used. 
+ * 
+ * This function will return NULL if the segment isn't known to the system. 
+ * This can happen if we're asked to attach the segment, but then everyone 
+ * else detaches it (causing it to be destroyed) before we get around to 
+ * attaching it. 
+ * 
+ * If there is a non-NULL CurrentResourceOwner, the attached segment is 
+ * associated with it and must be detached before the resource owner releases, 
+ * or a warning will be logged.  Otherwise the segment remains attached until 
+ * explicitely detached or the session ends.  See the note atop dsm_create(). 
+ */ 
+</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>* 
+</span><a name="LN560"></a><span class='Declare_Function'>dsm_attach</span><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a> <span class='Declare_Parameter'>h</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN562"></a>    <a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Local'>seg</span><span class='Delimiter'>; 
+</span><a name="LN563"></a>    <a href="../../../include/lib/ilist.h.html#LN158"><span class='Ref_to_Struct'>dlist_iter</span></a>  <span class='Declare_Local'>iter</span><span class='Delimiter'>; 
+</span><a name="LN564"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN565"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>nitems</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Unsafe in postmaster (and pointless in a stand-alone backend). */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="dsm.c.html#LN104"><span class='Ref_to_Global_Var'>dsm_init_done</span></a><span class='Parentheses'>) 
+</span>        <a href="dsm.c.html#LN403"><span class='Ref_to_Func'>dsm_backend_startup</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Since this is just a debugging cross-check, we could leave it out 
+     * altogether, or include it only in assert-enabled builds.  But since the 
+     * list of attached segments should normally be very short, let's include 
+     * it always for right now. 
+     * 
+     * If you're hitting this error, you probably want to attempt to find an 
+     * existing mapping via dsm_find_mapping() before calling dsm_attach() to 
+     * create a new one. 
+     */ 
+</span>    <a href="../../../include/lib/ilist.h.html#LN506"><span class='Ref_to_Macro'>dlist_foreach</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN563"><span class='Ref_To_Local'>iter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN123"><span class='Ref_to_Global_Var'>dsm_segment_list</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN476"><span class='Ref_to_Macro'>dlist_container</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN563"><span class='Ref_To_Local'>iter</span></a><span class='Operator'>.</span><a href="../../../include/lib/ilist.h.html#LN160"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN560"><span class='Ref_to_Parameter'>h</span></a><span class='Parentheses'>) 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"can't attach the same segment more than once"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Create a new segment descriptor. */ 
+</span>    <a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN98"><span class='Ref_to_Proto'>dsm_create_descriptor</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN560"><span class='Ref_to_Parameter'>h</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Bump reference count for this segment in shared memory. */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN565"><span class='Ref_To_Local'>nitems</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN91"><span class='Ref_to_Member'>nitems</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN564"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="dsm.c.html#LN564"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="dsm.c.html#LN565"><span class='Ref_To_Local'>nitems</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="dsm.c.html#LN564"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* If the reference count is 0, the slot is actually unused. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN564"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If the handle doesn't match, it's not the slot we want. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN564"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN81"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>!= </span><a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If the reference count is 1, the slot is still in use, but the 
+         * segment is in the process of going away.  Treat that as if we 
+         * didn't find a match. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN564"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Otherwise we've found a match. */ 
+</span>        <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN564"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN564"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;nitems;++i &raquo; </span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we didn't find the handle we're looking for in the control segment, 
+     * it probably means that everyone else who had it mapped, including the 
+     * original creator, died before we got to this point. It's up to the 
+     * caller to decide what to do about that. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN55"><span class='Ref_to_Const'>INVALID_CONTROL_SLOT</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/dsm.h.html#LN40"><span class='Ref_to_Proto'>dsm_detach</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Here's where we actually try to map the segment. */ 
+</span>    <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN60"><span class='Ref_to_EnumConst'>DSM_OP_ATTACH</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a><span class='Delimiter'>, 
+</span>                <span class='Operator'>&</span><a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="dsm.c.html#LN562"><span class='Ref_To_Local'>seg</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_attach &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * At backend shutdown time, detach any segments that are still attached. 
+ * (This is similar to dsm_detach_all, except that there's no reason to 
+ * unmap the control segment before exiting, so we don't bother.) 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN647"></a><span class='Declare_Function'>dsm_backend_shutdown</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/lib/ilist.h.html#LN287"><span class='Ref_to_Func'>dlist_is_empty</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN123"><span class='Ref_to_Global_Var'>dsm_segment_list</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN651"></a>        <a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Local'>seg</span><span class='Delimiter'>; 
+</span> 
+        <a href="dsm.c.html#LN651"><span class='Ref_To_Local'>seg</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN486"><span class='Ref_to_Macro'>dlist_head_element</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN123"><span class='Ref_to_Global_Var'>dsm_segment_list</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/dsm.h.html#LN40"><span class='Ref_to_Proto'>dsm_detach</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN651"><span class='Ref_To_Local'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Detach all shared memory segments, including the control segments.  This 
+ * should be called, along with PGSharedMemoryDetach, in processes that 
+ * might inherit mappings but are not intended to be connected to dynamic 
+ * shared memory. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN665"></a><span class='Declare_Function'>dsm_detach_all</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN667"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>control_address</span> <span class='Operator'>= </span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/lib/ilist.h.html#LN287"><span class='Ref_to_Func'>dlist_is_empty</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN123"><span class='Ref_to_Global_Var'>dsm_segment_list</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN671"></a>        <a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Local'>seg</span><span class='Delimiter'>; 
+</span> 
+        <a href="dsm.c.html#LN671"><span class='Ref_To_Local'>seg</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN486"><span class='Ref_to_Macro'>dlist_head_element</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN123"><span class='Ref_to_Global_Var'>dsm_segment_list</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/dsm.h.html#LN40"><span class='Ref_to_Proto'>dsm_detach</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN671"><span class='Ref_To_Local'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN667"><span class='Ref_To_Local'>control_address</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN61"><span class='Ref_to_EnumConst'>DSM_OP_DETACH</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN132"><span class='Ref_to_Global_Var'>dsm_control_handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                    <span class='Operator'>&</span><a href="dsm.c.html#LN135"><span class='Ref_to_Global_Var'>dsm_control_impl_private</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN667"><span class='Ref_To_Local'>control_address</span></a><span class='Delimiter'>, 
+</span>                    <span class='Operator'>&</span><a href="dsm.c.html#LN134"><span class='Ref_to_Global_Var'>dsm_control_mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Resize an existing shared memory segment. 
+ * 
+ * This may cause the shared memory segment to be remapped at a different 
+ * address.  For the caller's convenience, we return the mapped address. 
+ */ 
+</span><span class='Keyword'>void </span><span class='Operator'>* 
+</span><a name="LN690"></a><span class='Declare_Function'>dsm_resize</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN690"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a> <span class='Operator'>!= </span><a href="dsm.c.html#LN55"><span class='Ref_to_Const'>INVALID_CONTROL_SLOT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN62"><span class='Ref_to_EnumConst'>DSM_OP_RESIZE</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN690"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN690"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN690"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a><span class='Delimiter'>, 
+</span>                <span class='Operator'>&</span><a href="dsm.c.html#LN690"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN690"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="dsm.c.html#LN690"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Remap an existing shared memory segment. 
+ * 
+ * This is intended to be used when some other process has extended the 
+ * mapping using dsm_resize(), but we've still only got the initial 
+ * portion mapped.  Since this might change the address at which the 
+ * segment is mapped, we return the new mapped address. 
+ */ 
+</span><span class='Keyword'>void </span><span class='Operator'>* 
+</span><a name="LN707"></a><span class='Declare_Function'>dsm_remap</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN60"><span class='Ref_to_EnumConst'>DSM_OP_ATTACH</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN707"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN707"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a><span class='Delimiter'>, 
+</span>                <span class='Operator'>&</span><a href="dsm.c.html#LN707"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN707"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="dsm.c.html#LN707"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Detach from a shared memory segment, destroying the segment if we 
+ * remove the last reference. 
+ * 
+ * This function should never fail.  It will often be invoked when aborting 
+ * a transaction, and a further error won't serve any purpose.  It's not a 
+ * complete disaster if we fail to unmap or destroy the segment; it means a 
+ * resource leak, but that doesn't necessarily preclude further operations. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN725"></a><span class='Declare_Function'>dsm_detach</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Invoke registered callbacks.  Just in case one of those callbacks 
+     * throws a further error that brings us back here, pop the callback 
+     * before invoking it, to avoid infinite error recursion. 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/lib/ilist.h.html#LN561"><span class='Ref_to_Func'>slist_is_empty</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN75"><span class='Ref_to_Member'>on_detach</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN734"></a>        <a href="../../../include/lib/ilist.h.html#LN190"><span class='Ref_to_Struct'>slist_node</span></a> <span class='Operator'>*</span><span class='Declare_Local'>node</span><span class='Delimiter'>; 
+</span><a name="LN735"></a>        <a href="dsm.c.html#LN58"><span class='Ref_to_Struct'>dsm_segment_detach_callback</span></a> <span class='Operator'>*</span><span class='Declare_Local'>cb</span><span class='Delimiter'>; 
+</span><a name="LN736"></a>        <a href="../../../include/storage/dsm.h.html#LN55"><span class='Ref_to_Typedef'>on_dsm_detach_callback</span></a> <span class='Declare_Local'>function</span><span class='Delimiter'>; 
+</span><a name="LN737"></a>        <a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Local'>arg</span><span class='Delimiter'>; 
+</span> 
+        <a href="dsm.c.html#LN734"><span class='Ref_To_Local'>node</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN594"><span class='Ref_to_Func'>slist_pop_head_node</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN75"><span class='Ref_to_Member'>on_detach</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN735"><span class='Ref_To_Local'>cb</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN673"><span class='Ref_to_Macro'>slist_container</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN58"><span class='Ref_to_Struct'>dsm_segment_detach_callback</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN734"><span class='Ref_To_Local'>node</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN734"><span class='Ref_To_Local'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN736"><span class='Ref_To_Local'>function</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN735"><span class='Ref_To_Local'>cb</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN60"><span class='Ref_to_Member'>function</span></a><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN737"><span class='Ref_To_Local'>arg</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN735"><span class='Ref_To_Local'>cb</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN61"><span class='Ref_to_Member'>arg</span></a><span class='Delimiter'>; 
+</span>        <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN735"><span class='Ref_To_Local'>cb</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="dsm.c.html#LN736"><span class='Ref_To_Local'>function</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN737"><span class='Ref_To_Local'>arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Try to remove the mapping, if one exists.  Normally, there will be, but 
+     * maybe not, if we failed partway through a create or attach operation. 
+     * We remove the mapping before decrementing the reference count so that 
+     * the process that sees a zero reference count can be certain that no 
+     * remaining mappings exist.  Even if this fails, we pretend that it 
+     * works, because retrying is likely to fail in the same way. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN61"><span class='Ref_to_EnumConst'>DSM_OP_DETACH</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a><span class='Delimiter'>, 
+</span>                    <span class='Operator'>&</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Reduce reference count, if we previously increased it. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a> <span class='Operator'>!= </span><a href="dsm.c.html#LN55"><span class='Ref_to_Const'>INVALID_CONTROL_SLOT</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN768"></a>        <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>refcnt</span><span class='Delimiter'>; 
+</span><a name="LN769"></a>        <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>control_slot</span> <span class='Operator'>= </span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN769"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN81"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN769"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>&GT; </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN768"><span class='Ref_To_Local'>refcnt</span></a> <span class='Operator'>= --</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN769"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN55"><span class='Ref_to_Const'>INVALID_CONTROL_SLOT</span></a><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If new reference count is 1, try to destroy the segment. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN768"><span class='Ref_To_Local'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* A pinned segment should never reach 1. */ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN769"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN84"><span class='Ref_to_Member'>pinned</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * If we fail to destroy the segment here, or are killed before we 
+             * finish doing so, the reference count will remain at 1, which 
+             * will mean that nobody else can attach to the segment.  At 
+             * postmaster shutdown time, or when a new postmaster is started 
+             * after a hard kill, another attempt will be made to remove the 
+             * segment. 
+             * 
+             * The main case we're worried about here is being killed by a 
+             * signal before we can finish removing the segment.  In that 
+             * case, it's important to be sure that the segment still gets 
+             * removed. If we actually fail to remove the segment for some 
+             * other reason, the postmaster may not have any better luck than 
+             * we did.  There's not much we can do about that, though. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN63"><span class='Ref_to_EnumConst'>DSM_OP_DESTROY</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a><span class='Delimiter'>, 
+</span>                            <span class='Operator'>&</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN769"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN81"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN769"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN769"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if refcnt==1 &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if seg-&GT;control_slot!=IN... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Clean up our remaining backend-private data structures. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/resowner_private.h.html#LN87"><span class='Ref_to_Proto'>ResourceOwnerForgetDSM</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/lib/ilist.h.html#LN356"><span class='Ref_to_Func'>dlist_delete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN68"><span class='Ref_to_Member'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN725"><span class='Ref_to_Parameter'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_detach &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Keep a dynamic shared memory mapping until end of session. 
+ * 
+ * By default, mappings are owned by the current resource owner, which 
+ * typically means they stick around for the duration of the current query 
+ * only. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN826"></a><span class='Declare_Function'>dsm_pin_mapping</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN826"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/utils/resowner_private.h.html#LN87"><span class='Ref_to_Proto'>ResourceOwnerForgetDSM</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN826"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN826"><span class='Ref_to_Parameter'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="dsm.c.html#LN826"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Arrange to remove a dynamic shared memory mapping at cleanup time. 
+ * 
+ * dsm_pin_mapping() can be used to preserve a mapping for the entire 
+ * lifetime of a process; this function reverses that decision, making 
+ * the segment owned by the current resource owner.  This may be useful 
+ * just before performing some operation that will invalidate the segment 
+ * for future use by this backend. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN845"></a><span class='Declare_Function'>dsm_unpin_mapping</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN845"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/resowner_private.h.html#LN84"><span class='Ref_to_Proto'>ResourceOwnerEnlargeDSMs</span></a><span class='Parentheses'>(</span><a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN845"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a> <span class='Operator'>= </span><a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/resowner_private.h.html#LN85"><span class='Ref_to_Proto'>ResourceOwnerRememberDSM</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN845"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN845"><span class='Ref_to_Parameter'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Keep a dynamic shared memory segment until postmaster shutdown, or until 
+ * dsm_unpin_segment is called. 
+ * 
+ * This function should not be called more than once per segment, unless the 
+ * segment is explicitly unpinned with dsm_unpin_segment in between calls. 
+ * 
+ * Note that this function does not arrange for the current process to 
+ * keep the segment mapped indefinitely; if that behavior is desired, 
+ * dsm_pin_mapping() should be used from each process that needs to 
+ * retain the mapping. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN866"></a><span class='Declare_Function'>dsm_pin_segment</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN868"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>handle</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Bump reference count for this segment in shared memory. This will 
+     * ensure that even if there is no session which is attached to this 
+     * segment, it will remain until postmaster shutdown or an explicit call 
+     * to unpin. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN866"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN84"><span class='Ref_to_Member'>pinned</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"cannot pin a segment that is already pinned"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/dsm_impl.h.html#LN75"><span class='Ref_to_Proto'>dsm_impl_pin_segment</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN866"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN866"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN868"><span class='Ref_To_Local'>handle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN866"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN84"><span class='Ref_to_Member'>pinned</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN866"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN866"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN83"><span class='Ref_to_Member'>impl_private_pm_handle</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN868"><span class='Ref_To_Local'>handle</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_pin_segment &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Unpin a dynamic shared memory segment that was previously pinned with 
+ * dsm_pin_segment.  This function should not be called unless dsm_pin_segment 
+ * was previously called for this segment. 
+ * 
+ * The argument is a dsm_handle rather than a dsm_segment in case you want 
+ * to unpin a segment to which you haven't attached.  This turns out to be 
+ * useful if, for example, a reference to one shared memory segment is stored 
+ * within another shared memory segment.  You might want to unpin the 
+ * referenced segment before destroying the referencing segment. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN898"></a><span class='Declare_Function'>dsm_unpin_segment</span><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a> <span class='Declare_Parameter'>handle</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN900"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>control_slot</span> <span class='Operator'>= </span><a href="dsm.c.html#LN55"><span class='Ref_to_Const'>INVALID_CONTROL_SLOT</span></a><span class='Delimiter'>; 
+</span><a name="LN901"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>destroy</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN902"></a>    <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Find the control slot for the given handle. */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN902"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="dsm.c.html#LN902"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN91"><span class='Ref_to_Member'>nitems</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="dsm.c.html#LN902"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Skip unused slots. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN902"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If we've found our handle, we can stop searching. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN902"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN81"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN898"><span class='Ref_to_Parameter'>handle</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN902"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We should definitely have found the slot, and it should not already be 
+     * in the process of going away, because this function should only be 
+     * called on a segment which is pinned. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN55"><span class='Ref_to_Const'>INVALID_CONTROL_SLOT</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"cannot unpin unknown segment handle"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN84"><span class='Ref_to_Member'>pinned</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"cannot unpin a segment that is not pinned"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>&GT; </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Allow implementation-specific code to run.  We have to do this before 
+     * releasing the lock, because impl_private_pm_handle may get modified by 
+     * dsm_impl_unpin_segment. 
+     */ 
+</span>    <a href="../../../include/storage/dsm_impl.h.html#LN77"><span class='Ref_to_Proto'>dsm_impl_unpin_segment</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN898"><span class='Ref_to_Parameter'>handle</span></a><span class='Delimiter'>, 
+</span>                    <span class='Operator'>&</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN83"><span class='Ref_to_Member'>impl_private_pm_handle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Note that 1 means no references (0 means unused slot). */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>--</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>        <a href="dsm.c.html#LN901"><span class='Ref_To_Local'>destroy</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN84"><span class='Ref_to_Member'>pinned</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now we can release the lock. */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Clean up resources if that was the last reference. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN901"><span class='Ref_To_Local'>destroy</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN950"></a>        <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>junk_impl_private</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN951"></a>        <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>junk_mapped_address</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN952"></a>        <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>junk_mapped_size</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * For an explanation of how error handling works in this case, see 
+         * comments in dsm_detach.  Note that if we reach this point, the 
+         * current process certainly does not have the segment mapped, because 
+         * if it did, the reference count would have still been greater than 1 
+         * even after releasing the reference count held by the pin.  The fact 
+         * that there can't be a dsm_segment for this handle makes it OK to 
+         * pass the mapped size, mapped address, and private data as NULL 
+         * here. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN67"><span class='Ref_to_Proto'>dsm_impl_op</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN63"><span class='Ref_to_EnumConst'>DSM_OP_DESTROY</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN898"><span class='Ref_to_Parameter'>handle</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN950"><span class='Ref_To_Local'>junk_impl_private</span></a><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="dsm.c.html#LN951"><span class='Ref_To_Local'>junk_mapped_address</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN952"><span class='Ref_To_Local'>junk_mapped_size</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN81"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN898"><span class='Ref_to_Parameter'>handle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="dsm.c.html#LN133"><span class='Ref_to_Global_Var'>dsm_control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN93"><span class='Ref_to_Member'>item</span></a><span class='Delimiter'>[</span><a href="dsm.c.html#LN900"><span class='Ref_To_Local'>control_slot</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="dsm.c.html#LN82"><span class='Ref_to_Member'>refcnt</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>DynamicSharedMemoryControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if destroy &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end dsm_unpin_segment &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Find an existing mapping for a shared memory segment, if there is one. 
+ */ 
+</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>* 
+</span><a name="LN980"></a><span class='Declare_Function'>dsm_find_mapping</span><span class='Parentheses'>(</span><a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a> <span class='Declare_Parameter'>h</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN982"></a>    <a href="../../../include/lib/ilist.h.html#LN158"><span class='Ref_to_Struct'>dlist_iter</span></a>  <span class='Declare_Local'>iter</span><span class='Delimiter'>; 
+</span><a name="LN983"></a>    <a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Local'>seg</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/lib/ilist.h.html#LN506"><span class='Ref_to_Macro'>dlist_foreach</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN982"><span class='Ref_To_Local'>iter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN123"><span class='Ref_to_Global_Var'>dsm_segment_list</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="dsm.c.html#LN983"><span class='Ref_To_Local'>seg</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN476"><span class='Ref_to_Macro'>dlist_container</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN982"><span class='Ref_To_Local'>iter</span></a><span class='Operator'>.</span><a href="../../../include/lib/ilist.h.html#LN160"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN983"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN980"><span class='Ref_to_Parameter'>h</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <a href="dsm.c.html#LN983"><span class='Ref_To_Local'>seg</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Get the address at which a dynamic shared memory segment is mapped. 
+ */ 
+</span><span class='Keyword'>void </span><span class='Operator'>* 
+</span><a name="LN999"></a><span class='Declare_Function'>dsm_segment_address</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN999"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="dsm.c.html#LN999"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Get the size of a mapping. 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN1009"></a><span class='Declare_Function'>dsm_segment_map_length</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN1009"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="dsm.c.html#LN1009"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Get a handle for a mapping. 
+ * 
+ * To establish communication via dynamic shared memory between two backends, 
+ * one of them should first call dsm_create() to establish a new shared 
+ * memory mapping.  That process should then call dsm_segment_handle() to 
+ * obtain a handle for the mapping, and pass that handle to the 
+ * coordinating backend via some means (e.g. bgw_main_arg, or via the 
+ * main shared memory segment).  The recipient, once in possession of the 
+ * handle, should call dsm_attach(). 
+ */ 
+</span><a href="../../../include/storage/dsm_impl.h.html#LN54"><span class='Ref_to_Typedef'>dsm_handle</span></a> 
+<a name="LN1027"></a><span class='Declare_Function'>dsm_segment_handle</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="dsm.c.html#LN1027"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN70"><span class='Ref_to_Member'>handle</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Register an on-detach callback for a dynamic shared memory segment. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN1036"></a><span class='Declare_Function'>on_dsm_detach</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Delimiter'>, </span><a href="../../../include/storage/dsm.h.html#LN55"><span class='Ref_to_Typedef'>on_dsm_detach_callback</span></a> <span class='Declare_Parameter'>function</span><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1038"></a>    <a href="dsm.c.html#LN58"><span class='Ref_to_Struct'>dsm_segment_detach_callback</span></a> <span class='Operator'>*</span><span class='Declare_Local'>cb</span><span class='Delimiter'>; 
+</span> 
+    <a href="dsm.c.html#LN1038"><span class='Ref_To_Local'>cb</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN70"><span class='Ref_to_Proto'>MemoryContextAlloc</span></a><span class='Parentheses'>(</span><a href="../../utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, 
+</span>                            <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN58"><span class='Ref_to_Struct'>dsm_segment_detach_callback</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN1038"><span class='Ref_To_Local'>cb</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN60"><span class='Ref_to_Member'>function</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN1036"><span class='Ref_to_Parameter'>function</span></a><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN1038"><span class='Ref_To_Local'>cb</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN61"><span class='Ref_to_Member'>arg</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN1036"><span class='Ref_to_Parameter'>arg</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/lib/ilist.h.html#LN572"><span class='Ref_to_Func'>slist_push_head</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN1036"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN75"><span class='Ref_to_Member'>on_detach</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN1038"><span class='Ref_To_Local'>cb</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN62"><span class='Ref_to_Member'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Unregister an on-detach callback for a dynamic shared memory segment. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN1051"></a><span class='Declare_Function'>cancel_on_dsm_detach</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Delimiter'>, </span><a href="../../../include/storage/dsm.h.html#LN55"><span class='Ref_to_Typedef'>on_dsm_detach_callback</span></a> <span class='Declare_Parameter'>function</span><span class='Delimiter'>, 
+</span><a name="LN1052"></a>                     <a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1054"></a>    <a href="../../../include/lib/ilist.h.html#LN238"><span class='Ref_to_Struct'>slist_mutable_iter</span></a> <span class='Declare_Local'>iter</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/lib/ilist.h.html#LN715"><span class='Ref_to_Macro'>slist_foreach_modify</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN1054"><span class='Ref_To_Local'>iter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN1051"><span class='Ref_to_Parameter'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN75"><span class='Ref_to_Member'>on_detach</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN1058"></a>        <a href="dsm.c.html#LN58"><span class='Ref_to_Struct'>dsm_segment_detach_callback</span></a> <span class='Operator'>*</span><span class='Declare_Local'>cb</span><span class='Delimiter'>; 
+</span> 
+        <a href="dsm.c.html#LN1058"><span class='Ref_To_Local'>cb</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN673"><span class='Ref_to_Macro'>slist_container</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN58"><span class='Ref_to_Struct'>dsm_segment_detach_callback</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN1054"><span class='Ref_To_Local'>iter</span></a><span class='Operator'>.</span><a href="../../../include/lib/ilist.h.html#LN240"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN1058"><span class='Ref_To_Local'>cb</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN60"><span class='Ref_to_Member'>function</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN1051"><span class='Ref_to_Parameter'>function</span></a> <span class='Operator'>&& </span><a href="dsm.c.html#LN1058"><span class='Ref_To_Local'>cb</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN61"><span class='Ref_to_Member'>arg</span></a> <span class='Operator'>== </span><a href="dsm.c.html#LN1052"><span class='Ref_to_Parameter'>arg</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/lib/ilist.h.html#LN650"><span class='Ref_to_Func'>slist_delete_current</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN1054"><span class='Ref_To_Local'>iter</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN1058"><span class='Ref_To_Local'>cb</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Discard all registered on-detach callbacks without executing them. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN1074"></a><span class='Declare_Function'>reset_on_dsm_detach</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1076"></a>    <a href="../../../include/lib/ilist.h.html#LN158"><span class='Ref_to_Struct'>dlist_iter</span></a>  <span class='Declare_Local'>iter</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/lib/ilist.h.html#LN506"><span class='Ref_to_Macro'>dlist_foreach</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN1076"><span class='Ref_To_Local'>iter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN123"><span class='Ref_to_Global_Var'>dsm_segment_list</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN1080"></a>        <a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Local'>seg</span> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN476"><span class='Ref_to_Macro'>dlist_container</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN1076"><span class='Ref_To_Local'>iter</span></a><span class='Operator'>.</span><a href="../../../include/lib/ilist.h.html#LN160"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Throw away explicit on-detach actions one by one. */ 
+</span>        <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/lib/ilist.h.html#LN561"><span class='Ref_to_Func'>slist_is_empty</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN1080"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN75"><span class='Ref_to_Member'>on_detach</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN1085"></a>            <a href="../../../include/lib/ilist.h.html#LN190"><span class='Ref_to_Struct'>slist_node</span></a> <span class='Operator'>*</span><span class='Declare_Local'>node</span><span class='Delimiter'>; 
+</span><a name="LN1086"></a>            <a href="dsm.c.html#LN58"><span class='Ref_to_Struct'>dsm_segment_detach_callback</span></a> <span class='Operator'>*</span><span class='Declare_Local'>cb</span><span class='Delimiter'>; 
+</span> 
+            <a href="dsm.c.html#LN1085"><span class='Ref_To_Local'>node</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN594"><span class='Ref_to_Func'>slist_pop_head_node</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN1080"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN75"><span class='Ref_to_Member'>on_detach</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="dsm.c.html#LN1086"><span class='Ref_To_Local'>cb</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN673"><span class='Ref_to_Macro'>slist_container</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN58"><span class='Ref_to_Struct'>dsm_segment_detach_callback</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN1085"><span class='Ref_To_Local'>node</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN1085"><span class='Ref_To_Local'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN1086"><span class='Ref_To_Local'>cb</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Decrementing the reference count is a sort of implicit on-detach 
+         * action; make sure we don't do that, either. 
+         */ 
+</span>        <a href="dsm.c.html#LN1080"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN55"><span class='Ref_to_Const'>INVALID_CONTROL_SLOT</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end reset_on_dsm_detach &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Create a segment descriptor. 
+ */ 
+</span><span class='Keyword'>static </span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>* 
+</span><a name="LN1105"></a><span class='Declare_Function'>dsm_create_descriptor</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1107"></a>    <a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Local'>seg</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/resowner_private.h.html#LN84"><span class='Ref_to_Proto'>ResourceOwnerEnlargeDSMs</span></a><span class='Parentheses'>(</span><a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN70"><span class='Ref_to_Proto'>MemoryContextAlloc</span></a><span class='Parentheses'>(</span><a href="../../utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/lib/ilist.h.html#LN298"><span class='Ref_to_Func'>dlist_push_head</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN123"><span class='Ref_to_Global_Var'>dsm_segment_list</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN68"><span class='Ref_to_Member'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* seg-&GT;handle must be initialized by the caller */ 
+</span>    <a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN71"><span class='Ref_to_Member'>control_slot</span></a> <span class='Operator'>= </span><a href="dsm.c.html#LN55"><span class='Ref_to_Const'>INVALID_CONTROL_SLOT</span></a><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN72"><span class='Ref_to_Member'>impl_private</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN73"><span class='Ref_to_Member'>mapped_address</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN74"><span class='Ref_to_Member'>mapped_size</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN69"><span class='Ref_to_Member'>resowner</span></a> <span class='Operator'>= </span><a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/resowner_private.h.html#LN85"><span class='Ref_to_Proto'>ResourceOwnerRememberDSM</span></a><span class='Parentheses'>(</span><a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Delimiter'>, </span><a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/lib/ilist.h.html#LN552"><span class='Ref_to_Func'>slist_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN75"><span class='Ref_to_Member'>on_detach</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="dsm.c.html#LN1107"><span class='Ref_To_Local'>seg</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end dsm_create_descriptor &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Sanity check a control segment. 
+ * 
+ * The goal here isn't to detect everything that could possibly be wrong with 
+ * the control segment; there's not enough information for that.  Rather, the 
+ * goal is to make sure that someone can iterate over the items in the segment 
+ * without overrunning the end of the mapping and crashing.  We also check 
+ * the magic number since, if that's messed up, this may not even be one of 
+ * our segments at all. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN1141"></a><span class='Declare_Function'>dsm_control_segment_sane</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN88"><span class='Ref_to_Struct'>dsm_control_header</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>control</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>mapped_size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN1141"><span class='Ref_to_Parameter'>mapped_size</span></a> <span class='Operator'>&LT; </span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN88"><span class='Ref_to_Struct'>dsm_control_header</span></a><span class='Delimiter'>, </span>item<span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* Mapped size too short to read header. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN1141"><span class='Ref_to_Parameter'>control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN90"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>!= </span><a href="dsm.c.html#LN45"><span class='Ref_to_Const'>PG_DYNSHMEM_CONTROL_MAGIC</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* Magic number doesn't match. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN101"><span class='Ref_to_Proto'>dsm_control_bytes_needed</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN1141"><span class='Ref_to_Parameter'>control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN92"><span class='Ref_to_Member'>maxitems</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><a href="dsm.c.html#LN1141"><span class='Ref_to_Parameter'>mapped_size</span></a><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* Max item count won't fit in map. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="dsm.c.html#LN1141"><span class='Ref_to_Parameter'>control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN91"><span class='Ref_to_Member'>nitems</span></a> <span class='Operator'>&GT; </span><a href="dsm.c.html#LN1141"><span class='Ref_to_Parameter'>control</span></a><span class='Operator'>-&GT;</span><a href="dsm.c.html#LN92"><span class='Ref_to_Member'>maxitems</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* Overfull. */ 
+</span>    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Compute the number of control-segment bytes needed to store a given 
+ * number of items. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a> 
+<a name="LN1159"></a><span class='Declare_Function'>dsm_control_bytes_needed</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Parameter'>nitems</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="dsm.c.html#LN88"><span class='Ref_to_Struct'>dsm_control_header</span></a><span class='Delimiter'>, </span>item<span class='Parentheses'>) 
+</span>        <span class='Operator'>+</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="dsm.c.html#LN79"><span class='Ref_to_Struct'>dsm_control_item</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a><span class='Parentheses'>) </span><a href="dsm.c.html#LN1159"><span class='Ref_to_Parameter'>nitems</span></a><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

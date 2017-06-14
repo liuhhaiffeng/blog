@@ -1,0 +1,640 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\storage\file\buffile.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\storage\file\buffile.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:48 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * buffile.c 
+ *    Management of large buffered files, primarily temporary files. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/storage/file/buffile.c 
+ * 
+ * NOTES: 
+ * 
+ * BufFiles provide a very incomplete emulation of stdio atop virtual Files 
+ * (as managed by fd.c).  Currently, we only support the buffered-I/O 
+ * aspect of stdio: a read or write of the low-level File occurs only 
+ * when the buffer is filled or emptied.  This is an even bigger win 
+ * for virtual Files than for ordinary kernel files, since reducing the 
+ * frequency with which a virtual File is touched reduces "thrashing" 
+ * of opening/closing file descriptors. 
+ * 
+ * Note that BufFile structs are allocated with palloc(), and therefore 
+ * will go away automatically at transaction end.  If the underlying 
+ * virtual File is made with OpenTemporaryFile, then all resources for 
+ * the file are certain to be cleaned up even if processing is aborted 
+ * by ereport(ERROR).  The data structures required are made in the 
+ * palloc context that was current when the BufFile was created, and 
+ * any external resources such as temp files are owned by the ResourceOwner 
+ * that was current at that time. 
+ * 
+ * BufFile also supports temporary files that exceed the OS file size limit 
+ * (by opening multiple fd.c temporary files).  This is an essential feature 
+ * for sorts and hashjoins on large amounts of data. 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"executor/instrument.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/fd.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/buffile.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/buf_internals.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/resowner.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * We break BufFiles into gigabyte-sized segments, regardless of RELSEG_SIZE. 
+ * The reason is that we'd like large temporary BufFiles to be spread across 
+ * multiple tablespaces when available. 
+ */ 
+</span><a name="LN50"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MAX_PHYSICAL_FILESIZE</span>   <span class='Number'>0x40000000</span> 
+<a name="LN51"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>BUFFILE_SEG_SIZE</span>        <span class='Parentheses'>(</span><a href="buffile.c.html#LN50"><span class='Ref_to_Const'>MAX_PHYSICAL_FILESIZE</span></a> <span class='Operator'>/ </span>BLCKSZ<span class='Parentheses'>) 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * This data structure represents a buffered file that consists of one or 
+ * more physical files (each accessed through a virtual file descriptor 
+ * managed by fd.c). 
+ */ 
+</span><a name="LN58"></a><span class='Control'>struct</span> <span class='Declare_Struct'>BufFile</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN60"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>numFiles</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* number of physical files in set */ 
+</span>    <span class='Comment_Multi_Line'>/* all files except the last have length exactly MAX_PHYSICAL_FILESIZE */ 
+</span><a name="LN62"></a>    <a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a>       <span class='Operator'>*</span><span class='Declare_Member'>files</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* palloc'd array with numFiles entries */ 
+</span><a name="LN63"></a>    off_t      <span class='Operator'>*</span><span class='Declare_Member'>offsets</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* palloc'd array with numFiles entries */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * offsets[i] is the current seek position of files[i].  We use this to 
+     * avoid making redundant FileSeek calls. 
+     */ 
+</span> 
+<a name="LN70"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>isTemp</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* can only add files if this is TRUE */ 
+</span><a name="LN71"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>isInterXact</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* keep open over transactions? */ 
+</span><a name="LN72"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>dirty</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* does buffer need to be written? */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * resowner is the ResourceOwner to use for underlying temp files.  (We 
+     * don't need to remember the memory context we're using explicitly, 
+     * because after creation we only repalloc our arrays larger.) 
+     */ 
+</span><a name="LN79"></a>    <a href="../../../include/utils/resowner.h.html#LN26"><span class='Ref_to_Typedef'>ResourceOwner</span></a> <span class='Declare_Member'>resowner</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * "current pos" is position of start of buffer within the logical file. 
+     * Position as seen by user of BufFile is (curFile, curOffset + pos). 
+     */ 
+</span><a name="LN85"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>curFile</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* file index (0..n) part of current pos */ 
+</span><a name="LN86"></a>    off_t       <span class='Declare_Member'>curOffset</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* offset part of current pos */ 
+</span><a name="LN87"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>pos</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* next read/write position in buffer */ 
+</span><a name="LN88"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>nbytes</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* total # of valid bytes in buffer */ 
+</span><a name="LN89"></a>    <span class='Keyword'>char</span>        <span class='Declare_Member'>buffer</span><span class='Delimiter'>[</span>BLCKSZ<span class='Delimiter'>]; 
+}</span><span class='Auto_Annotations'> &laquo; end BufFile &raquo; </span><span class='Delimiter'>; 
+</span> 
+<a name="LN92"></a><span class='Keyword'>static </span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>makeBufFile</span><span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a> <span class='Declare_Parameter'>firstfile</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN93"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>extendBufFile</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN94"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>BufFileLoadBuffer</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN95"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>BufFileDumpBuffer</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN96"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>BufFileFlush</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Create a BufFile given the first underlying physical file. 
+ * NOTE: caller must set isTemp and isInterXact if appropriate. 
+ */ 
+</span><span class='Keyword'>static </span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>* 
+</span><a name="LN104"></a><span class='Declare_Function'>makeBufFile</span><span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a> <span class='Declare_Parameter'>firstfile</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN106"></a>    <a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a>    <span class='Operator'>*</span><span class='Declare_Local'>file</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN62"><span class='Ref_to_Member'>files</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN62"><span class='Ref_to_Member'>files</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="buffile.c.html#LN104"><span class='Ref_to_Parameter'>firstfile</span></a><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span>off_t <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span>off_t<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Number'>0L</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN70"><span class='Ref_to_Member'>isTemp</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN71"><span class='Ref_to_Member'>isInterXact</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN72"><span class='Ref_to_Member'>dirty</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN79"><span class='Ref_to_Member'>resowner</span></a> <span class='Operator'>= </span><a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>= </span><span class='Number'>0L</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="buffile.c.html#LN106"><span class='Ref_To_Local'>file</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end makeBufFile &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Add another component temp file. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN129"></a><span class='Declare_Function'>extendBufFile</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN131"></a>    <a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a>        <span class='Declare_Local'>pfile</span><span class='Delimiter'>; 
+</span><a name="LN132"></a>    <a href="../../../include/utils/resowner.h.html#LN26"><span class='Ref_to_Typedef'>ResourceOwner</span></a> <span class='Declare_Local'>oldowner</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Be sure to associate the file with the BufFile's resource owner */ 
+</span>    <a href="buffile.c.html#LN132"><span class='Ref_To_Local'>oldowner</span></a> <span class='Operator'>= </span><a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Delimiter'>; 
+</span>    <a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN79"><span class='Ref_to_Member'>resowner</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN70"><span class='Ref_to_Member'>isTemp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN131"><span class='Ref_To_Local'>pfile</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN68"><span class='Ref_to_Proto'>OpenTemporaryFile</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN71"><span class='Ref_to_Member'>isInterXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN131"><span class='Ref_To_Local'>pfile</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN132"><span class='Ref_To_Local'>oldowner</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN62"><span class='Ref_to_Member'>files</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN36"><span class='Ref_to_Proto'>repalloc</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN62"><span class='Ref_to_Member'>files</span></a><span class='Delimiter'>, 
+</span>                                    <span class='Parentheses'>(</span><a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span>off_t <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN36"><span class='Ref_to_Proto'>repalloc</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Delimiter'>, 
+</span>                                       <span class='Parentheses'>(</span><a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span>off_t<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN62"><span class='Ref_to_Member'>files</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="buffile.c.html#LN131"><span class='Ref_To_Local'>pfile</span></a><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Number'>0L</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN129"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end extendBufFile &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Create a BufFile for a new temporary file (which will expand to become 
+ * multiple temporary files if more than MAX_PHYSICAL_FILESIZE bytes are 
+ * written to it). 
+ * 
+ * If interXact is true, the temp file will not be automatically deleted 
+ * at end of transaction. 
+ * 
+ * Note: if interXact is true, the caller had better be calling us in a 
+ * memory context, and with a resource owner, that will survive across 
+ * transaction boundaries. 
+ */ 
+</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>* 
+</span><a name="LN166"></a><span class='Declare_Function'>BufFileCreateTemp</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>interXact</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN168"></a>    <a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a>    <span class='Operator'>*</span><span class='Declare_Local'>file</span><span class='Delimiter'>; 
+</span><a name="LN169"></a>    <a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a>        <span class='Declare_Local'>pfile</span><span class='Delimiter'>; 
+</span> 
+    <a href="buffile.c.html#LN169"><span class='Ref_To_Local'>pfile</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN68"><span class='Ref_to_Proto'>OpenTemporaryFile</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN166"><span class='Ref_to_Parameter'>interXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN169"><span class='Ref_To_Local'>pfile</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="buffile.c.html#LN168"><span class='Ref_To_Local'>file</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN92"><span class='Ref_to_Proto'>makeBufFile</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN169"><span class='Ref_To_Local'>pfile</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN168"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN70"><span class='Ref_to_Member'>isTemp</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN168"><span class='Ref_To_Local'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN71"><span class='Ref_to_Member'>isInterXact</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN166"><span class='Ref_to_Parameter'>interXact</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="buffile.c.html#LN168"><span class='Ref_To_Local'>file</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Directive'>#ifdef</span> NOT_USED 
+<span class='Comment_Multi_Line'>/* 
+ * Create a BufFile and attach it to an already-opened virtual File. 
+ * 
+ * This is comparable to fdopen() in stdio.  This is the only way at present 
+ * to attach a BufFile to a non-temporary file.  Note that BufFiles created 
+ * in this way CANNOT be expanded into multiple files. 
+ */ 
+</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>* 
+</span><a name="LN190"></a><span class='Declare_Function'>BufFileCreate</span><span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a> <span class='Declare_Parameter'>file</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="buffile.c.html#LN92"><span class='Ref_to_Proto'>makeBufFile</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN190"><span class='Ref_to_Parameter'>file</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span><span class='Directive'>#endif</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Close a BufFile 
+ * 
+ * Like fclose(), this also implicitly FileCloses the underlying File. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN202"></a><span class='Declare_Function'>BufFileClose</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN204"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* flush any unwritten data */ 
+</span>    <a href="buffile.c.html#LN96"><span class='Ref_to_Proto'>BufFileFlush</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN202"><span class='Ref_to_Parameter'>file</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* close the underlying file(s) (with delete if it's a temp file) */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN204"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="buffile.c.html#LN204"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="buffile.c.html#LN202"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a><span class='Delimiter'>; </span><a href="buffile.c.html#LN204"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/fd.h.html#LN69"><span class='Ref_to_Proto'>FileClose</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN202"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN62"><span class='Ref_to_Member'>files</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN204"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* release the buffer space */ 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN202"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN62"><span class='Ref_to_Member'>files</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN202"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN202"><span class='Ref_to_Parameter'>file</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * BufFileLoadBuffer 
+ * 
+ * Load some data into buffer, if possible, starting from curOffset. 
+ * At call, must have dirty = false, pos and nbytes = 0. 
+ * On exit, nbytes is number of bytes loaded. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN225"></a><span class='Declare_Function'>BufFileLoadBuffer</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN227"></a>    <a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a>        <span class='Declare_Local'>thisfile</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Advance to next component file if necessary and possible. 
+     * 
+     * This path can only be taken if there is more than one component, so it 
+     * won't interfere with reading a non-temp file that is over 
+     * MAX_PHYSICAL_FILESIZE. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>&GT;= </span><a href="buffile.c.html#LN50"><span class='Ref_to_Const'>MAX_PHYSICAL_FILESIZE</span></a> <span class='Operator'>&& 
+</span>        <a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a> <span class='Operator'>+ </span><span class='Number'>1</span> <span class='Operator'>&LT; </span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>= </span><span class='Number'>0L</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * May need to reposition physical file. 
+     */ 
+</span>    <a href="buffile.c.html#LN227"><span class='Ref_To_Local'>thisfile</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN62"><span class='Ref_to_Member'>files</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>]; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>!= </span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN74"><span class='Ref_to_Proto'>FileSeek</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN227"><span class='Ref_To_Local'>thisfile</span></a><span class='Delimiter'>, </span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a><span class='Delimiter'>, </span>SEEK_SET<span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a><span class='Parentheses'>)</span> 
+            <span class='Control'>return</span><span class='Delimiter'>;</span>             <span class='Comment_Single_Line'>/* seek failed, read nothing */ 
+</span>        <a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Read whatever we can get, up to a full bufferload. 
+     */ 
+</span>    <a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN71"><span class='Ref_to_Proto'>FileRead</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN227"><span class='Ref_To_Local'>thisfile</span></a><span class='Delimiter'>, 
+</span>                            <a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN89"><span class='Ref_to_Member'>buffer</span></a><span class='Delimiter'>, 
+</span>                            <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN89"><span class='Ref_to_Member'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                            <a href="../../../include/pgstat.h.html#LN838"><span class='Ref_to_EnumConst'>WAIT_EVENT_BUFFILE_READ</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>] </span><span class='Operator'>+= </span><a href="buffile.c.html#LN225"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* we choose not to advance curOffset here */ 
+</span> 
+    <a href="../../executor/instrument.c.html#LN19"><span class='Ref_to_Global_Var'>pgBufferUsage</span></a><span class='Operator'>.</span><a href="../../../include/executor/instrument.h.html#LN28"><span class='Ref_to_Member'>temp_blks_read</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end BufFileLoadBuffer &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * BufFileDumpBuffer 
+ * 
+ * Dump buffer contents starting at curOffset. 
+ * At call, should have dirty = true, nbytes &GT; 0. 
+ * On exit, dirty is cleared if successful write, and curOffset is advanced. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN277"></a><span class='Declare_Function'>BufFileDumpBuffer</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN279"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>wpos</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN280"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>bytestowrite</span><span class='Delimiter'>; 
+</span><a name="LN281"></a>    <a href="../../../include/storage/fd.h.html#LN50"><span class='Ref_to_Typedef'>File</span></a>        <span class='Declare_Local'>thisfile</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Unlike BufFileLoadBuffer, we must dump the whole buffer even if it 
+     * crosses a component-file boundary; so we need a loop. 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN279"><span class='Ref_To_Local'>wpos</span></a> <span class='Operator'>&LT; </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Advance to next component file if necessary and possible. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>&GT;= </span><a href="buffile.c.html#LN50"><span class='Ref_to_Const'>MAX_PHYSICAL_FILESIZE</span></a> <span class='Operator'>&& </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN70"><span class='Ref_to_Member'>isTemp</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a> <span class='Operator'>+ </span><span class='Number'>1</span> <span class='Operator'>&GT;= </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a><span class='Parentheses'>) 
+</span>                <a href="buffile.c.html#LN93"><span class='Ref_to_Proto'>extendBufFile</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>= </span><span class='Number'>0L</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Enforce per-file size limit only for temp files, else just try to 
+         * write as much as asked... 
+         */ 
+</span>        <a href="buffile.c.html#LN280"><span class='Ref_To_Local'>bytestowrite</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>- </span><a href="buffile.c.html#LN279"><span class='Ref_To_Local'>wpos</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN70"><span class='Ref_to_Member'>isTemp</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN307"></a>            off_t       <span class='Declare_Local'>availbytes</span> <span class='Operator'>= </span><a href="buffile.c.html#LN50"><span class='Ref_to_Const'>MAX_PHYSICAL_FILESIZE</span></a> <span class='Operator'>- </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>((</span>off_t<span class='Parentheses'>) </span><a href="buffile.c.html#LN280"><span class='Ref_To_Local'>bytestowrite</span></a> <span class='Operator'>&GT; </span><a href="buffile.c.html#LN307"><span class='Ref_To_Local'>availbytes</span></a><span class='Parentheses'>)</span> 
+                <a href="buffile.c.html#LN280"><span class='Ref_To_Local'>bytestowrite</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="buffile.c.html#LN307"><span class='Ref_To_Local'>availbytes</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * May need to reposition physical file. 
+         */ 
+</span>        <a href="buffile.c.html#LN281"><span class='Ref_To_Local'>thisfile</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN62"><span class='Ref_to_Member'>files</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>]; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>!= </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN74"><span class='Ref_to_Proto'>FileSeek</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN281"><span class='Ref_To_Local'>thisfile</span></a><span class='Delimiter'>, </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a><span class='Delimiter'>, </span>SEEK_SET<span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a><span class='Parentheses'>)</span> 
+                <span class='Control'>return</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* seek failed, give up */ 
+</span>            <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="buffile.c.html#LN280"><span class='Ref_To_Local'>bytestowrite</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN72"><span class='Ref_to_Proto'>FileWrite</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN281"><span class='Ref_To_Local'>thisfile</span></a><span class='Delimiter'>, 
+</span>                                 <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN89"><span class='Ref_to_Member'>buffer</span></a> <span class='Operator'>+ </span><a href="buffile.c.html#LN279"><span class='Ref_To_Local'>wpos</span></a><span class='Delimiter'>, 
+</span>                                 <a href="buffile.c.html#LN280"><span class='Ref_To_Local'>bytestowrite</span></a><span class='Delimiter'>, 
+</span>                                 <a href="../../../include/pgstat.h.html#LN839"><span class='Ref_to_EnumConst'>WAIT_EVENT_BUFFILE_WRITE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN280"><span class='Ref_To_Local'>bytestowrite</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span><span class='Delimiter'>;</span>             <span class='Comment_Single_Line'>/* failed to write */ 
+</span>        <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN63"><span class='Ref_to_Member'>offsets</span></a><span class='Delimiter'>[</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>] </span><span class='Operator'>+= </span><a href="buffile.c.html#LN280"><span class='Ref_To_Local'>bytestowrite</span></a><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN280"><span class='Ref_To_Local'>bytestowrite</span></a><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN279"><span class='Ref_To_Local'>wpos</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN280"><span class='Ref_To_Local'>bytestowrite</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../executor/instrument.c.html#LN19"><span class='Ref_to_Global_Var'>pgBufferUsage</span></a><span class='Operator'>.</span><a href="../../../include/executor/instrument.h.html#LN29"><span class='Ref_to_Member'>temp_blks_written</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while wpos&LT;file-&GT;nbytes &raquo; </span> 
+    <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN72"><span class='Ref_to_Member'>dirty</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * At this point, curOffset has been advanced to the end of the buffer, 
+     * ie, its original value + nbytes.  We need to make it point to the 
+     * logical file position, ie, original value + pos, in case that is less 
+     * (as could happen due to a small backwards seek in a dirty buffer!) 
+     */ 
+</span>    <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>-= </span><span class='Parentheses'>(</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>- </span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span>    <span class='Comment_Single_Line'>/* handle possible segment crossing */ 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN50"><span class='Ref_to_Const'>MAX_PHYSICAL_FILESIZE</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Now we can set the buffer empty without changing the logical position 
+     */ 
+</span>    <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN277"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end BufFileDumpBuffer &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * BufFileRead 
+ * 
+ * Like fread() except we assume 1-byte element size. 
+ */ 
+</span>size_t 
+<a name="LN364"></a><span class='Declare_Function'>BufFileRead</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>ptr</span><span class='Delimiter'>, </span>size_t <span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN366"></a>    size_t      <span class='Declare_Local'>nread</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN367"></a>    size_t      <span class='Declare_Local'>nthistime</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN72"><span class='Ref_to_Member'>dirty</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN96"><span class='Ref_to_Proto'>BufFileFlush</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* could not flush... */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN72"><span class='Ref_to_Member'>dirty</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>&GT;= </span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Try to load more data into buffer. */ 
+</span>            <a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN94"><span class='Ref_to_Proto'>BufFileLoadBuffer</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Control'>break</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* no more data available */ 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="buffile.c.html#LN367"><span class='Ref_To_Local'>nthistime</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>- </span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN367"><span class='Ref_To_Local'>nthistime</span></a> <span class='Operator'>&GT; </span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>) 
+</span>            <a href="buffile.c.html#LN367"><span class='Ref_To_Local'>nthistime</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN367"><span class='Ref_To_Local'>nthistime</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        memcpy<span class='Parentheses'>(</span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>ptr</span></a><span class='Delimiter'>, </span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN89"><span class='Ref_to_Member'>buffer</span></a> <span class='Operator'>+ </span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Delimiter'>, </span><a href="buffile.c.html#LN367"><span class='Ref_To_Local'>nthistime</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN367"><span class='Ref_To_Local'>nthistime</span></a><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>ptr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) ((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>ptr</span></a> <span class='Operator'>+ </span><a href="buffile.c.html#LN367"><span class='Ref_To_Local'>nthistime</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN364"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>-= </span><a href="buffile.c.html#LN367"><span class='Ref_To_Local'>nthistime</span></a><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN366"><span class='Ref_To_Local'>nread</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN367"><span class='Ref_To_Local'>nthistime</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while size&GT;0 &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="buffile.c.html#LN366"><span class='Ref_To_Local'>nread</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end BufFileRead &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * BufFileWrite 
+ * 
+ * Like fwrite() except we assume 1-byte element size. 
+ */ 
+</span>size_t 
+<a name="LN411"></a><span class='Declare_Function'>BufFileWrite</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>ptr</span><span class='Delimiter'>, </span>size_t <span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN413"></a>    size_t      <span class='Declare_Local'>nwritten</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN414"></a>    size_t      <span class='Declare_Local'>nthistime</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>&GT;= </span>BLCKSZ<span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Buffer full, dump it out */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN72"><span class='Ref_to_Member'>dirty</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="buffile.c.html#LN95"><span class='Ref_to_Proto'>BufFileDumpBuffer</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN72"><span class='Ref_to_Member'>dirty</span></a><span class='Parentheses'>) 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* I/O error */ 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* Hmm, went directly from reading to writing? */ 
+</span>                <a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Delimiter'>; 
+</span>                <a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>                <a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="buffile.c.html#LN414"><span class='Ref_To_Local'>nthistime</span></a> <span class='Operator'>= </span>BLCKSZ <span class='Operator'>- </span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN414"><span class='Ref_To_Local'>nthistime</span></a> <span class='Operator'>&GT; </span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>) 
+</span>            <a href="buffile.c.html#LN414"><span class='Ref_To_Local'>nthistime</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN414"><span class='Ref_To_Local'>nthistime</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        memcpy<span class='Parentheses'>(</span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN89"><span class='Ref_to_Member'>buffer</span></a> <span class='Operator'>+ </span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Delimiter'>, </span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>ptr</span></a><span class='Delimiter'>, </span><a href="buffile.c.html#LN414"><span class='Ref_To_Local'>nthistime</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN72"><span class='Ref_to_Member'>dirty</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN414"><span class='Ref_To_Local'>nthistime</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>&LT; </span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Parentheses'>) 
+</span>            <a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>ptr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) ((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>ptr</span></a> <span class='Operator'>+ </span><a href="buffile.c.html#LN414"><span class='Ref_To_Local'>nthistime</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN411"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>-= </span><a href="buffile.c.html#LN414"><span class='Ref_To_Local'>nthistime</span></a><span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN413"><span class='Ref_To_Local'>nwritten</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN414"><span class='Ref_To_Local'>nthistime</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while size&GT;0 &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="buffile.c.html#LN413"><span class='Ref_To_Local'>nwritten</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end BufFileWrite &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * BufFileFlush 
+ * 
+ * Like fflush() 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN461"></a><span class='Declare_Function'>BufFileFlush</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN461"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN72"><span class='Ref_to_Member'>dirty</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="buffile.c.html#LN95"><span class='Ref_to_Proto'>BufFileDumpBuffer</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN461"><span class='Ref_to_Parameter'>file</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN461"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN72"><span class='Ref_to_Member'>dirty</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> EOF<span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * BufFileSeek 
+ * 
+ * Like fseek(), except that target position needs two values in order to 
+ * work when logical filesize exceeds maximum value representable by long. 
+ * We do not support relative seeks across more than LONG_MAX, however. 
+ * 
+ * Result is 0 if OK, EOF if not.  Logical position is not moved if an 
+ * impossible seek is attempted. 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN484"></a><span class='Declare_Function'>BufFileSeek</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>fileno</span><span class='Delimiter'>, </span>off_t <span class='Declare_Parameter'>offset</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>whence</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN486"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>newFile</span><span class='Delimiter'>; 
+</span><a name="LN487"></a>    off_t       <span class='Declare_Local'>newOffset</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>whence</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> SEEK_SET<span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>fileno</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> EOF<span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN486"><span class='Ref_To_Local'>newFile</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>fileno</span></a><span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>offset</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> SEEK_CUR<span class='Operator'>: 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Relative seek considers only the signed offset, ignoring 
+             * fileno. Note that large offsets (&GT; 1 gig) risk overflow in this 
+             * add, unless we have 64-bit off_t. 
+             */ 
+</span>            <a href="buffile.c.html#LN486"><span class='Ref_To_Local'>newFile</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>+ </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>offset</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span><span class='Directive'>#ifdef</span> NOT_USED 
+        <span class='Control'>case</span> SEEK_END<span class='Operator'>: 
+</span>            <span class='Comment_Multi_Line'>/* could be implemented, not needed currently */ 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"invalid whence: %d"</span><span class='Delimiter'>, </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>whence</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> EOF<span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch whence &raquo; </span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>--</span><a href="buffile.c.html#LN486"><span class='Ref_To_Local'>newFile</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> EOF<span class='Delimiter'>; 
+</span>        <a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN50"><span class='Ref_to_Const'>MAX_PHYSICAL_FILESIZE</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN486"><span class='Ref_To_Local'>newFile</span></a> <span class='Operator'>== </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a> <span class='Operator'>&& 
+</span>        <a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>&GT;= </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>&& 
+</span>        <a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>&LT;= </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>+ </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Seek is to a point within existing buffer; we can just adjust 
+         * pos-within-buffer, without flushing buffer.  Note this is OK 
+         * whether reading or writing, but buffer remains dirty if we were 
+         * writing. 
+         */ 
+</span>        <a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) (</span><a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>- </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Comment_Multi_Line'>/* Otherwise, must reposition buffer, so flush any dirty data */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN96"><span class='Ref_to_Proto'>BufFileFlush</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> EOF<span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * At this point and no sooner, check for seek past last segment. The 
+     * above flush could have created a new segment, so checking sooner would 
+     * not work (at least not with this code). 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN70"><span class='Ref_to_Member'>isTemp</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* convert seek to "start of next seg" to "end of last seg" */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN486"><span class='Ref_To_Local'>newFile</span></a> <span class='Operator'>== </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a> <span class='Operator'>&& </span><a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="buffile.c.html#LN486"><span class='Ref_To_Local'>newFile</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN50"><span class='Ref_to_Const'>MAX_PHYSICAL_FILESIZE</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>&GT; </span><a href="buffile.c.html#LN50"><span class='Ref_to_Const'>MAX_PHYSICAL_FILESIZE</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>++</span><a href="buffile.c.html#LN486"><span class='Ref_To_Local'>newFile</span></a> <span class='Operator'>&GT;= </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> EOF<span class='Delimiter'>; 
+</span>            <a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a> <span class='Operator'>-= </span><a href="buffile.c.html#LN50"><span class='Ref_to_Const'>MAX_PHYSICAL_FILESIZE</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="buffile.c.html#LN486"><span class='Ref_To_Local'>newFile</span></a> <span class='Operator'>&GT;= </span><a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN60"><span class='Ref_to_Member'>numFiles</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> EOF<span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* Seek is OK! */ 
+</span>    <a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN486"><span class='Ref_To_Local'>newFile</span></a><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN487"><span class='Ref_To_Local'>newOffset</span></a><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN484"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN88"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end BufFileSeek &raquo; </span> 
+ 
+<span class='Keyword'>void 
+</span><a name="LN570"></a><span class='Declare_Function'>BufFileTell</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>fileno</span><span class='Delimiter'>, </span>off_t <span class='Operator'>*</span><span class='Declare_Parameter'>offset</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Operator'>*</span><a href="buffile.c.html#LN570"><span class='Ref_to_Parameter'>fileno</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN570"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="buffile.c.html#LN570"><span class='Ref_to_Parameter'>offset</span></a> <span class='Operator'>= </span><a href="buffile.c.html#LN570"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>+ </span><a href="buffile.c.html#LN570"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * BufFileSeekBlock --- block-oriented seek 
+ * 
+ * Performs absolute seek to the start of the n'th BLCKSZ-sized block of 
+ * the file.  Note that users of this interface will fail if their files 
+ * exceed BLCKSZ * LONG_MAX bytes, but that is quite a lot; we don't work 
+ * with tables bigger than that, either... 
+ * 
+ * Result is 0 if OK, EOF if not.  Logical position is not moved if an 
+ * impossible seek is attempted. 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN588"></a><span class='Declare_Function'>BufFileSeekBlock</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Delimiter'>, </span><span class='Keyword'>long </span><span class='Declare_Parameter'>blknum</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="../../../include/storage/buffile.h.html#LN40"><span class='Ref_to_Proto'>BufFileSeek</span></a><span class='Parentheses'>(</span><a href="buffile.c.html#LN588"><span class='Ref_to_Parameter'>file</span></a><span class='Delimiter'>, 
+</span>                       <span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) (</span><a href="buffile.c.html#LN588"><span class='Ref_to_Parameter'>blknum</span></a> <span class='Operator'>/ </span><a href="buffile.c.html#LN51"><span class='Ref_to_Const'>BUFFILE_SEG_SIZE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                       <span class='Parentheses'>(</span>off_t<span class='Parentheses'>) (</span><a href="buffile.c.html#LN588"><span class='Ref_to_Parameter'>blknum</span></a> <span class='Operator'>% </span><a href="buffile.c.html#LN51"><span class='Ref_to_Const'>BUFFILE_SEG_SIZE</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span>BLCKSZ<span class='Delimiter'>, 
+</span>                       SEEK_SET<span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Directive'>#ifdef</span> NOT_USED 
+<span class='Comment_Multi_Line'>/* 
+ * BufFileTellBlock --- block-oriented tell 
+ * 
+ * Any fractional part of a block in the current seek position is ignored. 
+ */ 
+</span><span class='Keyword'>long 
+</span><a name="LN603"></a><span class='Declare_Function'>BufFileTellBlock</span><span class='Parentheses'>(</span><a href="buffile.c.html#LN58"><span class='Ref_to_Struct'>BufFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN605"></a>    <span class='Keyword'>long</span>        <span class='Declare_Local'>blknum</span><span class='Delimiter'>; 
+</span> 
+    <a href="buffile.c.html#LN605"><span class='Ref_To_Local'>blknum</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="buffile.c.html#LN603"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN86"><span class='Ref_to_Member'>curOffset</span></a> <span class='Operator'>+ </span><a href="buffile.c.html#LN603"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN87"><span class='Ref_to_Member'>pos</span></a><span class='Parentheses'>) </span><span class='Operator'>/ </span>BLCKSZ<span class='Delimiter'>; 
+</span>    <a href="buffile.c.html#LN605"><span class='Ref_To_Local'>blknum</span></a> <span class='Operator'>+= </span><a href="buffile.c.html#LN603"><span class='Ref_to_Parameter'>file</span></a><span class='Operator'>-&GT;</span><a href="buffile.c.html#LN85"><span class='Ref_to_Member'>curFile</span></a> <span class='Operator'>* </span><a href="buffile.c.html#LN51"><span class='Ref_to_Const'>BUFFILE_SEG_SIZE</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="buffile.c.html#LN605"><span class='Ref_To_Local'>blknum</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Directive'>#endif</span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

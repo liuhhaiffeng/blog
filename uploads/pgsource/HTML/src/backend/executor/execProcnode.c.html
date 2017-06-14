@@ -1,0 +1,908 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\executor\execProcnode.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\executor\execProcnode.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:39 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * execProcnode.c 
+ *   contains dispatch functions which call the appropriate "initialize", 
+ *   "get a tuple", and "cleanup" routines for the given node type. 
+ *   If the node has children, then it will presumably call ExecInitNode, 
+ *   ExecProcNode, or ExecEndNode on its subnodes and do the appropriate 
+ *   processing. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/executor/execProcnode.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+/* 
+ *   INTERFACE ROUTINES 
+ *      ExecInitNode    -       initialize a plan node and its subplans 
+ *      ExecProcNode    -       get a tuple by executing the plan node 
+ *      ExecEndNode     -       shut down a plan node and its subplans 
+ * 
+ *   NOTES 
+ *      This used to be three files.  It is now all combined into 
+ *      one file so that it is easier to keep ExecInitNode, ExecProcNode, 
+ *      and ExecEndNode in sync when new nodes are added. 
+ * 
+ *   EXAMPLE 
+ *      Suppose we want the age of the manager of the shoe department and 
+ *      the number of employees in that department.  So we have the query: 
+ * 
+ *              select DEPT.no_emps, EMP.age 
+ *              from DEPT, EMP 
+ *              where EMP.name = DEPT.mgr and 
+ *                    DEPT.name = "shoe" 
+ * 
+ *      Suppose the planner gives us the following plan: 
+ * 
+ *                      Nest Loop (DEPT.mgr = EMP.name) 
+ *                      /       \ 
+ *                     /         \ 
+ *                 Seq Scan     Seq Scan 
+ *                  DEPT          EMP 
+ *              (name = "shoe") 
+ * 
+ *      ExecutorStart() is called first. 
+ *      It calls InitPlan() which calls ExecInitNode() on 
+ *      the root of the plan -- the nest loop node. 
+ * 
+ *    * ExecInitNode() notices that it is looking at a nest loop and 
+ *      as the code below demonstrates, it calls ExecInitNestLoop(). 
+ *      Eventually this calls ExecInitNode() on the right and left subplans 
+ *      and so forth until the entire plan is initialized.  The result 
+ *      of ExecInitNode() is a plan state tree built with the same structure 
+ *      as the underlying plan tree. 
+ * 
+ *    * Then when ExecutorRun() is called, it calls ExecutePlan() which calls 
+ *      ExecProcNode() repeatedly on the top node of the plan state tree. 
+ *      Each time this happens, ExecProcNode() will end up calling 
+ *      ExecNestLoop(), which calls ExecProcNode() on its subplans. 
+ *      Each of these subplans is a sequential scan so ExecSeqScan() is 
+ *      called.  The slots returned by ExecSeqScan() may contain 
+ *      tuples which contain the attributes ExecNestLoop() uses to 
+ *      form the tuples it returns. 
+ * 
+ *    * Eventually ExecSeqScan() stops returning tuples and the nest 
+ *      loop join ends.  Lastly, ExecutorEnd() calls ExecEndNode() which 
+ *      calls ExecEndNestLoop() which in turn calls ExecEndNode() on 
+ *      its subplans which result in ExecEndSeqScan(). 
+ * 
+ *      This should show how the executor works by having 
+ *      ExecInitNode(), ExecProcNode() and ExecEndNode() dispatch 
+ *      their work to the appropriate node support routines which may 
+ *      in turn call these routines themselves on their subplans. 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"executor/executor.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeAgg.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeAppend.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeBitmapAnd.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeBitmapHeapscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeBitmapIndexscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeBitmapOr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeCtescan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeCustom.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeForeignscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeFunctionscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeGather.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeGatherMerge.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeGroup.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeHash.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeHashjoin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeIndexonlyscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeIndexscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeLimit.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeLockRows.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeMaterial.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeMergeAppend.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeMergejoin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeModifyTable.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeNamedtuplestorescan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeNestloop.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeProjectSet.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeRecursiveunion.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeResult.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeSamplescan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeSeqscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeSetOp.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeSort.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeSubplan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeSubqueryscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeTableFuncscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeTidscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeUnique.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeValuesscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeWindowAgg.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeWorktablescan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"nodes/nodeFuncs.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* ------------------------------------------------------------------------ 
+ *      ExecInitNode 
+ * 
+ *      Recursively initializes all the nodes in the plan tree rooted 
+ *      at 'node'. 
+ * 
+ *      Inputs: 
+ *        'node' is the current node of the plan produced by the query planner 
+ *        'estate' is the shared execution state for the plan tree 
+ *        'eflags' is a bitwise OR of flag bits described in executor.h 
+ * 
+ *      Returns a PlanState node corresponding to the given Plan node. 
+ * ------------------------------------------------------------------------ 
+ */ 
+</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>* 
+</span><a name="LN139"></a><span class='Declare_Function'>ExecInitNode</span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN117"><span class='Ref_to_Struct'>Plan</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>eflags</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN141"></a>    <a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span><a name="LN142"></a>    <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>subps</span><span class='Delimiter'>; 
+</span><a name="LN143"></a>    <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>l</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * do nothing when we get to the end of a leaf on tree. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * control nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN44"><span class='Ref_to_EnumConst'>T_Result</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeResult.h.html#LN18"><span class='Ref_to_Proto'>ExecInitResult</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN187"><span class='Ref_to_Struct'>Result</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                  <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN45"><span class='Ref_to_EnumConst'>T_ProjectSet</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeProjectSet.h.html#LN18"><span class='Ref_to_Proto'>ExecInitProjectSet</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN199"><span class='Ref_to_Struct'>ProjectSet</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                      <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN46"><span class='Ref_to_EnumConst'>T_ModifyTable</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeModifyTable.h.html#LN17"><span class='Ref_to_Proto'>ExecInitModifyTable</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN213"><span class='Ref_to_Struct'>ModifyTable</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                       <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN47"><span class='Ref_to_EnumConst'>T_Append</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeAppend.h.html#LN18"><span class='Ref_to_Proto'>ExecInitAppend</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN244"><span class='Ref_to_Struct'>Append</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                  <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN48"><span class='Ref_to_EnumConst'>T_MergeAppend</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeMergeAppend.h.html#LN18"><span class='Ref_to_Proto'>ExecInitMergeAppend</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN257"><span class='Ref_to_Struct'>MergeAppend</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                       <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN49"><span class='Ref_to_EnumConst'>T_RecursiveUnion</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeRecursiveunion.h.html#LN18"><span class='Ref_to_Proto'>ExecInitRecursiveUnion</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN279"><span class='Ref_to_Struct'>RecursiveUnion</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                          <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN50"><span class='Ref_to_EnumConst'>T_BitmapAnd</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeBitmapAnd.h.html#LN18"><span class='Ref_to_Proto'>ExecInitBitmapAnd</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN299"><span class='Ref_to_Struct'>BitmapAnd</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                     <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN51"><span class='Ref_to_EnumConst'>T_BitmapOr</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeBitmapOr.h.html#LN18"><span class='Ref_to_Proto'>ExecInitBitmapOr</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN313"><span class='Ref_to_Struct'>BitmapOr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                    <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * scan nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN53"><span class='Ref_to_EnumConst'>T_SeqScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeSeqscan.h.html#LN19"><span class='Ref_to_Proto'>ExecInitSeqScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN335"><span class='Ref_to_Typedef'>SeqScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                   <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN54"><span class='Ref_to_EnumConst'>T_SampleScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeSamplescan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitSampleScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN341"><span class='Ref_to_Struct'>SampleScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                      <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN55"><span class='Ref_to_EnumConst'>T_IndexScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeIndexscan.h.html#LN19"><span class='Ref_to_Proto'>ExecInitIndexScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN385"><span class='Ref_to_Struct'>IndexScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                     <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN56"><span class='Ref_to_EnumConst'>T_IndexOnlyScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeIndexonlyscan.h.html#LN19"><span class='Ref_to_Proto'>ExecInitIndexOnlyScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN414"><span class='Ref_to_Struct'>IndexOnlyScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                         <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN57"><span class='Ref_to_EnumConst'>T_BitmapIndexScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeBitmapIndexscan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitBitmapIndexScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN441"><span class='Ref_to_Struct'>BitmapIndexScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                           <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN58"><span class='Ref_to_EnumConst'>T_BitmapHeapScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeBitmapHeapscan.h.html#LN19"><span class='Ref_to_Proto'>ExecInitBitmapHeapScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN459"><span class='Ref_to_Struct'>BitmapHeapScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                          <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN59"><span class='Ref_to_EnumConst'>T_TidScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeTidscan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitTidScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN472"><span class='Ref_to_Struct'>TidScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                   <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN60"><span class='Ref_to_EnumConst'>T_SubqueryScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeSubqueryscan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitSubqueryScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN494"><span class='Ref_to_Struct'>SubqueryScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                        <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN61"><span class='Ref_to_EnumConst'>T_FunctionScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeFunctionscan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitFunctionScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN504"><span class='Ref_to_Struct'>FunctionScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                        <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN63"><span class='Ref_to_EnumConst'>T_TableFuncScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeTableFuncscan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitTableFuncScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN525"><span class='Ref_to_Struct'>TableFuncScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                         <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN62"><span class='Ref_to_EnumConst'>T_ValuesScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeValuesscan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitValuesScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN515"><span class='Ref_to_Struct'>ValuesScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                      <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN64"><span class='Ref_to_EnumConst'>T_CteScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeCtescan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitCteScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN535"><span class='Ref_to_Struct'>CteScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                   <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN65"><span class='Ref_to_EnumConst'>T_NamedTuplestoreScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeNamedtuplestorescan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitNamedTuplestoreScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN546"><span class='Ref_to_Struct'>NamedTuplestoreScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                             <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN66"><span class='Ref_to_EnumConst'>T_WorkTableScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeWorktablescan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitWorkTableScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN556"><span class='Ref_to_Struct'>WorkTableScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                         <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN67"><span class='Ref_to_EnumConst'>T_ForeignScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeForeignscan.h.html#LN19"><span class='Ref_to_Proto'>ExecInitForeignScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN594"><span class='Ref_to_Struct'>ForeignScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                       <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN68"><span class='Ref_to_EnumConst'>T_CustomScan</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeCustom.h.html#LN21"><span class='Ref_to_Proto'>ExecInitCustomScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN623"><span class='Ref_to_Struct'>CustomScan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                      <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * join nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN70"><span class='Ref_to_EnumConst'>T_NestLoop</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeNestloop.h.html#LN18"><span class='Ref_to_Proto'>ExecInitNestLoop</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN684"><span class='Ref_to_Struct'>NestLoop</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                    <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN71"><span class='Ref_to_EnumConst'>T_MergeJoin</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeMergejoin.h.html#LN18"><span class='Ref_to_Proto'>ExecInitMergeJoin</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN708"><span class='Ref_to_Struct'>MergeJoin</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                     <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN72"><span class='Ref_to_EnumConst'>T_HashJoin</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeHashjoin.h.html#LN19"><span class='Ref_to_Proto'>ExecInitHashJoin</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN724"><span class='Ref_to_Struct'>HashJoin</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                    <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * materialization nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN73"><span class='Ref_to_EnumConst'>T_Material</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeMaterial.h.html#LN18"><span class='Ref_to_Proto'>ExecInitMaterial</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN734"><span class='Ref_to_Struct'>Material</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                    <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN74"><span class='Ref_to_EnumConst'>T_Sort</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeSort.h.html#LN18"><span class='Ref_to_Proto'>ExecInitSort</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN743"><span class='Ref_to_Struct'>Sort</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN75"><span class='Ref_to_EnumConst'>T_Group</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeGroup.h.html#LN18"><span class='Ref_to_Proto'>ExecInitGroup</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN759"><span class='Ref_to_Struct'>Group</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                 <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN76"><span class='Ref_to_EnumConst'>T_Agg</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeAgg.h.html#LN18"><span class='Ref_to_Proto'>ExecInitAgg</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN781"><span class='Ref_to_Struct'>Agg</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                               <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN77"><span class='Ref_to_EnumConst'>T_WindowAgg</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeWindowAgg.h.html#LN18"><span class='Ref_to_Proto'>ExecInitWindowAgg</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN800"><span class='Ref_to_Struct'>WindowAgg</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                     <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN78"><span class='Ref_to_EnumConst'>T_Unique</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeUnique.h.html#LN18"><span class='Ref_to_Proto'>ExecInitUnique</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN819"><span class='Ref_to_Struct'>Unique</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                  <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN79"><span class='Ref_to_EnumConst'>T_Gather</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeGather.h.html#LN18"><span class='Ref_to_Proto'>ExecInitGather</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN831"><span class='Ref_to_Struct'>Gather</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                  <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN80"><span class='Ref_to_EnumConst'>T_GatherMerge</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeGatherMerge.h.html#LN18"><span class='Ref_to_Proto'>ExecInitGatherMerge</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN843"><span class='Ref_to_Struct'>GatherMerge</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                       <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN81"><span class='Ref_to_EnumConst'>T_Hash</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeHash.h.html#LN18"><span class='Ref_to_Proto'>ExecInitHash</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN863"><span class='Ref_to_Struct'>Hash</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN82"><span class='Ref_to_EnumConst'>T_SetOp</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeSetOp.h.html#LN18"><span class='Ref_to_Proto'>ExecInitSetOp</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                 <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN83"><span class='Ref_to_EnumConst'>T_LockRows</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeLockRows.h.html#LN18"><span class='Ref_to_Proto'>ExecInitLockRows</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN899"><span class='Ref_to_Struct'>LockRows</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                    <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN84"><span class='Ref_to_EnumConst'>T_Limit</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/executor/nodeLimit.h.html#LN18"><span class='Ref_to_Proto'>ExecInitLimit</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/plannodes.h.html#LN913"><span class='Ref_to_Struct'>Limit</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, 
+</span>                                                 <a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unrecognized node type: %d"</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* keep compiler quiet */ 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch nodeTag(node) &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Initialize any initPlans present in this node.  The planner put them in 
+     * a separate list for us. 
+     */ 
+</span>    <a href="execProcnode.c.html#LN142"><span class='Ref_To_Local'>subps</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span>    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN143"><span class='Ref_To_Local'>l</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN147"><span class='Ref_to_Member'>initPlan</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN373"></a>        <a href="../../include/nodes/primnodes.h.html#LN678"><span class='Ref_to_Struct'>SubPlan</span></a>    <span class='Operator'>*</span><span class='Declare_Local'>subplan</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/primnodes.h.html#LN678"><span class='Ref_to_Struct'>SubPlan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN143"><span class='Ref_To_Local'>l</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN374"></a>        <a href="../../include/nodes/execnodes.h.html#LN731"><span class='Ref_to_Struct'>SubPlanState</span></a> <span class='Operator'>*</span><span class='Declare_Local'>sstate</span><span class='Delimiter'>; 
+</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN373"><span class='Ref_To_Local'>subplan</span></a><span class='Delimiter'>, </span><a href="../../include/nodes/primnodes.h.html#LN678"><span class='Ref_to_Struct'>SubPlan</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="execProcnode.c.html#LN374"><span class='Ref_To_Local'>sstate</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeSubplan.h.html#LN18"><span class='Ref_to_Proto'>ExecInitSubPlan</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN373"><span class='Ref_To_Local'>subplan</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execProcnode.c.html#LN142"><span class='Ref_To_Local'>subps</span></a> <span class='Operator'>= </span><a href="../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN142"><span class='Ref_To_Local'>subps</span></a><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN374"><span class='Ref_To_Local'>sstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN829"><span class='Ref_to_Member'>initPlan</span></a> <span class='Operator'>= </span><a href="execProcnode.c.html#LN142"><span class='Ref_To_Local'>subps</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Set up instrumentation for this node if requested */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN457"><span class='Ref_to_Member'>es_instrument</span></a><span class='Parentheses'>) 
+</span>        <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN818"><span class='Ref_to_Member'>instrument</span></a> <span class='Operator'>= </span><a href="instrument.c.html#LN28"><span class='Ref_to_Func'>InstrAlloc</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Delimiter'>, </span><a href="execProcnode.c.html#LN139"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN457"><span class='Ref_to_Member'>es_instrument</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execProcnode.c.html#LN141"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecInitNode &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecProcNode 
+ * 
+ *      Execute the given node to return a(nother) tuple. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN397"></a><span class='Declare_Function'>ExecProcNode</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN399"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN836"><span class='Ref_to_Member'>chgParam</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Comment_Single_Line'>/* something changed */ 
+</span>        <a href="execAmi.c.html#LN73"><span class='Ref_to_Func'>ExecReScan</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* let ReScan handle this */ 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN818"><span class='Ref_to_Member'>instrument</span></a><span class='Parentheses'>) 
+</span>        <a href="instrument.c.html#LN61"><span class='Ref_to_Func'>InstrStartNode</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN818"><span class='Ref_to_Member'>instrument</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * control nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN96"><span class='Ref_to_EnumConst'>T_ResultState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeResult.h.html#LN19"><span class='Ref_to_Proto'>ExecResult</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN888"><span class='Ref_to_Struct'>ResultState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN97"><span class='Ref_to_EnumConst'>T_ProjectSetState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeProjectSet.h.html#LN19"><span class='Ref_to_Proto'>ExecProjectSet</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN903"><span class='Ref_to_Struct'>ProjectSetState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN98"><span class='Ref_to_EnumConst'>T_ModifyTableState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeModifyTable.h.html#LN18"><span class='Ref_to_Proto'>ExecModifyTable</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN916"><span class='Ref_to_Struct'>ModifyTableState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN99"><span class='Ref_to_EnumConst'>T_AppendState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeAppend.h.html#LN19"><span class='Ref_to_Proto'>ExecAppend</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN957"><span class='Ref_to_Struct'>AppendState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN100"><span class='Ref_to_EnumConst'>T_MergeAppendState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeMergeAppend.h.html#LN19"><span class='Ref_to_Proto'>ExecMergeAppend</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN976"><span class='Ref_to_Struct'>MergeAppendState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN101"><span class='Ref_to_EnumConst'>T_RecursiveUnionState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeRecursiveunion.h.html#LN19"><span class='Ref_to_Proto'>ExecRecursiveUnion</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN999"><span class='Ref_to_Struct'>RecursiveUnionState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* BitmapAndState does not yield tuples */ 
+</span> 
+            <span class='Comment_Multi_Line'>/* BitmapOrState does not yield tuples */ 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * scan nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN105"><span class='Ref_to_EnumConst'>T_SeqScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeSeqscan.h.html#LN20"><span class='Ref_to_Proto'>ExecSeqScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1067"><span class='Ref_to_Struct'>SeqScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN106"><span class='Ref_to_EnumConst'>T_SampleScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeSamplescan.h.html#LN19"><span class='Ref_to_Proto'>ExecSampleScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1077"><span class='Ref_to_Struct'>SampleScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN107"><span class='Ref_to_EnumConst'>T_IndexScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeIndexscan.h.html#LN20"><span class='Ref_to_Proto'>ExecIndexScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1139"><span class='Ref_to_Struct'>IndexScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN108"><span class='Ref_to_EnumConst'>T_IndexOnlyScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeIndexonlyscan.h.html#LN20"><span class='Ref_to_Proto'>ExecIndexOnlyScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1185"><span class='Ref_to_Struct'>IndexOnlyScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* BitmapIndexScanState does not yield tuples */ 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN110"><span class='Ref_to_EnumConst'>T_BitmapHeapScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeBitmapHeapscan.h.html#LN20"><span class='Ref_to_Proto'>ExecBitmapHeapScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1301"><span class='Ref_to_Struct'>BitmapHeapScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN111"><span class='Ref_to_EnumConst'>T_TidScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeTidscan.h.html#LN19"><span class='Ref_to_Proto'>ExecTidScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1332"><span class='Ref_to_Struct'>TidScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN112"><span class='Ref_to_EnumConst'>T_SubqueryScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeSubqueryscan.h.html#LN19"><span class='Ref_to_Proto'>ExecSubqueryScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1350"><span class='Ref_to_Struct'>SubqueryScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN113"><span class='Ref_to_EnumConst'>T_FunctionScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeFunctionscan.h.html#LN19"><span class='Ref_to_Proto'>ExecFunctionScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1374"><span class='Ref_to_Struct'>FunctionScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN114"><span class='Ref_to_EnumConst'>T_TableFuncScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeTableFuncscan.h.html#LN19"><span class='Ref_to_Proto'>ExecTableFuncScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1419"><span class='Ref_to_Struct'>TableFuncScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN115"><span class='Ref_to_EnumConst'>T_ValuesScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeValuesscan.h.html#LN19"><span class='Ref_to_Proto'>ExecValuesScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1404"><span class='Ref_to_Struct'>ValuesScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN116"><span class='Ref_to_EnumConst'>T_CteScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeCtescan.h.html#LN19"><span class='Ref_to_Proto'>ExecCteScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1448"><span class='Ref_to_Struct'>CteScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN117"><span class='Ref_to_EnumConst'>T_NamedTuplestoreScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeNamedtuplestorescan.h.html#LN19"><span class='Ref_to_Proto'>ExecNamedTuplestoreScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1471"><span class='Ref_to_Struct'>NamedTuplestoreScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN118"><span class='Ref_to_EnumConst'>T_WorkTableScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeWorktablescan.h.html#LN19"><span class='Ref_to_Proto'>ExecWorkTableScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1487"><span class='Ref_to_Struct'>WorkTableScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN119"><span class='Ref_to_EnumConst'>T_ForeignScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeForeignscan.h.html#LN20"><span class='Ref_to_Proto'>ExecForeignScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1499"><span class='Ref_to_Struct'>ForeignScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN120"><span class='Ref_to_EnumConst'>T_CustomScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeCustom.h.html#LN23"><span class='Ref_to_Proto'>ExecCustomScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1524"><span class='Ref_to_Struct'>CustomScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * join nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN122"><span class='Ref_to_EnumConst'>T_NestLoopState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeNestloop.h.html#LN19"><span class='Ref_to_Proto'>ExecNestLoop</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1562"><span class='Ref_to_Struct'>NestLoopState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN123"><span class='Ref_to_EnumConst'>T_MergeJoinState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeMergejoin.h.html#LN19"><span class='Ref_to_Proto'>ExecMergeJoin</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1595"><span class='Ref_to_Struct'>MergeJoinState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN124"><span class='Ref_to_EnumConst'>T_HashJoinState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeHashjoin.h.html#LN20"><span class='Ref_to_Proto'>ExecHashJoin</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1648"><span class='Ref_to_Struct'>HashJoinState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * materialization nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN125"><span class='Ref_to_EnumConst'>T_MaterialState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeMaterial.h.html#LN19"><span class='Ref_to_Proto'>ExecMaterial</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1685"><span class='Ref_to_Struct'>MaterialState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN126"><span class='Ref_to_EnumConst'>T_SortState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeSort.h.html#LN19"><span class='Ref_to_Proto'>ExecSort</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1697"><span class='Ref_to_Struct'>SortState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN127"><span class='Ref_to_EnumConst'>T_GroupState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeGroup.h.html#LN19"><span class='Ref_to_Proto'>ExecGroup</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1713"><span class='Ref_to_Struct'>GroupState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN128"><span class='Ref_to_EnumConst'>T_AggState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeAgg.h.html#LN19"><span class='Ref_to_Proto'>ExecAgg</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1739"><span class='Ref_to_Struct'>AggState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN129"><span class='Ref_to_EnumConst'>T_WindowAggState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeWindowAgg.h.html#LN19"><span class='Ref_to_Proto'>ExecWindowAgg</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1792"><span class='Ref_to_Struct'>WindowAggState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN130"><span class='Ref_to_EnumConst'>T_UniqueState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeUnique.h.html#LN19"><span class='Ref_to_Proto'>ExecUnique</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1860"><span class='Ref_to_Struct'>UniqueState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN131"><span class='Ref_to_EnumConst'>T_GatherState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeGather.h.html#LN19"><span class='Ref_to_Proto'>ExecGather</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1874"><span class='Ref_to_Struct'>GatherState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN132"><span class='Ref_to_EnumConst'>T_GatherMergeState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeGatherMerge.h.html#LN21"><span class='Ref_to_Proto'>ExecGatherMerge</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN133"><span class='Ref_to_EnumConst'>T_HashState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeHash.h.html#LN19"><span class='Ref_to_Proto'>ExecHash</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1920"><span class='Ref_to_Struct'>HashState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN134"><span class='Ref_to_EnumConst'>T_SetOpState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeSetOp.h.html#LN19"><span class='Ref_to_Proto'>ExecSetOp</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN135"><span class='Ref_to_EnumConst'>T_LockRowsState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeLockRows.h.html#LN19"><span class='Ref_to_Proto'>ExecLockRows</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1964"><span class='Ref_to_Struct'>LockRowsState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN136"><span class='Ref_to_EnumConst'>T_LimitState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeLimit.h.html#LN19"><span class='Ref_to_Proto'>ExecLimit</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1996"><span class='Ref_to_Struct'>LimitState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unrecognized node type: %d"</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch nodeTag(node) &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN818"><span class='Ref_to_Member'>instrument</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/executor/instrument.h.html#LN76"><span class='Ref_to_Proto'>InstrStopNode</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN397"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN818"><span class='Ref_to_Member'>instrument</span></a><span class='Delimiter'>, </span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) </span><span class='Operator'>? </span><span class='Number'>0</span><span class='Operator'>.</span><span class='Number'>0</span> <span class='Operator'>: </span><span class='Number'>1</span><span class='Operator'>.</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="execProcnode.c.html#LN399"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecProcNode &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      MultiExecProcNode 
+ * 
+ *      Execute a node that doesn't return individual tuples 
+ *      (it might return a hashtable, bitmap, etc).  Caller should 
+ *      check it got back the expected kind of Node. 
+ * 
+ * This has essentially the same responsibilities as ExecProcNode, 
+ * but it does not do InstrStartNode/InstrStopNode (mainly because 
+ * it can't tell how many returned tuples to count).  Each per-node 
+ * function must provide its own instrumentation support. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a href="../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>* 
+</span><a name="LN600"></a><span class='Declare_Function'>MultiExecProcNode</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN602"></a>    <a href="../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execProcnode.c.html#LN600"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN836"><span class='Ref_to_Member'>chgParam</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Comment_Single_Line'>/* something changed */ 
+</span>        <a href="execAmi.c.html#LN73"><span class='Ref_to_Func'>ExecReScan</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN600"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* let ReScan handle this */ 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN600"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * Only node types that actually support multiexec will be listed 
+             */ 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN133"><span class='Ref_to_EnumConst'>T_HashState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN602"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeHash.h.html#LN20"><span class='Ref_to_Proto'>MultiExecHash</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1920"><span class='Ref_to_Struct'>HashState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN600"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN109"><span class='Ref_to_EnumConst'>T_BitmapIndexScanState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN602"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeBitmapIndexscan.h.html#LN19"><span class='Ref_to_Proto'>MultiExecBitmapIndexScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1220"><span class='Ref_to_Struct'>BitmapIndexScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN600"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN102"><span class='Ref_to_EnumConst'>T_BitmapAndState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN602"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeBitmapAnd.h.html#LN19"><span class='Ref_to_Proto'>MultiExecBitmapAnd</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1018"><span class='Ref_to_Struct'>BitmapAndState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN600"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN103"><span class='Ref_to_EnumConst'>T_BitmapOrState</span></a><span class='Operator'>: 
+</span>            <a href="execProcnode.c.html#LN602"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../include/executor/nodeBitmapOr.h.html#LN19"><span class='Ref_to_Proto'>MultiExecBitmapOr</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1029"><span class='Ref_to_Struct'>BitmapOrState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN600"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unrecognized node type: %d"</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN600"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="execProcnode.c.html#LN602"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch nodeTag(node) &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="execProcnode.c.html#LN602"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end MultiExecProcNode &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecEndNode 
+ * 
+ *      Recursively cleans up all the nodes in the plan rooted 
+ *      at 'node'. 
+ * 
+ *      After this operation, the query plan will not be able to be 
+ *      processed any further.  This should be called only after 
+ *      the query plan has been fully executed. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN653"></a><span class='Declare_Function'>ExecEndNode</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * do nothing when we get to the end of a leaf on tree. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN836"><span class='Ref_to_Member'>chgParam</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/nodes/bitmapset.h.html#LN68"><span class='Ref_to_Proto'>bms_free</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN836"><span class='Ref_to_Member'>chgParam</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN836"><span class='Ref_to_Member'>chgParam</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * control nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN96"><span class='Ref_to_EnumConst'>T_ResultState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeResult.h.html#LN20"><span class='Ref_to_Proto'>ExecEndResult</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN888"><span class='Ref_to_Struct'>ResultState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN97"><span class='Ref_to_EnumConst'>T_ProjectSetState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeProjectSet.h.html#LN20"><span class='Ref_to_Proto'>ExecEndProjectSet</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN903"><span class='Ref_to_Struct'>ProjectSetState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN98"><span class='Ref_to_EnumConst'>T_ModifyTableState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeModifyTable.h.html#LN19"><span class='Ref_to_Proto'>ExecEndModifyTable</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN916"><span class='Ref_to_Struct'>ModifyTableState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN99"><span class='Ref_to_EnumConst'>T_AppendState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeAppend.h.html#LN20"><span class='Ref_to_Proto'>ExecEndAppend</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN957"><span class='Ref_to_Struct'>AppendState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN100"><span class='Ref_to_EnumConst'>T_MergeAppendState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeMergeAppend.h.html#LN20"><span class='Ref_to_Proto'>ExecEndMergeAppend</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN976"><span class='Ref_to_Struct'>MergeAppendState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN101"><span class='Ref_to_EnumConst'>T_RecursiveUnionState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeRecursiveunion.h.html#LN20"><span class='Ref_to_Proto'>ExecEndRecursiveUnion</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN999"><span class='Ref_to_Struct'>RecursiveUnionState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN102"><span class='Ref_to_EnumConst'>T_BitmapAndState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeBitmapAnd.h.html#LN20"><span class='Ref_to_Proto'>ExecEndBitmapAnd</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1018"><span class='Ref_to_Struct'>BitmapAndState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN103"><span class='Ref_to_EnumConst'>T_BitmapOrState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeBitmapOr.h.html#LN20"><span class='Ref_to_Proto'>ExecEndBitmapOr</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1029"><span class='Ref_to_Struct'>BitmapOrState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * scan nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN105"><span class='Ref_to_EnumConst'>T_SeqScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeSeqscan.h.html#LN21"><span class='Ref_to_Proto'>ExecEndSeqScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1067"><span class='Ref_to_Struct'>SeqScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN106"><span class='Ref_to_EnumConst'>T_SampleScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeSamplescan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndSampleScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1077"><span class='Ref_to_Struct'>SampleScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN131"><span class='Ref_to_EnumConst'>T_GatherState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeGather.h.html#LN20"><span class='Ref_to_Proto'>ExecEndGather</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1874"><span class='Ref_to_Struct'>GatherState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN132"><span class='Ref_to_EnumConst'>T_GatherMergeState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeGatherMerge.h.html#LN22"><span class='Ref_to_Proto'>ExecEndGatherMerge</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN107"><span class='Ref_to_EnumConst'>T_IndexScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeIndexscan.h.html#LN21"><span class='Ref_to_Proto'>ExecEndIndexScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1139"><span class='Ref_to_Struct'>IndexScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN108"><span class='Ref_to_EnumConst'>T_IndexOnlyScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeIndexonlyscan.h.html#LN21"><span class='Ref_to_Proto'>ExecEndIndexOnlyScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1185"><span class='Ref_to_Struct'>IndexOnlyScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN109"><span class='Ref_to_EnumConst'>T_BitmapIndexScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeBitmapIndexscan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndBitmapIndexScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1220"><span class='Ref_to_Struct'>BitmapIndexScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN110"><span class='Ref_to_EnumConst'>T_BitmapHeapScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeBitmapHeapscan.h.html#LN21"><span class='Ref_to_Proto'>ExecEndBitmapHeapScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1301"><span class='Ref_to_Struct'>BitmapHeapScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN111"><span class='Ref_to_EnumConst'>T_TidScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeTidscan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndTidScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1332"><span class='Ref_to_Struct'>TidScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN112"><span class='Ref_to_EnumConst'>T_SubqueryScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeSubqueryscan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndSubqueryScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1350"><span class='Ref_to_Struct'>SubqueryScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN113"><span class='Ref_to_EnumConst'>T_FunctionScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeFunctionscan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndFunctionScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1374"><span class='Ref_to_Struct'>FunctionScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN114"><span class='Ref_to_EnumConst'>T_TableFuncScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeTableFuncscan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndTableFuncScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1419"><span class='Ref_to_Struct'>TableFuncScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN115"><span class='Ref_to_EnumConst'>T_ValuesScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeValuesscan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndValuesScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1404"><span class='Ref_to_Struct'>ValuesScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN116"><span class='Ref_to_EnumConst'>T_CteScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeCtescan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndCteScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1448"><span class='Ref_to_Struct'>CteScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN117"><span class='Ref_to_EnumConst'>T_NamedTuplestoreScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeNamedtuplestorescan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndNamedTuplestoreScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1471"><span class='Ref_to_Struct'>NamedTuplestoreScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN118"><span class='Ref_to_EnumConst'>T_WorkTableScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeWorktablescan.h.html#LN20"><span class='Ref_to_Proto'>ExecEndWorkTableScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1487"><span class='Ref_to_Struct'>WorkTableScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN119"><span class='Ref_to_EnumConst'>T_ForeignScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeForeignscan.h.html#LN21"><span class='Ref_to_Proto'>ExecEndForeignScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1499"><span class='Ref_to_Struct'>ForeignScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN120"><span class='Ref_to_EnumConst'>T_CustomScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeCustom.h.html#LN24"><span class='Ref_to_Proto'>ExecEndCustomScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1524"><span class='Ref_to_Struct'>CustomScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * join nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN122"><span class='Ref_to_EnumConst'>T_NestLoopState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeNestloop.h.html#LN20"><span class='Ref_to_Proto'>ExecEndNestLoop</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1562"><span class='Ref_to_Struct'>NestLoopState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN123"><span class='Ref_to_EnumConst'>T_MergeJoinState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeMergejoin.h.html#LN20"><span class='Ref_to_Proto'>ExecEndMergeJoin</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1595"><span class='Ref_to_Struct'>MergeJoinState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN124"><span class='Ref_to_EnumConst'>T_HashJoinState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeHashjoin.h.html#LN21"><span class='Ref_to_Proto'>ExecEndHashJoin</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1648"><span class='Ref_to_Struct'>HashJoinState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * materialization nodes 
+             */ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN125"><span class='Ref_to_EnumConst'>T_MaterialState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeMaterial.h.html#LN20"><span class='Ref_to_Proto'>ExecEndMaterial</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1685"><span class='Ref_to_Struct'>MaterialState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN126"><span class='Ref_to_EnumConst'>T_SortState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeSort.h.html#LN20"><span class='Ref_to_Proto'>ExecEndSort</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1697"><span class='Ref_to_Struct'>SortState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN127"><span class='Ref_to_EnumConst'>T_GroupState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeGroup.h.html#LN20"><span class='Ref_to_Proto'>ExecEndGroup</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1713"><span class='Ref_to_Struct'>GroupState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN128"><span class='Ref_to_EnumConst'>T_AggState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeAgg.h.html#LN20"><span class='Ref_to_Proto'>ExecEndAgg</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1739"><span class='Ref_to_Struct'>AggState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN129"><span class='Ref_to_EnumConst'>T_WindowAggState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeWindowAgg.h.html#LN20"><span class='Ref_to_Proto'>ExecEndWindowAgg</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1792"><span class='Ref_to_Struct'>WindowAggState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN130"><span class='Ref_to_EnumConst'>T_UniqueState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeUnique.h.html#LN20"><span class='Ref_to_Proto'>ExecEndUnique</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1860"><span class='Ref_to_Struct'>UniqueState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN133"><span class='Ref_to_EnumConst'>T_HashState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeHash.h.html#LN21"><span class='Ref_to_Proto'>ExecEndHash</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1920"><span class='Ref_to_Struct'>HashState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN134"><span class='Ref_to_EnumConst'>T_SetOpState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeSetOp.h.html#LN20"><span class='Ref_to_Proto'>ExecEndSetOp</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN135"><span class='Ref_to_EnumConst'>T_LockRowsState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeLockRows.h.html#LN20"><span class='Ref_to_Proto'>ExecEndLockRows</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1964"><span class='Ref_to_Struct'>LockRowsState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN136"><span class='Ref_to_EnumConst'>T_LimitState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeLimit.h.html#LN20"><span class='Ref_to_Proto'>ExecEndLimit</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1996"><span class='Ref_to_Struct'>LimitState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unrecognized node type: %d"</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN653"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch nodeTag(node) &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end ExecEndNode &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ExecShutdownNode 
+ * 
+ * Give execution nodes a chance to stop asynchronous resource consumption 
+ * and release any resources still held.  Currently, this is only used for 
+ * parallel query, but we might want to extend it to other cases also (e.g. 
+ * FDW).  We might also want to call it sooner, as soon as it's evident that 
+ * no more rows will be needed (e.g. when a Limit is filled) rather than only 
+ * at the end of ExecutorRun. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN854"></a><span class='Declare_Function'>ExecShutdownNode</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execProcnode.c.html#LN854"><span class='Ref_to_Parameter'>node</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/nodes/nodeFuncs.h.html#LN76"><span class='Ref_to_Proto'>planstate_tree_walker</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN854"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, </span><a href="../../include/executor/executor.h.html#LN232"><span class='Ref_to_Proto'>ExecShutdownNode</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execProcnode.c.html#LN854"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN131"><span class='Ref_to_EnumConst'>T_GatherState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeGather.h.html#LN21"><span class='Ref_to_Proto'>ExecShutdownGather</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1874"><span class='Ref_to_Struct'>GatherState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN854"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN119"><span class='Ref_to_EnumConst'>T_ForeignScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeForeignscan.h.html#LN30"><span class='Ref_to_Proto'>ExecShutdownForeignScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1499"><span class='Ref_to_Struct'>ForeignScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN854"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN120"><span class='Ref_to_EnumConst'>T_CustomScanState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeCustom.h.html#LN39"><span class='Ref_to_Proto'>ExecShutdownCustomScan</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1524"><span class='Ref_to_Struct'>CustomScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN854"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN132"><span class='Ref_to_EnumConst'>T_GatherMergeState</span></a><span class='Operator'>: 
+</span>            <a href="../../include/executor/nodeGatherMerge.h.html#LN24"><span class='Ref_to_Proto'>ExecShutdownGatherMerge</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execProcnode.c.html#LN854"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecShutdownNode &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

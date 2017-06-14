@@ -1,0 +1,495 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\postmaster\bgwriter.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\postmaster\bgwriter.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:45 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * bgwriter.c 
+ * 
+ * The background writer (bgwriter) is new as of Postgres 8.0.  It attempts 
+ * to keep regular backends from having to write out dirty shared buffers 
+ * (which they would only do when needing to free a shared buffer to read in 
+ * another page).  In the best scenario all writes from shared buffers will 
+ * be issued by the background writer process.  However, regular backends are 
+ * still empowered to issue writes if the bgwriter fails to maintain enough 
+ * clean shared buffers. 
+ * 
+ * As of Postgres 9.2 the bgwriter no longer handles checkpoints. 
+ * 
+ * The bgwriter is started by the postmaster as soon as the startup subprocess 
+ * finishes, or as soon as recovery begins if we are doing archive recovery. 
+ * It remains alive until the postmaster commands it to terminate. 
+ * Normal termination is by SIGTERM, which instructs the bgwriter to exit(0). 
+ * Emergency termination is by SIGQUIT; like any backend, the bgwriter will 
+ * simply abort and exit on SIGQUIT. 
+ * 
+ * If the bgwriter exits unexpectedly, the postmaster treats that the same 
+ * as a backend crash: shared memory may be corrupted, so remaining backends 
+ * should be killed by SIGQUIT and then a recovery cycle started. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/postmaster/bgwriter.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;signal.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/time.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog_internal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"libpq/pqsignal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/bgwriter.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/bufmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/buf_internals.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/condition_variable.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/fd.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/smgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/spin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/standby.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/guc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/resowner.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/timestamp.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * GUC parameters 
+ */ 
+</span><a name="LN66"></a><span class='Keyword'>int</span>         <span class='Declare_Var'>BgWriterDelay</span> <span class='Operator'>= </span><span class='Number'>200</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Multiplier to apply to BgWriterDelay when we decide to hibernate. 
+ * (Perhaps this needs to be configurable?) 
+ */ 
+</span><a name="LN72"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>HIBERNATE_FACTOR</span>            <span class='Number'>50</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Interval in which standby snapshots are logged into the WAL stream, in 
+ * milliseconds. 
+ */ 
+</span><a name="LN78"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>LOG_SNAPSHOT_INTERVAL_MS</span> <span class='Number'>15000</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * LSN and timestamp at which we last issued a LogStandbySnapshot(), to avoid 
+ * doing so too often or repeatedly if there has been no other write activity 
+ * in the system. 
+ */ 
+</span><a name="LN85"></a><span class='Keyword'>static </span><a href="../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Var'>last_snapshot_ts</span><span class='Delimiter'>; 
+</span><a name="LN86"></a><span class='Keyword'>static </span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Var'>last_snapshot_lsn</span> <span class='Operator'>= </span><a href="../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Flags set by interrupt handlers for later service in the main loop. 
+ */ 
+</span><a name="LN91"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>got_SIGHUP</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN92"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>shutdown_requested</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Signal handlers */ 
+</span> 
+<a name="LN96"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>bg_quickdie</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN97"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>BgSigHupHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN98"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>ReqShutdownHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN99"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>bgwriter_sigusr1_handler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Main entry point for bgwriter process 
+ * 
+ * This is invoked from AuxiliaryProcessMain, which has already created the 
+ * basic execution environment, but not enabled signals yet. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN109"></a><span class='Declare_Function'>BackgroundWriterMain</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN111"></a>    <a href="../../include/c.h.html#LN1087"><span class='Ref_to_Const'>sigjmp_buf</span></a>  <span class='Declare_Local'>local_sigjmp_buf</span><span class='Delimiter'>; 
+</span><a name="LN112"></a>    <a href="../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>bgwriter_context</span><span class='Delimiter'>; 
+</span><a name="LN113"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>prev_hibernate</span><span class='Delimiter'>; 
+</span><a name="LN114"></a>    <a href="../../include/storage/buf_internals.h.html#LN261"><span class='Ref_to_Struct'>WritebackContext</span></a> <span class='Declare_Local'>wb_context</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Properly accept or ignore signals the postmaster might send us. 
+     * 
+     * bgwriter doesn't participate in ProcSignal signalling, but a SIGUSR1 
+     * handler is still needed for latch wakeups. 
+     */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN187"><span class='Ref_to_Const'>SIGHUP</span></a><span class='Delimiter'>, </span><a href="bgwriter.c.html#LN97"><span class='Ref_to_Proto'>BgSigHupHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>  <span class='Comment_Single_Line'>/* set flag to read config file */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGINT<span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGTERM<span class='Delimiter'>, </span><a href="bgwriter.c.html#LN98"><span class='Ref_to_Proto'>ReqShutdownHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* shutdown */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN188"><span class='Ref_to_Const'>SIGQUIT</span></a><span class='Delimiter'>, </span><a href="bgwriter.c.html#LN96"><span class='Ref_to_Proto'>bg_quickdie</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* hard crash time */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN193"><span class='Ref_to_Const'>SIGALRM</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN192"><span class='Ref_to_Const'>SIGPIPE</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN201"><span class='Ref_to_Const'>SIGUSR1</span></a><span class='Delimiter'>, </span><a href="bgwriter.c.html#LN99"><span class='Ref_to_Proto'>bgwriter_sigusr1_handler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN202"><span class='Ref_to_Const'>SIGUSR2</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Reset some signals that are accepted by postmaster but not here 
+     */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN197"><span class='Ref_to_Const'>SIGCHLD</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN198"><span class='Ref_to_Const'>SIGTTIN</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN199"><span class='Ref_to_Const'>SIGTTOU</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN196"><span class='Ref_to_Const'>SIGCONT</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN200"><span class='Ref_to_Const'>SIGWINCH</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We allow SIGQUIT (quickdie) at all times */ 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN29"><span class='Ref_to_Macro'>sigdelset</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN22"><span class='Ref_to_Global_Var'>BlockSig</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN188"><span class='Ref_to_Const'>SIGQUIT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create a resource owner to keep track of our resources (currently only 
+     * buffer pins). 
+     */ 
+</span>    <a href="../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a> <span class='Operator'>= </span><a href="../../include/utils/resowner.h.html#LN66"><span class='Ref_to_Proto'>ResourceOwnerCreate</span></a><span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='String'>"Background Writer"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We just started, assume there has been either a shutdown or 
+     * end-of-recovery snapshot. 
+     */ 
+</span>    <a href="bgwriter.c.html#LN85"><span class='Ref_to_Global_Var'>last_snapshot_ts</span></a> <span class='Operator'>= </span><a href="../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create a memory context that we will do all our work in.  We do this so 
+     * that we can reset the context during error recovery and thereby avoid 
+     * possible memory leaks.  Formerly this code just ran in 
+     * TopMemoryContext, but resetting that would be a really bad idea. 
+     */ 
+</span>    <a href="bgwriter.c.html#LN112"><span class='Ref_To_Local'>bgwriter_context</span></a> <span class='Operator'>= </span><a href="../../include/utils/memutils.h.html#LN145"><span class='Ref_to_Proto'>AllocSetContextCreate</span></a><span class='Parentheses'>(</span><a href="../utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, 
+</span>                                             <span class='String'>"Background Writer"</span><span class='Delimiter'>, 
+</span>                                             <a href="../../include/utils/memutils.h.html#LN164"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_SIZES</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="bgwriter.c.html#LN112"><span class='Ref_To_Local'>bgwriter_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/buf_internals.h.html#LN303"><span class='Ref_to_Proto'>WritebackContextInit</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="bgwriter.c.html#LN114"><span class='Ref_To_Local'>wb_context</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="../storage/buffer/bufmgr.c.html#LN118"><span class='Ref_to_Global_Var'>bgwriter_flush_after</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If an exception is encountered, processing resumes here. 
+     * 
+     * See notes in postgres.c about the design of this coding. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1088"><span class='Ref_to_Macro'>sigsetjmp</span></a><span class='Parentheses'>(</span><a href="bgwriter.c.html#LN111"><span class='Ref_To_Local'>local_sigjmp_buf</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Since not using PG_TRY, must reset error stack by hand */ 
+</span>        <a href="../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Prevent interrupts while cleaning up */ 
+</span>        <a href="../../include/miscadmin.h.html#LN116"><span class='Ref_to_Macro'>HOLD_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Report the error to the server log */ 
+</span>        <a href="../../include/utils/elog.h.html#LN362"><span class='Ref_to_Proto'>EmitErrorReport</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * These operations are really just a minimal subset of 
+         * AbortTransaction().  We don't have very many resources to worry 
+         * about in bgwriter, but we do have LWLocks, buffers, and temp files. 
+         */ 
+</span>        <a href="../../include/storage/lwlock.h.html#LN150"><span class='Ref_to_Proto'>LWLockReleaseAll</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/condition_variable.h.html#LN45"><span class='Ref_to_Proto'>ConditionVariableCancelSleep</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/bufmgr.h.html#LN221"><span class='Ref_to_Proto'>AbortBufferIO</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/bufmgr.h.html#LN213"><span class='Ref_to_Proto'>UnlockBuffers</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* buffer pins are released here: */ 
+</span>        <a href="../../include/utils/resowner.h.html#LN68"><span class='Ref_to_Proto'>ResourceOwnerRelease</span></a><span class='Parentheses'>(</span><a href="../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Delimiter'>, 
+</span>                             <a href="../../include/utils/resowner.h.html#LN46"><span class='Ref_to_EnumConst'>RESOURCE_RELEASE_BEFORE_LOCKS</span></a><span class='Delimiter'>, 
+</span>                             <span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* we needn't bother with the other ResourceOwnerRelease phases */ 
+</span>        <a href="../../include/storage/bufmgr.h.html#LN184"><span class='Ref_to_Proto'>AtEOXact_Buffers</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/smgr.h.html#LN111"><span class='Ref_to_Proto'>AtEOXact_SMgr</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/fd.h.html#LN109"><span class='Ref_to_Proto'>AtEOXact_Files</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/hsearch.h.html#LN141"><span class='Ref_to_Proto'>AtEOXact_HashTables</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Now return to normal top-level context and clear ErrorContext for 
+         * next time. 
+         */ 
+</span>        <a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="bgwriter.c.html#LN112"><span class='Ref_To_Local'>bgwriter_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/elog.h.html#LN365"><span class='Ref_to_Proto'>FlushErrorState</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Flush any leaked data in the top-level context */ 
+</span>        <a href="../../include/utils/memutils.h.html#LN66"><span class='Ref_to_Macro'>MemoryContextResetAndDeleteChildren</span></a><span class='Parentheses'>(</span><a href="bgwriter.c.html#LN112"><span class='Ref_To_Local'>bgwriter_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* re-initialize to avoid repeated errors causing problems */ 
+</span>        <a href="../../include/storage/buf_internals.h.html#LN303"><span class='Ref_to_Proto'>WritebackContextInit</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="bgwriter.c.html#LN114"><span class='Ref_To_Local'>wb_context</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="../storage/buffer/bufmgr.c.html#LN118"><span class='Ref_to_Global_Var'>bgwriter_flush_after</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Now we can allow interrupts again */ 
+</span>        <a href="../../include/miscadmin.h.html#LN118"><span class='Ref_to_Macro'>RESUME_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Sleep at least 1 second after any error.  A write error is likely 
+         * to be repeated, and we don't want to be filling the error logs as 
+         * fast as we can. 
+         */ 
+</span>        <a href="../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><span class='Number'>1000000L</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Close all open files after any error.  This is helpful on Windows, 
+         * where holding deleted files open causes various strange errors. 
+         * It's not clear we need it elsewhere, but shouldn't hurt. 
+         */ 
+</span>        <a href="../../include/storage/smgr.h.html#LN88"><span class='Ref_to_Proto'>smgrcloseall</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Report wait end here, when there is no further possibility of wait */ 
+</span>        <a href="../../include/pgstat.h.html#LN1230"><span class='Ref_to_Func'>pgstat_report_wait_end</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if sigsetjmp(local_sigjm... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* We can now handle ereport(ERROR) */ 
+</span>    <a href="../utils/error/elog.c.html#LN89"><span class='Ref_to_Global_Var'>PG_exception_stack</span></a> <span class='Operator'>= &</span><a href="bgwriter.c.html#LN111"><span class='Ref_To_Local'>local_sigjmp_buf</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Unblock signals (they were blocked when the postmaster forked us) 
+     */ 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN18"><span class='Ref_to_Macro'>PG_SETMASK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN21"><span class='Ref_to_Global_Var'>UnBlockSig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Reset hibernation state after any error. 
+     */ 
+</span>    <a href="bgwriter.c.html#LN113"><span class='Ref_To_Local'>prev_hibernate</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Loop forever 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN255"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>can_hibernate</span><span class='Delimiter'>; 
+</span><a name="LN256"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Clear any already-pending wakeups */ 
+</span>        <a href="../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="../utils/misc/guc-file.l.html#LN107"><span class='Ref_to_Func'>ProcessConfigFile</span></a><span class='Parentheses'>(</span><a href="../../include/utils/guc.h.html#LN71"><span class='Ref_to_EnumConst'>PGC_SIGHUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="startup.c.html#LN41"><span class='Ref_to_Global_Var'>shutdown_requested</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * From here on, elog(ERROR) should end with exit(1), not send 
+             * control back to the sigsetjmp block above 
+             */ 
+</span>            <a href="../utils/init/globals.c.html#LN104"><span class='Ref_to_Global_Var'>ExitOnAnyError</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* Normal exit from the bgwriter is here */ 
+</span>            <a href="../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* done */ 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Do one cycle of dirty-buffer writing. 
+         */ 
+</span>        <a href="bgwriter.c.html#LN255"><span class='Ref_To_Local'>can_hibernate</span></a> <span class='Operator'>= </span><a href="../../include/storage/bufmgr.h.html#LN224"><span class='Ref_to_Proto'>BgBufferSync</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="bgwriter.c.html#LN114"><span class='Ref_To_Local'>wb_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Send off activity statistics to the stats collector 
+         */ 
+</span>        <a href="../../include/pgstat.h.html#LN1310"><span class='Ref_to_Proto'>pgstat_send_bgwriter</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/postmaster/bgwriter.h.html#LN40"><span class='Ref_to_Proto'>FirstCallSinceLastCheckpoint</span></a><span class='Parentheses'>())</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * After any checkpoint, close all smgr files.  This is so we 
+             * won't hang onto smgr references to deleted files indefinitely. 
+             */ 
+</span>            <a href="../../include/storage/smgr.h.html#LN88"><span class='Ref_to_Proto'>smgrcloseall</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Log a new xl_running_xacts every now and then so replication can 
+         * get into a consistent state faster (think of suboverflowed 
+         * snapshots) and clean up resources (locks, KnownXids*) more 
+         * frequently. The costs of this are relatively low, so doing it 4 
+         * times (LOG_SNAPSHOT_INTERVAL_MS) a minute seems fine. 
+         * 
+         * We assume the interval for writing xl_running_xacts is 
+         * significantly bigger than BgWriterDelay, so we don't complicate the 
+         * overall timeout handling but just assume we're going to get called 
+         * often enough even if hibernation mode is active. It's not that 
+         * important that log_snap_interval_ms is met strictly. To make sure 
+         * we're not waking the disk up unnecessarily on an idle system we 
+         * check whether there has been any WAL inserted since the last time 
+         * we've logged a running xacts. 
+         * 
+         * We do this logging in the bgwriter as it is the only process that 
+         * is run regularly and returns to its mainloop all the time. E.g. 
+         * Checkpointer, when active, is barely ever in its mainloop and thus 
+         * makes it hard to log regularly. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/xlog.h.html#LN158"><span class='Ref_to_Macro'>XLogStandbyInfoActive</span></a><span class='Parentheses'>() </span><span class='Operator'>&& !</span><a href="../../include/access/xlog.h.html#LN242"><span class='Ref_to_Proto'>RecoveryInProgress</span></a><span class='Parentheses'>())</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN319"></a>            <a href="../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>timeout</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN320"></a>            <a href="../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>now</span> <span class='Operator'>= </span><a href="../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <a href="bgwriter.c.html#LN319"><span class='Ref_To_Local'>timeout</span></a> <span class='Operator'>= </span><a href="../../include/utils/timestamp.h.html#LN55"><span class='Ref_to_Macro'>TimestampTzPlusMilliseconds</span></a><span class='Parentheses'>(</span><a href="bgwriter.c.html#LN85"><span class='Ref_to_Global_Var'>last_snapshot_ts</span></a><span class='Delimiter'>, 
+</span>                                                  <a href="bgwriter.c.html#LN78"><span class='Ref_to_Const'>LOG_SNAPSHOT_INTERVAL_MS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Only log if enough time has passed and interesting records have 
+             * been inserted since the last snapshot.  Have to compare with &LT;= 
+             * instead of &LT; because GetLastImportantRecPtr() points at the 
+             * start of a record, whereas last_snapshot_lsn points just past 
+             * the end of the record. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgwriter.c.html#LN320"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>&GT;= </span><a href="bgwriter.c.html#LN319"><span class='Ref_To_Local'>timeout</span></a> <span class='Operator'>&& 
+</span>                <a href="bgwriter.c.html#LN86"><span class='Ref_to_Global_Var'>last_snapshot_lsn</span></a> <span class='Operator'>&LT;= </span><a href="../../include/access/xlog.h.html#LN276"><span class='Ref_to_Proto'>GetLastImportantRecPtr</span></a><span class='Parentheses'>())</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="bgwriter.c.html#LN86"><span class='Ref_to_Global_Var'>last_snapshot_lsn</span></a> <span class='Operator'>= </span><a href="../../include/storage/standby.h.html#LN86"><span class='Ref_to_Proto'>LogStandbySnapshot</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>                <a href="bgwriter.c.html#LN85"><span class='Ref_to_Global_Var'>last_snapshot_ts</span></a> <span class='Operator'>= </span><a href="bgwriter.c.html#LN320"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if XLogStandbyInfoActive... &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* 
+         * Sleep until we are signaled or BgWriterDelay has elapsed. 
+         * 
+         * Note: the feedback control loop in BgBufferSync() expects that we 
+         * will call it every BgWriterDelay msec.  While it's not critical for 
+         * correctness that that be exact, the feedback loop might misbehave 
+         * if we stray too far from that.  Hence, avoid loading this process 
+         * down with latch events that are likely to happen frequently during 
+         * normal operation. 
+         */ 
+</span>        <a href="bgwriter.c.html#LN256"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                       <a href="bgwriter.c.html#LN66"><span class='Ref_to_Global_Var'>BgWriterDelay</span></a> <span class='Comment_Multi_Line'>/* ms */ </span><span class='Delimiter'>, </span><a href="../../include/pgstat.h.html#LN759"><span class='Ref_to_EnumConst'>WAIT_EVENT_BGWRITER_MAIN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If no latch event and BgBufferSync says nothing's happening, extend 
+         * the sleep in "hibernation" mode, where we sleep for much longer 
+         * than bgwriter_delay says.  Fewer wakeups save electricity.  When a 
+         * backend starts using buffers again, it will wake us up by setting 
+         * our latch.  Because the extra sleep will persist only as long as no 
+         * buffer allocations happen, this should not distort the behavior of 
+         * BgBufferSync's control loop too badly; essentially, it will think 
+         * that the system-wide idle interval didn't exist. 
+         * 
+         * There is a race condition here, in that a backend might allocate a 
+         * buffer between the time BgBufferSync saw the alloc count as zero 
+         * and the time we call StrategyNotifyBgWriter.  While it's not 
+         * critical that we not hibernate anyway, we try to reduce the odds of 
+         * that by only hibernating when BgBufferSync says nothing's happening 
+         * for two consecutive cycles.  Also, we mitigate any possible 
+         * consequences of a missed wakeup by not hibernating forever. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgwriter.c.html#LN256"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>== </span><a href="../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>&& </span><a href="bgwriter.c.html#LN255"><span class='Ref_To_Local'>can_hibernate</span></a> <span class='Operator'>&& </span><a href="bgwriter.c.html#LN113"><span class='Ref_To_Local'>prev_hibernate</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Ask for notification at next buffer allocation */ 
+</span>            <a href="../../include/storage/buf_internals.h.html#LN315"><span class='Ref_to_Proto'>StrategyNotifyBgWriter</span></a><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN108"><span class='Ref_to_Member'>pgprocno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* Sleep ... */ 
+</span>            <a href="bgwriter.c.html#LN256"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                           <a href="../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                           <a href="bgwriter.c.html#LN66"><span class='Ref_to_Global_Var'>BgWriterDelay</span></a> <span class='Operator'>* </span><a href="bgwriter.c.html#LN72"><span class='Ref_to_Const'>HIBERNATE_FACTOR</span></a><span class='Delimiter'>, 
+</span>                           <a href="../../include/pgstat.h.html#LN758"><span class='Ref_to_EnumConst'>WAIT_EVENT_BGWRITER_HIBERNATE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* Reset the notification request in case we timed out */ 
+</span>            <a href="../../include/storage/buf_internals.h.html#LN315"><span class='Ref_to_Proto'>StrategyNotifyBgWriter</span></a><span class='Parentheses'>(</span><span class='Operator'>-</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Emergency bailout if postmaster has died.  This is to avoid the 
+         * necessity for manual cleanup of all postmaster children. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgwriter.c.html#LN256"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../test/isolation/specscanner.l.html#LN91"><span class='Ref_to_Proto'>exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="bgwriter.c.html#LN113"><span class='Ref_To_Local'>prev_hibernate</span></a> <span class='Operator'>= </span><a href="bgwriter.c.html#LN255"><span class='Ref_To_Local'>can_hibernate</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end BackgroundWriterMain &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      signal handler routines 
+ * -------------------------------- 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * bg_quickdie() occurs when signalled SIGQUIT by the postmaster. 
+ * 
+ * Some backend has bought the farm, 
+ * so we need to stop what we're doing and exit. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN409"></a><span class='Declare_Function'>bg_quickdie</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN18"><span class='Ref_to_Macro'>PG_SETMASK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN22"><span class='Ref_to_Global_Var'>BlockSig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We DO NOT want to run proc_exit() callbacks -- we're here because 
+     * shared memory may be corrupted, so we don't want to try to clean up our 
+     * transaction.  Just nail the windows shut and get out of town.  Now that 
+     * there's an atexit callback to prevent third-party code from breaking 
+     * things by calling exit() directly, we have to reset the callbacks 
+     * explicitly to make this work as intended. 
+     */ 
+</span>    <a href="../../include/storage/ipc.h.html#LN72"><span class='Ref_to_Proto'>on_exit_reset</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Note we do exit(2) not exit(0).  This is to force the postmaster into a 
+     * system reset cycle if some idiot DBA sends a manual SIGQUIT to a random 
+     * backend.  This is necessary precisely because we don't clean up our 
+     * shared memory state.  (The "dead man switch" mechanism in pmsignal.c 
+     * should ensure the postmaster sees this as a crash, too, but no harm in 
+     * being doubly sure.) 
+     */ 
+</span>    <a href="../../test/isolation/specscanner.l.html#LN91"><span class='Ref_to_Proto'>exit</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end bg_quickdie &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* SIGHUP: set flag to re-read config file at next convenient time */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN436"></a><span class='Declare_Function'>BgSigHupHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN438"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="bgwriter.c.html#LN438"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGTERM: set flag to shutdown and exit */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN448"></a><span class='Declare_Function'>ReqShutdownHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN450"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="startup.c.html#LN41"><span class='Ref_to_Global_Var'>shutdown_requested</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="bgwriter.c.html#LN450"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGUSR1: used for latch wakeups */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN460"></a><span class='Declare_Function'>bgwriter_sigusr1_handler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN462"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/latch.h.html#LN173"><span class='Ref_to_Proto'>latch_sigusr1_handler</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="bgwriter.c.html#LN462"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

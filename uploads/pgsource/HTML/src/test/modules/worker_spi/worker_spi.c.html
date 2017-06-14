@@ -1,0 +1,438 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\test\modules\worker_spi\worker_spi.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\test\modules\worker_spi\worker_spi.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:26:14 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/* ------------------------------------------------------------------------- 
+ * 
+ * worker_spi.c 
+ *      Sample background worker code that demonstrates various coding 
+ *      patterns: establishing a database connection; starting and committing 
+ *      transactions; using GUC variables, and heeding SIGHUP to reread 
+ *      the configuration file; reporting to pg_stat_activity; using the 
+ *      process latch to sleep and exit in case of postmaster death. 
+ * 
+ * This code connects to a database, creates a schema and table, and summarizes 
+ * the numbers contained therein.  To see it working, insert an initial value 
+ * with "total" type and some initial value; then insert some other rows with 
+ * "delta" type.  Delta rows will be deleted by this worker and their values 
+ * aggregated into the total. 
+ * 
+ * Copyright (c) 2013-2017, PostgreSQL Global Development Group 
+ * 
+ * IDENTIFICATION 
+ *      src/test/modules/worker_spi/worker_spi.c 
+ * 
+ * ------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* These are always necessary for a bgworker */ 
+</span><span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/bgworker.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/latch.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/shmem.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* these headers are used by this particular worker's code */ 
+</span><span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/spi.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"fmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"lib/stringinfo.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/builtins.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/snapmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"tcop/utility.h"</span> 
+ 
+<a href="../../../include/fmgr.h.html#LN442"><span class='Ref_to_Const'>PG_MODULE_MAGIC</span></a><span class='Delimiter'>; 
+</span> 
+<a name="LN45"></a><span class='Declare_Prototype'>PG_FUNCTION_INFO_V1</span><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN371"><span class='Ref_to_Func'>worker_spi_launch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN47"></a><span class='Keyword'>void</span>        <span class='Declare_Prototype'>_PG_init</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN48"></a><span class='Keyword'>void</span>        <a href="worker_spi.c.html#LN160"><span class='Ref_to_Func'>worker_spi_main</span></a><span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>) </span><span class='Declare_Var'>pg_attribute_noreturn</span><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* flags set by signal handlers */ 
+</span><a name="LN51"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>got_sighup</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN52"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>got_sigterm</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* GUC variables */ 
+</span><a name="LN55"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>worker_spi_naptime</span> <span class='Operator'>= </span><span class='Number'>10</span><span class='Delimiter'>; 
+</span><a name="LN56"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>worker_spi_total_workers</span> <span class='Operator'>= </span><span class='Number'>2</span><span class='Delimiter'>; 
+</span> 
+ 
+<a name="LN59"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>worktable</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN61"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Member'>schema</span><span class='Delimiter'>; 
+</span><a name="LN62"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Member'>name</span><span class='Delimiter'>; 
+</span><a name="LN63"></a>} <span class='Declare_Typedef'>worktable</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Signal handler for SIGTERM 
+ *      Set a flag to let the main loop to terminate, and set our latch to wake 
+ *      it up. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN71"></a><span class='Declare_Function'>worker_spi_sigterm</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN73"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="worker_spi.c.html#LN52"><span class='Ref_to_Global_Var'>got_sigterm</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../../../backend/utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="worker_spi.c.html#LN73"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Signal handler for SIGHUP 
+ *      Set a flag to tell the main loop to reread the config file, and set 
+ *      our latch to wake it up. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN87"></a><span class='Declare_Function'>worker_spi_sighup</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN89"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="worker_spi.c.html#LN51"><span class='Ref_to_Global_Var'>got_sighup</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../../../backend/utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="worker_spi.c.html#LN89"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize workspace for a worker process: create the schema if it doesn't 
+ * already exist. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN102"></a><span class='Declare_Function'>initialize_worker_spi</span><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN59"><span class='Ref_to_Struct'>worktable</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>table</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN104"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>ret</span><span class='Delimiter'>; 
+</span><a name="LN105"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>ntup</span><span class='Delimiter'>; 
+</span><a name="LN106"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>isnull</span><span class='Delimiter'>; 
+</span><a name="LN107"></a>    <a href="../../../include/lib/stringinfo.h.html#LN34"><span class='Ref_to_Struct'>StringInfoData</span></a> <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xact.h.html#LN343"><span class='Ref_to_Proto'>SetCurrentStatementStartTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/executor/spi.h.html#LN79"><span class='Ref_to_Proto'>SPI_connect</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/snapmgr.h.html#LN73"><span class='Ref_to_Proto'>PushActiveSnapshot</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/snapmgr.h.html#LN63"><span class='Ref_to_Proto'>GetTransactionSnapshot</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/pgstat.h.html#LN1168"><span class='Ref_to_Proto'>pgstat_report_activity</span></a><span class='Parentheses'>(</span><a href="../../../include/pgstat.h.html#LN724"><span class='Ref_to_EnumConst'>STATE_RUNNING</span></a><span class='Delimiter'>, </span><span class='String'>"initializing spi_worker schema"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* XXX could we use CREATE SCHEMA IF NOT EXISTS? */ 
+</span>    <a href="../../../backend/lib/stringinfo.c.html#LN44"><span class='Ref_to_Func'>initStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN107"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../bin/pg_waldump/compat.c.html#LN69"><span class='Ref_to_Func'>appendStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN107"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='String'>"select count(*) from pg_namespace where nspname = '%s'"</span><span class='Delimiter'>, 
+</span>                     <a href="worker_spi.c.html#LN102"><span class='Ref_to_Parameter'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="worker_spi.c.html#LN104"><span class='Ref_To_Local'>ret</span></a> <span class='Operator'>= </span><a href="../../../include/executor/spi.h.html#LN81"><span class='Ref_to_Proto'>SPI_execute</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN107"><span class='Ref_To_Local'>buf</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN104"><span class='Ref_To_Local'>ret</span></a> <span class='Operator'>!= </span><a href="../../../include/executor/spi.h.html#LN53"><span class='Ref_to_Const'>SPI_OK_SELECT</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"SPI_execute failed: error code %d"</span><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN104"><span class='Ref_To_Local'>ret</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../backend/executor/spi.c.html#LN38"><span class='Ref_to_Global_Var'>SPI_processed</span></a> <span class='Operator'>!= </span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>        <a href="../../../backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"not a singleton result"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="worker_spi.c.html#LN105"><span class='Ref_To_Local'>ntup</span></a> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN610"><span class='Ref_to_Macro'>DatumGetInt64</span></a><span class='Parentheses'>(</span><a href="../../../include/executor/spi.h.html#LN126"><span class='Ref_to_Proto'>SPI_getbinval</span></a><span class='Parentheses'>(</span><a href="../../../backend/executor/spi.c.html#LN40"><span class='Ref_to_Global_Var'>SPI_tuptable</span></a><span class='Operator'>-&GT;</span><a href="../../../include/executor/spi.h.html#LN27"><span class='Ref_to_Member'>vals</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>], 
+</span>                                       <a href="../../../backend/executor/spi.c.html#LN40"><span class='Ref_to_Global_Var'>SPI_tuptable</span></a><span class='Operator'>-&GT;</span><a href="../../../include/executor/spi.h.html#LN26"><span class='Ref_to_Member'>tupdesc</span></a><span class='Delimiter'>, 
+</span>                                       <span class='Number'>1</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="worker_spi.c.html#LN106"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN106"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"null result"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN105"><span class='Ref_To_Local'>ntup</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../backend/lib/stringinfo.c.html#LN60"><span class='Ref_to_Func'>resetStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN107"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../bin/pg_waldump/compat.c.html#LN69"><span class='Ref_to_Func'>appendStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN107"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, 
+</span>                         <span class='String'>"CREATE SCHEMA \"%s\" "</span> 
+                         <span class='String'>"CREATE TABLE \"%s\" ("</span> 
+               <span class='String'>"        type text CHECK (type IN ('total', 'delta')), "</span> 
+                         <span class='String'>"      value   integer)"</span> 
+                  <span class='String'>"CREATE UNIQUE INDEX \"%s_unique_total\" ON \"%s\" (type) "</span> 
+                         <span class='String'>"WHERE type = 'total'"</span><span class='Delimiter'>, 
+</span>                       <a href="worker_spi.c.html#LN102"><span class='Ref_to_Parameter'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN102"><span class='Ref_to_Parameter'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN102"><span class='Ref_to_Parameter'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN102"><span class='Ref_to_Parameter'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* set statement start time */ 
+</span>        <a href="../../../include/access/xact.h.html#LN343"><span class='Ref_to_Proto'>SetCurrentStatementStartTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="worker_spi.c.html#LN104"><span class='Ref_To_Local'>ret</span></a> <span class='Operator'>= </span><a href="../../../include/executor/spi.h.html#LN81"><span class='Ref_to_Proto'>SPI_execute</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN107"><span class='Ref_To_Local'>buf</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN104"><span class='Ref_To_Local'>ret</span></a> <span class='Operator'>!= </span><a href="../../../include/executor/spi.h.html#LN52"><span class='Ref_to_Const'>SPI_OK_UTILITY</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"failed to create my schema"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if ntup==0 &raquo; </span> 
+ 
+    <a href="../../../include/executor/spi.h.html#LN80"><span class='Ref_to_Proto'>SPI_finish</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/snapmgr.h.html#LN76"><span class='Ref_to_Proto'>PopActiveSnapshot</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xact.h.html#LN349"><span class='Ref_to_Proto'>CommitTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/pgstat.h.html#LN1168"><span class='Ref_to_Proto'>pgstat_report_activity</span></a><span class='Parentheses'>(</span><a href="../../../include/pgstat.h.html#LN723"><span class='Ref_to_EnumConst'>STATE_IDLE</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end initialize_worker_spi &raquo; </span> 
+ 
+<span class='Keyword'>void 
+</span><a name="LN161"></a><span class='Declare_Function'>worker_spi_main</span><span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>main_arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN163"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>index</span> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN477"><span class='Ref_to_Macro'>DatumGetInt32</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN161"><span class='Ref_to_Parameter'>main_arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN164"></a>    <a href="worker_spi.c.html#LN59"><span class='Ref_to_Struct'>worktable</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>table</span><span class='Delimiter'>; 
+</span><a name="LN165"></a>    <a href="../../../include/lib/stringinfo.h.html#LN34"><span class='Ref_to_Struct'>StringInfoData</span></a> <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span><a name="LN166"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>name</span><span class='Delimiter'>[</span><span class='Number'>20</span><span class='Delimiter'>]; 
+</span> 
+    <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN59"><span class='Ref_to_Struct'>worktable</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port.h.html#LN170"><span class='Ref_to_Macro'>sprintf</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN166"><span class='Ref_To_Local'>name</span></a><span class='Delimiter'>, </span><span class='String'>"schema%d"</span><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN163"><span class='Ref_To_Local'>index</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN166"><span class='Ref_To_Local'>name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><span class='String'>"counted"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Establish signal handlers before unblocking signals. */ 
+</span>    <a href="../../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32.h.html#LN187"><span class='Ref_to_Const'>SIGHUP</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN86"><span class='Ref_to_Func'>worker_spi_sighup</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGTERM<span class='Delimiter'>, </span><a href="worker_spi.c.html#LN70"><span class='Ref_to_Func'>worker_spi_sigterm</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We're now ready to receive signals */ 
+</span>    <a href="../../../include/postmaster/bgworker.h.html#LN149"><span class='Ref_to_Proto'>BackgroundWorkerUnblockSignals</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Connect to our database */ 
+</span>    <a href="../../../include/postmaster/bgworker.h.html#LN142"><span class='Ref_to_Proto'>BackgroundWorkerInitializeConnection</span></a><span class='Parentheses'>(</span><span class='String'>"postgres"</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, </span><span class='String'>"%s initialized with %s.%s"</span><span class='Delimiter'>, 
+</span>         <a href="../../../backend/postmaster/postmaster.c.html#LN188"><span class='Ref_to_Global_Var'>MyBgworkerEntry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN101"><span class='Ref_to_Func'>initialize_worker_spi</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Quote identifiers passed to us.  Note that this must be done after 
+     * initialize_worker_spi, because that routine assumes the names are not 
+     * quoted. 
+     * 
+     * Note some memory might be leaked here. 
+     */ 
+</span>    <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a> <span class='Operator'>= </span><a href="../../../include/utils/builtins.h.html#LN77"><span class='Ref_to_Proto'>quote_identifier</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a> <span class='Operator'>= </span><a href="../../../include/utils/builtins.h.html#LN77"><span class='Ref_to_Proto'>quote_identifier</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../backend/lib/stringinfo.c.html#LN44"><span class='Ref_to_Func'>initStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN165"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../bin/pg_waldump/compat.c.html#LN69"><span class='Ref_to_Func'>appendStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN165"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, 
+</span>                     <span class='String'>"WITH deleted AS (DELETE "</span> 
+                     <span class='String'>"FROM %s.%s "</span> 
+                     <span class='String'>"WHERE type = 'delta' RETURNING value), "</span> 
+                     <span class='String'>"total AS (SELECT coalesce(sum(value), 0) as sum "</span> 
+                     <span class='String'>"FROM deleted) "</span> 
+                     <span class='String'>"UPDATE %s.%s "</span> 
+                     <span class='String'>"SET value = %s.value + total.sum "</span> 
+                     <span class='String'>"FROM total WHERE type = 'total' "</span> 
+                     <span class='String'>"RETURNING %s.value"</span><span class='Delimiter'>, 
+</span>                     <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, 
+</span>                     <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, 
+</span>                     <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, 
+</span>                     <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Main loop: do this until the SIGTERM handler tells us to terminate 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="worker_spi.c.html#LN52"><span class='Ref_to_Global_Var'>got_sigterm</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN218"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>ret</span><span class='Delimiter'>; 
+</span><a name="LN219"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Background workers mustn't call usleep() or any direct equivalent: 
+         * instead, they may wait on their process latch, which sleeps as 
+         * necessary, but is awakened if postmaster dies.  That way the 
+         * background process goes away immediately in an emergency. 
+         */ 
+</span>        <a href="worker_spi.c.html#LN219"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../../../backend/utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                       <a href="worker_spi.c.html#LN55"><span class='Ref_to_Global_Var'>worker_spi_naptime</span></a> <span class='Operator'>* </span><span class='Number'>1000L</span><span class='Delimiter'>, 
+</span>                       <a href="../../../include/pgstat.h.html#LN741"><span class='Ref_to_Const'>PG_WAIT_EXTENSION</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../../backend/utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* emergency bailout if postmaster has died */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN219"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../backend/storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * In case of a SIGHUP, just reload the configuration. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN51"><span class='Ref_to_Global_Var'>got_sighup</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="worker_spi.c.html#LN51"><span class='Ref_to_Global_Var'>got_sighup</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="../../../backend/utils/misc/guc-file.l.html#LN107"><span class='Ref_to_Func'>ProcessConfigFile</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/guc.h.html#LN71"><span class='Ref_to_EnumConst'>PGC_SIGHUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Start a transaction on which we can run queries.  Note that each 
+         * StartTransactionCommand() call should be preceded by a 
+         * SetCurrentStatementStartTimestamp() call, which sets both the time 
+         * for the statement we're about the run, and also the transaction 
+         * start time.  Also, each other query sent to SPI should probably be 
+         * preceded by SetCurrentStatementStartTimestamp(), so that statement 
+         * start time is always up to date. 
+         * 
+         * The SPI_connect() call lets us run queries through the SPI manager, 
+         * and the PushActiveSnapshot() call creates an "active" snapshot 
+         * which is necessary for queries to have MVCC data to work on. 
+         * 
+         * The pgstat_report_activity() call makes our activity visible 
+         * through the pgstat views. 
+         */ 
+</span>        <a href="../../../include/access/xact.h.html#LN343"><span class='Ref_to_Proto'>SetCurrentStatementStartTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/executor/spi.h.html#LN79"><span class='Ref_to_Proto'>SPI_connect</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/snapmgr.h.html#LN73"><span class='Ref_to_Proto'>PushActiveSnapshot</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/snapmgr.h.html#LN63"><span class='Ref_to_Proto'>GetTransactionSnapshot</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/pgstat.h.html#LN1168"><span class='Ref_to_Proto'>pgstat_report_activity</span></a><span class='Parentheses'>(</span><a href="../../../include/pgstat.h.html#LN724"><span class='Ref_to_EnumConst'>STATE_RUNNING</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN165"><span class='Ref_To_Local'>buf</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* We can now execute queries via SPI */ 
+</span>        <a href="worker_spi.c.html#LN218"><span class='Ref_To_Local'>ret</span></a> <span class='Operator'>= </span><a href="../../../include/executor/spi.h.html#LN81"><span class='Ref_to_Proto'>SPI_execute</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN165"><span class='Ref_To_Local'>buf</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN218"><span class='Ref_To_Local'>ret</span></a> <span class='Operator'>!= </span><a href="../../../include/executor/spi.h.html#LN61"><span class='Ref_to_Const'>SPI_OK_UPDATE_RETURNING</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"cannot select from table %s.%s: error code %d"</span><span class='Delimiter'>, 
+</span>                 <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN218"><span class='Ref_To_Local'>ret</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../backend/executor/spi.c.html#LN38"><span class='Ref_to_Global_Var'>SPI_processed</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN279"></a>            <span class='Keyword'>bool</span>        <span class='Declare_Local'>isnull</span><span class='Delimiter'>; 
+</span><a name="LN280"></a>            <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>val</span><span class='Delimiter'>; 
+</span> 
+            <a href="worker_spi.c.html#LN280"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN477"><span class='Ref_to_Macro'>DatumGetInt32</span></a><span class='Parentheses'>(</span><a href="../../../include/executor/spi.h.html#LN126"><span class='Ref_to_Proto'>SPI_getbinval</span></a><span class='Parentheses'>(</span><a href="../../../backend/executor/spi.c.html#LN40"><span class='Ref_to_Global_Var'>SPI_tuptable</span></a><span class='Operator'>-&GT;</span><a href="../../../include/executor/spi.h.html#LN27"><span class='Ref_to_Member'>vals</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>], 
+</span>                                              <a href="../../../backend/executor/spi.c.html#LN40"><span class='Ref_to_Global_Var'>SPI_tuptable</span></a><span class='Operator'>-&GT;</span><a href="../../../include/executor/spi.h.html#LN26"><span class='Ref_to_Member'>tupdesc</span></a><span class='Delimiter'>, 
+</span>                                              <span class='Number'>1</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="worker_spi.c.html#LN279"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="worker_spi.c.html#LN279"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>) 
+</span>                <a href="../../../backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, </span><span class='String'>"%s: count in %s.%s is now %d"</span><span class='Delimiter'>, 
+</span>                     <a href="../../../backend/postmaster/postmaster.c.html#LN188"><span class='Ref_to_Global_Var'>MyBgworkerEntry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Delimiter'>, 
+</span>                     <a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN61"><span class='Ref_to_Member'>schema</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN164"><span class='Ref_To_Local'>table</span></a><span class='Operator'>-&GT;</span><a href="worker_spi.c.html#LN62"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN280"><span class='Ref_To_Local'>val</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * And finish our transaction. 
+         */ 
+</span>        <a href="../../../include/executor/spi.h.html#LN80"><span class='Ref_to_Proto'>SPI_finish</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/snapmgr.h.html#LN76"><span class='Ref_to_Proto'>PopActiveSnapshot</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xact.h.html#LN349"><span class='Ref_to_Proto'>CommitTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../backend/postmaster/pgstat.c.html#LN810"><span class='Ref_to_Func'>pgstat_report_stat</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/pgstat.h.html#LN1168"><span class='Ref_to_Proto'>pgstat_report_activity</span></a><span class='Parentheses'>(</span><a href="../../../include/pgstat.h.html#LN723"><span class='Ref_to_EnumConst'>STATE_IDLE</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while !got_sigterm &raquo; </span> 
+ 
+    <a href="../../../backend/storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end worker_spi_main &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Entrypoint of this module. 
+ * 
+ * We register more than one worker process here, to demonstrate how that can 
+ * be done. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN311"></a><span class='Declare_Function'>_PG_init</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN313"></a>    <a href="../../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Declare_Local'>worker</span><span class='Delimiter'>; 
+</span><a name="LN314"></a>    <span class='Keyword'>unsigned int </span><span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* get the configuration */ 
+</span>    <a href="../../../include/utils/guc.h.html#LN291"><span class='Ref_to_Proto'>DefineCustomIntVariable</span></a><span class='Parentheses'>(</span><span class='String'>"worker_spi.naptime"</span><span class='Delimiter'>, 
+</span>                            <span class='String'>"Duration between each check (in seconds)."</span><span class='Delimiter'>, 
+</span>                            <span class='Null_Value'>NULL</span><span class='Delimiter'>, 
+</span>                            <span class='Operator'>&</span><a href="worker_spi.c.html#LN55"><span class='Ref_to_Global_Var'>worker_spi_naptime</span></a><span class='Delimiter'>, 
+</span>                            <span class='Number'>10</span><span class='Delimiter'>, 
+</span>                            <span class='Number'>1</span><span class='Delimiter'>, 
+</span>                            INT_MAX<span class='Delimiter'>, 
+</span>                            <a href="../../../include/utils/guc.h.html#LN71"><span class='Ref_to_EnumConst'>PGC_SIGHUP</span></a><span class='Delimiter'>, 
+</span>                            <span class='Number'>0</span><span class='Delimiter'>, 
+</span>                            <span class='Null_Value'>NULL</span><span class='Delimiter'>, 
+</span>                            <span class='Null_Value'>NULL</span><span class='Delimiter'>, 
+</span>                            <span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../backend/utils/init/miscinit.c.html#LN1416"><span class='Ref_to_Global_Var'>process_shared_preload_libraries_in_progress</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/guc.h.html#LN291"><span class='Ref_to_Proto'>DefineCustomIntVariable</span></a><span class='Parentheses'>(</span><span class='String'>"worker_spi.total_workers"</span><span class='Delimiter'>, 
+</span>                            <span class='String'>"Number of workers."</span><span class='Delimiter'>, 
+</span>                            <span class='Null_Value'>NULL</span><span class='Delimiter'>, 
+</span>                            <span class='Operator'>&</span><a href="worker_spi.c.html#LN56"><span class='Ref_to_Global_Var'>worker_spi_total_workers</span></a><span class='Delimiter'>, 
+</span>                            <span class='Number'>2</span><span class='Delimiter'>, 
+</span>                            <span class='Number'>1</span><span class='Delimiter'>, 
+</span>                            <span class='Number'>100</span><span class='Delimiter'>, 
+</span>                            <a href="../../../include/utils/guc.h.html#LN70"><span class='Ref_to_EnumConst'>PGC_POSTMASTER</span></a><span class='Delimiter'>, 
+</span>                            <span class='Number'>0</span><span class='Delimiter'>, 
+</span>                            <span class='Null_Value'>NULL</span><span class='Delimiter'>, 
+</span>                            <span class='Null_Value'>NULL</span><span class='Delimiter'>, 
+</span>                            <span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set up common data for all our workers */ 
+</span>    memset<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN51"><span class='Ref_to_Const'>BGWORKER_SHMEM_ACCESS</span></a> <span class='Operator'>| 
+</span>        <a href="../../../include/postmaster/bgworker.h.html#LN58"><span class='Ref_to_Const'>BGWORKER_BACKEND_DATABASE_CONNECTION</span></a><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN91"><span class='Ref_to_Member'>bgw_start_time</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN79"><span class='Ref_to_EnumConst'>BgWorkerStart_RecoveryFinished</span></a><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN83"><span class='Ref_to_Const'>BGW_NEVER_RESTART</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/port.h.html#LN170"><span class='Ref_to_Macro'>sprintf</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN93"><span class='Ref_to_Member'>bgw_library_name</span></a><span class='Delimiter'>, </span><span class='String'>"worker_spi"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port.h.html#LN170"><span class='Ref_to_Macro'>sprintf</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN94"><span class='Ref_to_Member'>bgw_function_name</span></a><span class='Delimiter'>, </span><span class='String'>"worker_spi_main"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Now fill in worker-specific data, and do the actual registrations. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN314"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="worker_spi.c.html#LN314"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="worker_spi.c.html#LN56"><span class='Ref_to_Global_Var'>worker_spi_total_workers</span></a><span class='Delimiter'>; </span><a href="worker_spi.c.html#LN314"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Delimiter'>, </span><a href="../../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Delimiter'>, </span><span class='String'>"worker %d"</span><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN314"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN95"><span class='Ref_to_Member'>bgw_main_arg</span></a> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN484"><span class='Ref_to_Macro'>Int32GetDatum</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN314"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/postmaster/bgworker.h.html#LN112"><span class='Ref_to_Proto'>RegisterBackgroundWorker</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN313"><span class='Ref_To_Local'>worker</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end _PG_init &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Dynamically launch an SPI worker. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN372"></a><span class='Declare_Function'>worker_spi_launch</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN374"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>i</span> <span class='Operator'>= </span><a href="../../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN375"></a>    <a href="../../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Declare_Local'>worker</span><span class='Delimiter'>; 
+</span><a name="LN376"></a>    <a href="../../../backend/postmaster/bgworker.c.html#LN104"><span class='Ref_to_Struct'>BackgroundWorkerHandle</span></a> <span class='Operator'>*</span><span class='Declare_Local'>handle</span><span class='Delimiter'>; 
+</span><a name="LN377"></a>    <a href="../../../include/postmaster/bgworker.h.html#LN100"><span class='Ref_to_Enum'>BgwHandleStatus</span></a> <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN378"></a>    <a href="../../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Local'>pid</span><span class='Delimiter'>; 
+</span> 
+    memset<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN51"><span class='Ref_to_Const'>BGWORKER_SHMEM_ACCESS</span></a> <span class='Operator'>| 
+</span>        <a href="../../../include/postmaster/bgworker.h.html#LN58"><span class='Ref_to_Const'>BGWORKER_BACKEND_DATABASE_CONNECTION</span></a><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN91"><span class='Ref_to_Member'>bgw_start_time</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN79"><span class='Ref_to_EnumConst'>BgWorkerStart_RecoveryFinished</span></a><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN83"><span class='Ref_to_Const'>BGW_NEVER_RESTART</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/port.h.html#LN170"><span class='Ref_to_Macro'>sprintf</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN93"><span class='Ref_to_Member'>bgw_library_name</span></a><span class='Delimiter'>, </span><span class='String'>"worker_spi"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port.h.html#LN170"><span class='Ref_to_Macro'>sprintf</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN94"><span class='Ref_to_Member'>bgw_function_name</span></a><span class='Delimiter'>, </span><span class='String'>"worker_spi_main"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Delimiter'>, </span><a href="../../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Delimiter'>, </span><span class='String'>"worker %d"</span><span class='Delimiter'>, </span><a href="worker_spi.c.html#LN374"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN95"><span class='Ref_to_Member'>bgw_main_arg</span></a> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN484"><span class='Ref_to_Macro'>Int32GetDatum</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN374"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* set bgw_notify_pid so that we can use WaitForBackgroundWorkerStartup */ 
+</span>    <a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>= </span><a href="../../../backend/utils/init/globals.c.html#LN38"><span class='Ref_to_Global_Var'>MyProcPid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/postmaster/bgworker.h.html#LN115"><span class='Ref_to_Proto'>RegisterDynamicBackgroundWorker</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="worker_spi.c.html#LN375"><span class='Ref_To_Local'>worker</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="worker_spi.c.html#LN376"><span class='Ref_To_Local'>handle</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/fmgr.h.html#LN304"><span class='Ref_to_Macro'>PG_RETURN_NULL</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="worker_spi.c.html#LN377"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN121"><span class='Ref_to_Proto'>WaitForBackgroundWorkerStartup</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN376"><span class='Ref_To_Local'>handle</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="worker_spi.c.html#LN378"><span class='Ref_To_Local'>pid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN377"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>== </span><a href="../../../include/postmaster/bgworker.h.html#LN104"><span class='Ref_to_EnumConst'>BGWH_STOPPED</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_RESOURCES<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../../backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not start background process"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>               <a href="../../../backend/utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"More details may be available in the server log."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="worker_spi.c.html#LN377"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>== </span><a href="../../../include/postmaster/bgworker.h.html#LN105"><span class='Ref_to_EnumConst'>BGWH_POSTMASTER_DIED</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_RESOURCES<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>              <a href="../../../backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"cannot start background processes without postmaster"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../../backend/utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Kill all remaining database processes and restart the database."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN377"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>== </span><a href="../../../include/postmaster/bgworker.h.html#LN102"><span class='Ref_to_EnumConst'>BGWH_STARTED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><a href="worker_spi.c.html#LN378"><span class='Ref_To_Local'>pid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end worker_spi_launch &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

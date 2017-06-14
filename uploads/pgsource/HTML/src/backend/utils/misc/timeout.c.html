@@ -1,0 +1,697 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\utils\misc\timeout.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\utils\misc\timeout.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:58 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * timeout.c 
+ *    Routines to multiplex SIGALRM interrupts for multiple timeout reasons. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/utils/misc/timeout.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/time.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/timeout.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/timestamp.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* Data about any one timeout reason */ 
+</span><a name="LN25"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>timeout_params</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN27"></a>    <a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a>   <span class='Declare_Member'>index</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* identifier of timeout reason */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* volatile because it may be changed from the signal handler */ 
+</span><a name="LN30"></a>    <span class='Keyword'>volatile bool </span><span class='Declare_Member'>indicator</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* true if timeout has occurred */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* callback function for timeout, or NULL if timeout not registered */ 
+</span><a name="LN33"></a>    <a href="../../../include/utils/timeout.h.html#LN40"><span class='Ref_to_Typedef'>timeout_handler_proc</span></a> <span class='Declare_Member'>timeout_handler</span><span class='Delimiter'>; 
+</span> 
+<a name="LN35"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Member'>start_time</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* time that timeout was last activated */ 
+</span><a name="LN36"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Member'>fin_time</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* time it is, or was last, due to fire */ 
+</span><a name="LN37"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>timeout_params</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * List of possible timeout reasons in the order of enum TimeoutId. 
+ */ 
+</span><a name="LN42"></a><span class='Keyword'>static </span><a href="timeout.c.html#LN25"><span class='Ref_to_Struct'>timeout_params</span></a> <span class='Declare_Var'>all_timeouts</span><span class='Delimiter'>[</span><a href="../../../include/utils/timeout.h.html#LN36"><span class='Ref_to_EnumConst'>MAX_TIMEOUTS</span></a><span class='Delimiter'>]; 
+</span><a name="LN43"></a><span class='Keyword'>static bool </span><span class='Declare_Var'>all_timeouts_initialized</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * List of active timeouts ordered by their fin_time and priority. 
+ * This list is subject to change by the interrupt handler, so it's volatile. 
+ */ 
+</span><a name="LN49"></a><span class='Keyword'>static volatile int </span><span class='Declare_Var'>num_active_timeouts</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN50"></a><span class='Keyword'>static </span><a href="timeout.c.html#LN25"><span class='Ref_to_Struct'>timeout_params</span></a> <span class='Operator'>*</span><span class='Keyword'>volatile </span><span class='Declare_Var'>active_timeouts</span><span class='Delimiter'>[</span><a href="../../../include/utils/timeout.h.html#LN36"><span class='Ref_to_EnumConst'>MAX_TIMEOUTS</span></a><span class='Delimiter'>]; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Flag controlling whether the signal handler is allowed to do anything. 
+ * We leave this "false" when we're not expecting interrupts, just in case. 
+ * 
+ * Note that we don't bother to reset any pending timer interrupt when we 
+ * disable the signal handler; it's not really worth the cycles to do so, 
+ * since the probability of the interrupt actually occurring while we have 
+ * it disabled is low.  See comments in schedule_alarm() about that. 
+ */ 
+</span><a name="LN61"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>alarm_enabled</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<a name="LN63"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>disable_alarm</span><span class='Parentheses'>() (</span><a href="timeout.c.html#LN61"><span class='Ref_to_Global_Var'>alarm_enabled</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Parentheses'>) 
+</span><a name="LN64"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>enable_alarm</span><span class='Parentheses'>()</span>  <span class='Parentheses'>(</span><a href="timeout.c.html#LN61"><span class='Ref_to_Global_Var'>alarm_enabled</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Parentheses'>) 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/***************************************************************************** 
+ * Internal helper functions 
+ * 
+ * For all of these, it is caller's responsibility to protect them from 
+ * interruption by the signal handler.  Generally, call disable_alarm() 
+ * first to prevent interruption, then update state, and last call 
+ * schedule_alarm(), which will re-enable the signal handler if needed. 
+ *****************************************************************************/ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Find the index of a given timeout reason in the active array. 
+ * If it's not there, return -1. 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN81"></a><span class='Declare_Function'>find_active_timeout</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN83"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN83"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="timeout.c.html#LN83"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN83"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN83"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span><a href="timeout.c.html#LN27"><span class='Ref_to_Member'>index</span></a> <span class='Operator'>== </span><a href="timeout.c.html#LN81"><span class='Ref_to_Parameter'>id</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <a href="timeout.c.html#LN83"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Insert specified timeout reason into the list of active timeouts 
+ * at the given index. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN99"></a><span class='Declare_Function'>insert_timeout</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>index</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN101"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN99"><span class='Ref_to_Parameter'>index</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="timeout.c.html#LN99"><span class='Ref_to_Parameter'>index</span></a> <span class='Operator'>&GT; </span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"timeout index %d out of range 0..%d"</span><span class='Delimiter'>, </span><a href="timeout.c.html#LN99"><span class='Ref_to_Parameter'>index</span></a><span class='Delimiter'>, 
+</span>             <a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN101"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="timeout.c.html#LN101"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&GT;= </span><a href="timeout.c.html#LN99"><span class='Ref_to_Parameter'>index</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN101"><span class='Ref_To_Local'>i</span></a><span class='Operator'>--</span><span class='Parentheses'>) 
+</span>        <a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN101"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN101"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+    <a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN99"><span class='Ref_to_Parameter'>index</span></a><span class='Delimiter'>] </span><span class='Operator'>= &</span><a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN99"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]; 
+</span> 
+    <a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Remove the index'th element from the timeout list. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN119"></a><span class='Declare_Function'>remove_timeout_index</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>index</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN121"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN119"><span class='Ref_to_Parameter'>index</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="timeout.c.html#LN119"><span class='Ref_to_Parameter'>index</span></a> <span class='Operator'>&GT;= </span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"timeout index %d out of range 0..%d"</span><span class='Delimiter'>, </span><a href="timeout.c.html#LN119"><span class='Ref_to_Parameter'>index</span></a><span class='Delimiter'>, 
+</span>             <a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN121"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="timeout.c.html#LN119"><span class='Ref_to_Parameter'>index</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="timeout.c.html#LN121"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN121"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN121"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN121"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+    <a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Enable the specified timeout reason 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN137"></a><span class='Declare_Function'>enable_timeout</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>now</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>fin_time</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN139"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Assert request is sane */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="timeout.c.html#LN43"><span class='Ref_to_Global_Var'>all_timeouts_initialized</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN33"><span class='Ref_to_Member'>timeout_handler</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If this timeout was already active, momentarily disable it.  We 
+     * interpret the call as a directive to reschedule the timeout. 
+     */ 
+</span>    <a href="timeout.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="timeout.c.html#LN80"><span class='Ref_to_Func'>find_active_timeout</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>id</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="timeout.c.html#LN118"><span class='Ref_to_Func'>remove_timeout_index</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Find out the index where to insert the new timeout.  We sort by 
+     * fin_time, and for equal fin_time by priority. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="timeout.c.html#LN139"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN159"></a>        <a href="timeout.c.html#LN25"><span class='Ref_to_Struct'>timeout_params</span></a> <span class='Operator'>*</span><span class='Declare_Local'>old_timeout</span> <span class='Operator'>= </span><a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>fin_time</span></a> <span class='Operator'>&LT; </span><a href="timeout.c.html#LN159"><span class='Ref_To_Local'>old_timeout</span></a><span class='Operator'>-&GT;</span><a href="timeout.c.html#LN36"><span class='Ref_to_Member'>fin_time</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>fin_time</span></a> <span class='Operator'>== </span><a href="timeout.c.html#LN159"><span class='Ref_To_Local'>old_timeout</span></a><span class='Operator'>-&GT;</span><a href="timeout.c.html#LN36"><span class='Ref_to_Member'>fin_time</span></a> <span class='Operator'>&& </span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>id</span></a> <span class='Operator'>&LT; </span><a href="timeout.c.html#LN159"><span class='Ref_To_Local'>old_timeout</span></a><span class='Operator'>-&GT;</span><a href="timeout.c.html#LN27"><span class='Ref_to_Member'>index</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Mark the timeout active, and insert it into the active list. 
+     */ 
+</span>    <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN30"><span class='Ref_to_Member'>indicator</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN35"><span class='Ref_to_Member'>start_time</span></a> <span class='Operator'>= </span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>now</span></a><span class='Delimiter'>; 
+</span>    <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN36"><span class='Ref_to_Member'>fin_time</span></a> <span class='Operator'>= </span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>fin_time</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="timeout.c.html#LN98"><span class='Ref_to_Func'>insert_timeout</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN137"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN139"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end enable_timeout &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Schedule alarm for the next active timeout, if any 
+ * 
+ * We assume the caller has obtained the current time, or a close-enough 
+ * approximation. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN184"></a><span class='Declare_Function'>schedule_alarm</span><span class='Parentheses'>(</span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>now</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN188"></a>        <span class='Control'>struct</span> <a href="../../../include/port/win32.h.html#LN218"><span class='Ref_to_Struct'>itimerval</span></a> <span class='Declare_Local'>timeval</span><span class='Delimiter'>; 
+</span><a name="LN189"></a>        <span class='Keyword'>long</span>        <span class='Declare_Local'>secs</span><span class='Delimiter'>; 
+</span><a name="LN190"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>usecs</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="timeout.c.html#LN188"><span class='Ref_To_Local'>timeval</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Control'>struct</span> <a href="../../../include/port/win32.h.html#LN218"><span class='Ref_to_Struct'>itimerval</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Get the time remaining till the nearest pending timeout */ 
+</span>        <a href="../../../include/utils/timestamp.h.html#LN72"><span class='Ref_to_Proto'>TimestampDifference</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN184"><span class='Ref_to_Parameter'>now</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span><a href="timeout.c.html#LN36"><span class='Ref_to_Member'>fin_time</span></a><span class='Delimiter'>, 
+</span>                            <span class='Operator'>&</span><a href="timeout.c.html#LN189"><span class='Ref_To_Local'>secs</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="timeout.c.html#LN190"><span class='Ref_To_Local'>usecs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * It's possible that the difference is less than a microsecond; 
+         * ensure we don't cancel, rather than set, the interrupt. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN189"><span class='Ref_To_Local'>secs</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="timeout.c.html#LN190"><span class='Ref_To_Local'>usecs</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="timeout.c.html#LN190"><span class='Ref_To_Local'>usecs</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+        <a href="timeout.c.html#LN188"><span class='Ref_To_Local'>timeval</span></a><span class='Operator'>.</span><a href="../../../include/port/win32.h.html#LN221"><span class='Ref_to_Member'>it_value</span></a><span class='Operator'>.</span>tv_sec <span class='Operator'>= </span><a href="timeout.c.html#LN189"><span class='Ref_To_Local'>secs</span></a><span class='Delimiter'>; 
+</span>        <a href="timeout.c.html#LN188"><span class='Ref_To_Local'>timeval</span></a><span class='Operator'>.</span><a href="../../../include/port/win32.h.html#LN221"><span class='Ref_to_Member'>it_value</span></a><span class='Operator'>.</span>tv_usec <span class='Operator'>= </span><a href="timeout.c.html#LN190"><span class='Ref_To_Local'>usecs</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * We must enable the signal handler before calling setitimer(); if we 
+         * did it in the other order, we'd have a race condition wherein the 
+         * interrupt could occur before we can set alarm_enabled, so that the 
+         * signal handler would fail to do anything. 
+         * 
+         * Because we didn't bother to reset the timer in disable_alarm(), 
+         * it's possible that a previously-set interrupt will fire between 
+         * enable_alarm() and setitimer().  This is safe, however.  There are 
+         * two possible outcomes: 
+         * 
+         * 1. The signal handler finds nothing to do (because the nearest 
+         * timeout event is still in the future).  It will re-set the timer 
+         * and return.  Then we'll overwrite the timer value with a new one. 
+         * This will mean that the timer fires a little later than we 
+         * intended, but only by the amount of time it takes for the signal 
+         * handler to do nothing useful, which shouldn't be much. 
+         * 
+         * 2. The signal handler executes and removes one or more timeout 
+         * events.  When it returns, either the queue is now empty or the 
+         * frontmost event is later than the one we looked at above.  So we'll 
+         * overwrite the timer value with one that is too soon (plus or minus 
+         * the signal handler's execution time), causing a useless interrupt 
+         * to occur.  But the handler will then re-set the timer and 
+         * everything will still work as expected. 
+         * 
+         * Since these cases are of very low probability (the window here 
+         * being quite narrow), it's not worth adding cycles to the mainline 
+         * code to prevent occasional wasted interrupts. 
+         */ 
+</span>        <a href="timeout.c.html#LN64"><span class='Ref_to_Macro'>enable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Set the alarm timer */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../port/win32/timer.c.html#LN84"><span class='Ref_to_Func'>setitimer</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32.h.html#LN217"><span class='Ref_to_Const'>ITIMER_REAL</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="timeout.c.html#LN188"><span class='Ref_To_Local'>timeval</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"could not enable SIGALRM timer: %m"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if num_active_timeouts&GT;0 &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end schedule_alarm &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/***************************************************************************** 
+ * Signal handler 
+ *****************************************************************************/ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Signal handler for SIGALRM 
+ * 
+ * Process any active timeout reasons and then reschedule the interrupt 
+ * as needed. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN258"></a><span class='Declare_Function'>handle_sig_alarm</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN260"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Bump the holdoff counter, to make sure nothing we call will process 
+     * interrupts directly. No timeout handler should do that, but these 
+     * failures are hard to debug, so better be sure. 
+     */ 
+</span>    <a href="../../../include/miscadmin.h.html#LN116"><span class='Ref_to_Macro'>HOLD_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * SIGALRM is always cause for waking anything waiting on the process 
+     * latch. 
+     */ 
+</span>    <a href="../../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Fire any pending timeouts, but only if we're enabled to do so. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN61"><span class='Ref_to_Global_Var'>alarm_enabled</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Disable alarms, just in case this platform allows signal handlers 
+         * to interrupt themselves.  schedule_alarm() will re-enable if 
+         * appropriate. 
+         */ 
+</span>        <a href="timeout.c.html#LN63"><span class='Ref_to_Macro'>disable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN289"></a>            <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>now</span> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* While the first pending timeout has been reached ... */ 
+</span>            <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>                   <a href="timeout.c.html#LN289"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>&GT;= </span><a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span><a href="timeout.c.html#LN36"><span class='Ref_to_Member'>fin_time</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN295"></a>                <a href="timeout.c.html#LN25"><span class='Ref_to_Struct'>timeout_params</span></a> <span class='Operator'>*</span><span class='Declare_Local'>this_timeout</span> <span class='Operator'>= </span><a href="timeout.c.html#LN50"><span class='Ref_to_Global_Var'>active_timeouts</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]; 
+</span> 
+                <span class='Comment_Multi_Line'>/* Remove it from the active list */ 
+</span>                <a href="timeout.c.html#LN118"><span class='Ref_to_Func'>remove_timeout_index</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* Mark it as fired */ 
+</span>                <a href="timeout.c.html#LN295"><span class='Ref_To_Local'>this_timeout</span></a><span class='Operator'>-&GT;</span><a href="timeout.c.html#LN30"><span class='Ref_to_Member'>indicator</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* And call its handler function */ 
+</span>                <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="timeout.c.html#LN295"><span class='Ref_To_Local'>this_timeout</span></a><span class='Operator'>-&GT;</span><a href="timeout.c.html#LN33"><span class='Ref_to_Member'>timeout_handler</span></a><span class='Parentheses'>) ()</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * The handler might not take negligible time (CheckDeadLock 
+                 * for instance isn't too cheap), so let's update our idea of 
+                 * "now" after each one. 
+                 */ 
+</span>                <a href="timeout.c.html#LN289"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while num_active_timeouts&GT;0... &raquo; </span> 
+ 
+            <span class='Comment_Multi_Line'>/* Done firing timeouts, so reschedule next interrupt if any */ 
+</span>            <a href="timeout.c.html#LN183"><span class='Ref_to_Func'>schedule_alarm</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN289"><span class='Ref_To_Local'>now</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if num_active_timeouts&GT;0 &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if alarm_enabled &raquo; </span> 
+ 
+    <a href="../../../include/miscadmin.h.html#LN118"><span class='Ref_to_Macro'>RESUME_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="timeout.c.html#LN260"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end handle_sig_alarm &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/***************************************************************************** 
+ * Public API 
+ *****************************************************************************/ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize timeout module. 
+ * 
+ * This must be called in every process that wants to use timeouts. 
+ * 
+ * If the process was forked from another one that was also using this 
+ * module, be sure to call this before re-enabling signals; else handlers 
+ * meant to run in the parent process might get invoked in this one. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN339"></a><span class='Declare_Function'>InitializeTimeouts</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN341"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize, or re-initialize, all local state */ 
+</span>    <a href="timeout.c.html#LN63"><span class='Ref_to_Macro'>disable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN341"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="timeout.c.html#LN341"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="../../../include/utils/timeout.h.html#LN36"><span class='Ref_to_EnumConst'>MAX_TIMEOUTS</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN341"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN341"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN27"><span class='Ref_to_Member'>index</span></a> <span class='Operator'>= </span><a href="timeout.c.html#LN341"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>        <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN341"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN30"><span class='Ref_to_Member'>indicator</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN341"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN33"><span class='Ref_to_Member'>timeout_handler</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN341"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN35"><span class='Ref_to_Member'>start_time</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN341"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN36"><span class='Ref_to_Member'>fin_time</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="timeout.c.html#LN43"><span class='Ref_to_Global_Var'>all_timeouts_initialized</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now establish the signal handler */ 
+</span>    <a href="../../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32.h.html#LN193"><span class='Ref_to_Const'>SIGALRM</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN257"><span class='Ref_to_Func'>handle_sig_alarm</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end InitializeTimeouts &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Register a timeout reason 
+ * 
+ * For predefined timeouts, this just registers the callback function. 
+ * 
+ * For user-defined timeouts, pass id == USER_TIMEOUT; we then allocate and 
+ * return a timeout ID. 
+ */ 
+</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> 
+<a name="LN372"></a><span class='Declare_Function'>RegisterTimeout</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Delimiter'>, </span><a href="../../../include/utils/timeout.h.html#LN40"><span class='Ref_to_Typedef'>timeout_handler_proc</span></a> <span class='Declare_Parameter'>handler</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="timeout.c.html#LN43"><span class='Ref_to_Global_Var'>all_timeouts_initialized</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* There's no need to disable the signal handler here. */ 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>id</span></a> <span class='Operator'>&GT;= </span><a href="../../../include/utils/timeout.h.html#LN34"><span class='Ref_to_EnumConst'>USER_TIMEOUT</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Allocate a user-defined timeout reason */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>id</span></a> <span class='Operator'>= </span><a href="../../../include/utils/timeout.h.html#LN34"><span class='Ref_to_EnumConst'>USER_TIMEOUT</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>id</span></a> <span class='Operator'>&LT; </span><a href="../../../include/utils/timeout.h.html#LN36"><span class='Ref_to_EnumConst'>MAX_TIMEOUTS</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>id</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN33"><span class='Ref_to_Member'>timeout_handler</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>id</span></a> <span class='Operator'>&GT;= </span><a href="../../../include/utils/timeout.h.html#LN36"><span class='Ref_to_EnumConst'>MAX_TIMEOUTS</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_CONFIGURATION_LIMIT_EXCEEDED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"cannot add more timeout reasons"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN33"><span class='Ref_to_Member'>timeout_handler</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN33"><span class='Ref_to_Member'>timeout_handler</span></a> <span class='Operator'>= </span><a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>handler</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="timeout.c.html#LN372"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RegisterTimeout &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Reschedule any pending SIGALRM interrupt. 
+ * 
+ * This can be used during error recovery in case query cancel resulted in loss 
+ * of a SIGALRM event (due to longjmp'ing out of handle_sig_alarm before it 
+ * could do anything).  But note it's not necessary if any of the public 
+ * enable_ or disable_timeout functions are called in the same area, since 
+ * those all do schedule_alarm() internally if needed. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN407"></a><span class='Declare_Function'>reschedule_timeouts</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* For flexibility, allow this to be called before we're initialized. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="timeout.c.html#LN43"><span class='Ref_to_Global_Var'>all_timeouts_initialized</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Disable timeout interrupts for safety. */ 
+</span>    <a href="timeout.c.html#LN63"><span class='Ref_to_Macro'>disable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Reschedule the interrupt, if any timeouts remain active. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="timeout.c.html#LN183"><span class='Ref_to_Func'>schedule_alarm</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Enable the specified timeout to fire after the specified delay. 
+ * 
+ * Delay is given in milliseconds. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN427"></a><span class='Declare_Function'>enable_timeout_after</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>delay_ms</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN429"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>now</span><span class='Delimiter'>; 
+</span><a name="LN430"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>fin_time</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Disable timeout interrupts for safety. */ 
+</span>    <a href="timeout.c.html#LN63"><span class='Ref_to_Macro'>disable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Queue the timeout at the appropriate time. */ 
+</span>    <a href="timeout.c.html#LN429"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="timeout.c.html#LN430"><span class='Ref_To_Local'>fin_time</span></a> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN55"><span class='Ref_to_Macro'>TimestampTzPlusMilliseconds</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN429"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN427"><span class='Ref_to_Parameter'>delay_ms</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="timeout.c.html#LN136"><span class='Ref_to_Func'>enable_timeout</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN427"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN429"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN430"><span class='Ref_To_Local'>fin_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Set the timer interrupt. */ 
+</span>    <a href="timeout.c.html#LN183"><span class='Ref_to_Func'>schedule_alarm</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN429"><span class='Ref_To_Local'>now</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Enable the specified timeout to fire at the specified time. 
+ * 
+ * This is provided to support cases where there's a reason to calculate 
+ * the timeout by reference to some point other than "now".  If there isn't, 
+ * use enable_timeout_after(), to avoid calling GetCurrentTimestamp() twice. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN452"></a><span class='Declare_Function'>enable_timeout_at</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>fin_time</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN454"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>now</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Disable timeout interrupts for safety. */ 
+</span>    <a href="timeout.c.html#LN63"><span class='Ref_to_Macro'>disable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Queue the timeout at the appropriate time. */ 
+</span>    <a href="timeout.c.html#LN454"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="timeout.c.html#LN136"><span class='Ref_to_Func'>enable_timeout</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN452"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN454"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN452"><span class='Ref_to_Parameter'>fin_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Set the timer interrupt. */ 
+</span>    <a href="timeout.c.html#LN183"><span class='Ref_to_Func'>schedule_alarm</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN454"><span class='Ref_To_Local'>now</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Enable multiple timeouts at once. 
+ * 
+ * This works like calling enable_timeout_after() and/or enable_timeout_at() 
+ * multiple times.  Use this to reduce the number of GetCurrentTimestamp() 
+ * and setitimer() calls needed to establish multiple timeouts. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN475"></a><span class='Declare_Function'>enable_timeouts</span><span class='Parentheses'>(</span><span class='Keyword'>const </span><a href="../../../include/utils/timeout.h.html#LN51"><span class='Ref_to_Typedef'>EnableTimeoutParams</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>timeouts</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>count</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN477"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>now</span><span class='Delimiter'>; 
+</span><a name="LN478"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Disable timeout interrupts for safety. */ 
+</span>    <a href="timeout.c.html#LN63"><span class='Ref_to_Macro'>disable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Queue the timeout(s) at the appropriate times. */ 
+</span>    <a href="timeout.c.html#LN477"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN478"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="timeout.c.html#LN478"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="timeout.c.html#LN475"><span class='Ref_to_Parameter'>count</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN478"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN488"></a>        <a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a>   <span class='Declare_Local'>id</span> <span class='Operator'>= </span><a href="timeout.c.html#LN475"><span class='Ref_to_Parameter'>timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN478"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/utils/timeout.h.html#LN53"><span class='Ref_to_Member'>id</span></a><span class='Delimiter'>; 
+</span><a name="LN489"></a>        <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>fin_time</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN475"><span class='Ref_to_Parameter'>timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN478"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/utils/timeout.h.html#LN54"><span class='Ref_to_Member'>type</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>case</span> <a href="../../../include/utils/timeout.h.html#LN47"><span class='Ref_to_EnumConst'>TMPARAM_AFTER</span></a><span class='Operator'>: 
+</span>                <a href="timeout.c.html#LN489"><span class='Ref_To_Local'>fin_time</span></a> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN55"><span class='Ref_to_Macro'>TimestampTzPlusMilliseconds</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN477"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, 
+</span>                                                       <a href="timeout.c.html#LN475"><span class='Ref_to_Parameter'>timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN478"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/utils/timeout.h.html#LN55"><span class='Ref_to_Member'>delay_ms</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="timeout.c.html#LN136"><span class='Ref_to_Func'>enable_timeout</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN488"><span class='Ref_To_Local'>id</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN477"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN489"><span class='Ref_To_Local'>fin_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>case</span> <a href="../../../include/utils/timeout.h.html#LN48"><span class='Ref_to_EnumConst'>TMPARAM_AT</span></a><span class='Operator'>: 
+</span>                <a href="timeout.c.html#LN136"><span class='Ref_to_Func'>enable_timeout</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN488"><span class='Ref_To_Local'>id</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN477"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, </span><a href="timeout.c.html#LN475"><span class='Ref_to_Parameter'>timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN478"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/utils/timeout.h.html#LN56"><span class='Ref_to_Member'>fin_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>default</span><span class='Operator'>: 
+</span>                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unrecognized timeout type %d"</span><span class='Delimiter'>, 
+</span>                     <span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="timeout.c.html#LN475"><span class='Ref_to_Parameter'>timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN478"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/utils/timeout.h.html#LN54"><span class='Ref_to_Member'>type</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;count;i++ &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Set the timer interrupt. */ 
+</span>    <a href="timeout.c.html#LN183"><span class='Ref_to_Func'>schedule_alarm</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN477"><span class='Ref_To_Local'>now</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end enable_timeouts &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Cancel the specified timeout. 
+ * 
+ * The timeout's I've-been-fired indicator is reset, 
+ * unless keep_indicator is true. 
+ * 
+ * When a timeout is canceled, any other active timeout remains in force. 
+ * It's not an error to disable a timeout that is not enabled. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN524"></a><span class='Declare_Function'>disable_timeout</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>keep_indicator</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN526"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Assert request is sane */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="timeout.c.html#LN43"><span class='Ref_to_Global_Var'>all_timeouts_initialized</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN524"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN33"><span class='Ref_to_Member'>timeout_handler</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Disable timeout interrupts for safety. */ 
+</span>    <a href="timeout.c.html#LN63"><span class='Ref_to_Macro'>disable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Find the timeout and remove it from the active list. */ 
+</span>    <a href="timeout.c.html#LN526"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="timeout.c.html#LN80"><span class='Ref_to_Func'>find_active_timeout</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN524"><span class='Ref_to_Parameter'>id</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN526"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="timeout.c.html#LN118"><span class='Ref_to_Func'>remove_timeout_index</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN526"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Mark it inactive, whether it was active or not. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="timeout.c.html#LN524"><span class='Ref_to_Parameter'>keep_indicator</span></a><span class='Parentheses'>) 
+</span>        <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN524"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN30"><span class='Ref_to_Member'>indicator</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Reschedule the interrupt, if any timeouts remain active. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="timeout.c.html#LN183"><span class='Ref_to_Func'>schedule_alarm</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end disable_timeout &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Cancel multiple timeouts at once. 
+ * 
+ * The timeouts' I've-been-fired indicators are reset, 
+ * unless timeouts[i].keep_indicator is true. 
+ * 
+ * This works like calling disable_timeout() multiple times. 
+ * Use this to reduce the number of GetCurrentTimestamp() 
+ * and setitimer() calls needed to cancel multiple timeouts. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN560"></a><span class='Declare_Function'>disable_timeouts</span><span class='Parentheses'>(</span><span class='Keyword'>const </span><a href="../../../include/utils/timeout.h.html#LN62"><span class='Ref_to_Typedef'>DisableTimeoutParams</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>timeouts</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>count</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN562"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="timeout.c.html#LN43"><span class='Ref_to_Global_Var'>all_timeouts_initialized</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Disable timeout interrupts for safety. */ 
+</span>    <a href="timeout.c.html#LN63"><span class='Ref_to_Macro'>disable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Cancel the timeout(s). */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN562"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="timeout.c.html#LN562"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="timeout.c.html#LN560"><span class='Ref_to_Parameter'>count</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN562"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN572"></a>        <a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a>   <span class='Declare_Local'>id</span> <span class='Operator'>= </span><a href="timeout.c.html#LN560"><span class='Ref_to_Parameter'>timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN562"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/utils/timeout.h.html#LN64"><span class='Ref_to_Member'>id</span></a><span class='Delimiter'>; 
+</span><a name="LN573"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>idx</span><span class='Delimiter'>; 
+</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN572"><span class='Ref_To_Local'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN33"><span class='Ref_to_Member'>timeout_handler</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="timeout.c.html#LN573"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>= </span><a href="timeout.c.html#LN80"><span class='Ref_to_Func'>find_active_timeout</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN572"><span class='Ref_To_Local'>id</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN573"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="timeout.c.html#LN118"><span class='Ref_to_Func'>remove_timeout_index</span></a><span class='Parentheses'>(</span><a href="timeout.c.html#LN573"><span class='Ref_To_Local'>idx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="timeout.c.html#LN560"><span class='Ref_to_Parameter'>timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN562"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/utils/timeout.h.html#LN65"><span class='Ref_to_Member'>keep_indicator</span></a><span class='Parentheses'>) 
+</span>            <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN572"><span class='Ref_To_Local'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN30"><span class='Ref_to_Member'>indicator</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Reschedule the interrupt, if any timeouts remain active. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="timeout.c.html#LN183"><span class='Ref_to_Func'>schedule_alarm</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end disable_timeouts &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Disable SIGALRM and remove all timeouts from the active list, 
+ * and optionally reset their timeout indicators. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN595"></a><span class='Declare_Function'>disable_all_timeouts</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>keep_indicators</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="timeout.c.html#LN63"><span class='Ref_to_Macro'>disable_alarm</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Only bother to reset the timer if we think it's active.  We could just 
+     * let the interrupt happen anyway, but it's probably a bit cheaper to do 
+     * setitimer() than to let the useless interrupt happen. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN606"></a>        <span class='Control'>struct</span> <a href="../../../include/port/win32.h.html#LN218"><span class='Ref_to_Struct'>itimerval</span></a> <span class='Declare_Local'>timeval</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="timeout.c.html#LN606"><span class='Ref_To_Local'>timeval</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Control'>struct</span> <a href="../../../include/port/win32.h.html#LN218"><span class='Ref_to_Struct'>itimerval</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../port/win32/timer.c.html#LN84"><span class='Ref_to_Func'>setitimer</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32.h.html#LN217"><span class='Ref_to_Const'>ITIMER_REAL</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="timeout.c.html#LN606"><span class='Ref_To_Local'>timeval</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"could not disable SIGALRM timer: %m"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="timeout.c.html#LN49"><span class='Ref_to_Global_Var'>num_active_timeouts</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="timeout.c.html#LN595"><span class='Ref_to_Parameter'>keep_indicators</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN617"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN617"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="timeout.c.html#LN617"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="../../../include/utils/timeout.h.html#LN36"><span class='Ref_to_EnumConst'>MAX_TIMEOUTS</span></a><span class='Delimiter'>; </span><a href="timeout.c.html#LN617"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>            <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN617"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN30"><span class='Ref_to_Member'>indicator</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end disable_all_timeouts &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Return the timeout's I've-been-fired indicator 
+ * 
+ * If reset_indicator is true, reset the indicator when returning true. 
+ * To avoid missing timeouts due to race conditions, we are careful not to 
+ * reset the indicator when returning false. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN632"></a><span class='Declare_Function'>get_timeout_indicator</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>reset_indicator</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN632"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN30"><span class='Ref_to_Member'>indicator</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="timeout.c.html#LN632"><span class='Ref_to_Parameter'>reset_indicator</span></a><span class='Parentheses'>) 
+</span>            <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN632"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN30"><span class='Ref_to_Member'>indicator</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Return the time when the timeout was most recently activated 
+ * 
+ * Note: will return 0 if timeout has never been activated in this process. 
+ * However, we do *not* reset the start_time when a timeout occurs, so as 
+ * not to create a race condition if SIGALRM fires just as some code is 
+ * about to fetch the value. 
+ */ 
+</span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> 
+<a name="LN652"></a><span class='Declare_Function'>get_timeout_start_time</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN652"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN35"><span class='Ref_to_Member'>start_time</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Return the time when the timeout is, or most recently was, due to fire 
+ * 
+ * Note: will return 0 if timeout has never been activated in this process. 
+ * However, we do *not* reset the fin_time when a timeout occurs, so as 
+ * not to create a race condition if SIGALRM fires just as some code is 
+ * about to fetch the value. 
+ */ 
+</span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> 
+<a name="LN666"></a><span class='Declare_Function'>get_timeout_finish_time</span><span class='Parentheses'>(</span><a href="../../../include/utils/timeout.h.html#LN22"><span class='Ref_to_Enum'>TimeoutId</span></a> <span class='Declare_Parameter'>id</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="timeout.c.html#LN42"><span class='Ref_to_Global_Var'>all_timeouts</span></a><span class='Delimiter'>[</span><a href="timeout.c.html#LN666"><span class='Ref_to_Parameter'>id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="timeout.c.html#LN36"><span class='Ref_to_Member'>fin_time</span></a><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

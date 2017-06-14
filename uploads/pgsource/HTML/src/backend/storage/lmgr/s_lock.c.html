@@ -1,0 +1,405 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\storage\lmgr\s_lock.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\storage\lmgr\s_lock.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:49 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * s_lock.c 
+ *     Hardware-dependent implementation of spinlocks. 
+ * 
+ * When waiting for a contended spinlock we loop tightly for awhile, then 
+ * delay using pg_usleep() and try again.  Preferably, "awhile" should be a 
+ * small multiple of the maximum time we expect a spinlock to be held.  100 
+ * iterations seems about right as an initial guess.  However, on a 
+ * uniprocessor the loop is a waste of cycles, while in a multi-CPU scenario 
+ * it's usually better to spin a bit longer than to call the kernel, so we try 
+ * to adapt the spin loop count depending on whether we seem to be in a 
+ * uniprocessor or multiprocessor. 
+ * 
+ * Note: you might think MIN_SPINS_PER_DELAY should be just 1, but you'd 
+ * be wrong; there are platforms where that can result in a "stuck 
+ * spinlock" failure.  This has been seen particularly on Alphas; it seems 
+ * that the first TAS after returning from kernel space will always fail 
+ * on that hardware. 
+ * 
+ * Once we do decide to block, we use randomly increasing pg_usleep() 
+ * delays. The first delay is 1 msec, then the delay randomly increases to 
+ * about one second, after which we reset to 1 msec and start again.  The 
+ * idea here is that in the presence of heavy contention we need to 
+ * increase the delay, else the spinlock holder may never get to run and 
+ * release the lock.  (Consider situation where spinlock holder has been 
+ * nice'd down in priority by the scheduler --- it will not get scheduled 
+ * until all would-be acquirers are sleeping, so if we always use a 1-msec 
+ * sleep, there is a real possibility of starvation.)  But we can't just 
+ * clamp the delay to an upper bound, else it would take a long time to 
+ * make a reasonable number of tries. 
+ * 
+ * We time out and declare error after NUM_DELAYS delays (thus, exactly 
+ * that many tries).  With the given settings, this will usually take 2 or 
+ * so minutes.  It seems better to fix the total number of tries (and thus 
+ * the probability of unintended failure) than to fix the total time 
+ * spent. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/storage/lmgr/s_lock.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;time.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"storage/s_lock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"port/atomics.h"</span> 
+ 
+ 
+<a name="LN56"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MIN_SPINS_PER_DELAY</span> <span class='Number'>10</span> 
+<a name="LN57"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MAX_SPINS_PER_DELAY</span> <span class='Number'>1000</span> 
+<a name="LN58"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>NUM_DELAYS</span>          <span class='Number'>1000</span> 
+<a name="LN59"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MIN_DELAY_USEC</span>      <span class='Number'>1000L</span> 
+<a name="LN60"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MAX_DELAY_USEC</span>      <span class='Number'>1000000L</span> 
+ 
+ 
+<a name="LN63"></a><a href="../../../include/storage/s_lock.h.html#LN137"><span class='Ref_to_Typedef'>slock_t</span></a>     <span class='Declare_Var'>dummy_spinlock</span><span class='Delimiter'>; 
+</span> 
+<a name="LN65"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>spins_per_delay</span> <span class='Operator'>= </span><a href="../../../include/storage/s_lock.h.html#LN965"><span class='Ref_to_Const'>DEFAULT_SPINS_PER_DELAY</span></a><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * s_lock_stuck() - complain about a stuck spinlock 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN72"></a><span class='Declare_Function'>s_lock_stuck</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>line</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>func</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="s_lock.c.html#LN72"><span class='Ref_to_Parameter'>func</span></a><span class='Parentheses'>) 
+</span>        <a href="s_lock.c.html#LN72"><span class='Ref_to_Parameter'>func</span></a> <span class='Operator'>= </span><span class='String'>"(unknown)"</span><span class='Delimiter'>; 
+</span><span class='Directive'>#if</span> defined<span class='Parentheses'>(</span>S_LOCK_TEST<span class='Parentheses'>) 
+</span>    <a href="../../../../contrib/seg/segscan.l.html#LN10"><span class='Ref_to_Macro'>fprintf</span></a><span class='Parentheses'>(</span>stderr<span class='Delimiter'>, 
+</span>            <span class='String'>"\nStuck spinlock detected at %s, %s:%d.\n"</span><span class='Delimiter'>, 
+</span>            <a href="s_lock.c.html#LN72"><span class='Ref_to_Parameter'>func</span></a><span class='Delimiter'>, </span><a href="s_lock.c.html#LN72"><span class='Ref_to_Parameter'>file</span></a><span class='Delimiter'>, </span><a href="s_lock.c.html#LN72"><span class='Ref_to_Parameter'>line</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../test/isolation/specscanner.l.html#LN91"><span class='Ref_to_Proto'>exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#else</span> 
+    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"stuck spinlock detected at %s, %s:%d"</span><span class='Delimiter'>, 
+</span>         <a href="s_lock.c.html#LN72"><span class='Ref_to_Parameter'>func</span></a><span class='Delimiter'>, </span><a href="s_lock.c.html#LN72"><span class='Ref_to_Parameter'>file</span></a><span class='Delimiter'>, </span><a href="s_lock.c.html#LN72"><span class='Ref_to_Parameter'>line</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+<span class='Delimiter'>} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * s_lock(lock) - platform-independent portion of waiting for a spinlock. 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN91"></a><span class='Declare_Function'>s_lock</span><span class='Parentheses'>(</span><span class='Keyword'>volatile </span><a href="../../../include/storage/s_lock.h.html#LN137"><span class='Ref_to_Typedef'>slock_t</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>lock</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>file</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>line</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>func</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN93"></a>    <a href="../../../include/storage/s_lock.h.html#LN974"><span class='Ref_to_Typedef'>SpinDelayStatus</span></a> <span class='Declare_Local'>delayStatus</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/s_lock.h.html#LN984"><span class='Ref_to_Func'>init_spin_delay</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN93"><span class='Ref_To_Local'>delayStatus</span></a><span class='Delimiter'>, </span><a href="s_lock.c.html#LN91"><span class='Ref_to_Parameter'>file</span></a><span class='Delimiter'>, </span><a href="s_lock.c.html#LN91"><span class='Ref_to_Parameter'>line</span></a><span class='Delimiter'>, </span><a href="s_lock.c.html#LN91"><span class='Ref_to_Parameter'>func</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="../../../include/storage/s_lock.h.html#LN220"><span class='Ref_to_Macro'>TAS_SPIN</span></a><span class='Parentheses'>(</span><a href="s_lock.c.html#LN91"><span class='Ref_to_Parameter'>lock</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="s_lock.c.html#LN123"><span class='Ref_to_Func'>perform_spin_delay</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN93"><span class='Ref_To_Local'>delayStatus</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="s_lock.c.html#LN173"><span class='Ref_to_Func'>finish_spin_delay</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN93"><span class='Ref_To_Local'>delayStatus</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="s_lock.c.html#LN93"><span class='Ref_To_Local'>delayStatus</span></a><span class='Operator'>.</span><a href="../../../include/storage/s_lock.h.html#LN977"><span class='Ref_to_Member'>delays</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="../../../include/storage/s_lock.h.html#LN933"><span class='Ref_to_Const'>USE_DEFAULT_S_UNLOCK</span></a> 
+<span class='Keyword'>void 
+</span><a name="LN109"></a><span class='Declare_Function'>s_unlock</span><span class='Parentheses'>(</span><span class='Keyword'>volatile </span><a href="../../../include/storage/s_lock.h.html#LN137"><span class='Ref_to_Typedef'>slock_t</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>lock</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><span class='Directive'>#ifdef</span> <a href="../../../include/storage/s_lock.h.html#LN726"><span class='Ref_to_Macro'>TAS_ACTIVE_WORD</span></a> 
+    <span class='Comment_Multi_Line'>/* HP's PA-RISC */ 
+</span>    <span class='Operator'>*</span><a href="../../../include/storage/s_lock.h.html#LN726"><span class='Ref_to_Macro'>TAS_ACTIVE_WORD</span></a><span class='Parentheses'>(</span><a href="s_lock.c.html#LN109"><span class='Ref_to_Parameter'>lock</span></a><span class='Parentheses'>) </span><span class='Operator'>= -</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span><span class='Directive'>#else</span> 
+    <span class='Operator'>*</span><a href="s_lock.c.html#LN109"><span class='Ref_to_Parameter'>lock</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+<span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Wait while spinning on a contended spinlock. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN124"></a><span class='Declare_Function'>perform_spin_delay</span><span class='Parentheses'>(</span><a href="../../../include/storage/s_lock.h.html#LN974"><span class='Ref_to_Typedef'>SpinDelayStatus</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>status</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* CPU-specific delay each time through the loop */ 
+</span>    <a href="../../../include/storage/s_lock.h.html#LN169"><span class='Ref_to_Macro'>SPIN_DELAY</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Block the process every spins_per_delay tries */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>++</span><span class='Parentheses'>(</span><a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN976"><span class='Ref_to_Member'>spins</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT;= </span><a href="s_lock.c.html#LN65"><span class='Ref_to_Global_Var'>spins_per_delay</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>++</span><span class='Parentheses'>(</span><a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN977"><span class='Ref_to_Member'>delays</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><a href="s_lock.c.html#LN58"><span class='Ref_to_Const'>NUM_DELAYS</span></a><span class='Parentheses'>)</span> 
+            <a href="s_lock.c.html#LN71"><span class='Ref_to_Func'>s_lock_stuck</span></a><span class='Parentheses'>(</span><a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN979"><span class='Ref_to_Member'>file</span></a><span class='Delimiter'>, </span><a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN980"><span class='Ref_to_Member'>line</span></a><span class='Delimiter'>, </span><a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN981"><span class='Ref_to_Member'>func</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN978"><span class='Ref_to_Member'>cur_delay</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span>     <span class='Comment_Single_Line'>/* first time to delay? */ 
+</span>            <a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN978"><span class='Ref_to_Member'>cur_delay</span></a> <span class='Operator'>= </span><a href="s_lock.c.html#LN59"><span class='Ref_to_Const'>MIN_DELAY_USEC</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN978"><span class='Ref_to_Member'>cur_delay</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#if</span> defined<span class='Parentheses'>(</span>S_LOCK_TEST<span class='Parentheses'>) 
+</span>        <a href="../../../../contrib/seg/segscan.l.html#LN10"><span class='Ref_to_Macro'>fprintf</span></a><span class='Parentheses'>(</span>stdout<span class='Delimiter'>, </span><span class='String'>"*"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        fflush<span class='Parentheses'>(</span>stdout<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+        <span class='Comment_Multi_Line'>/* increase delay by a random fraction between 1X and 2X */ 
+</span>        <a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN978"><span class='Ref_to_Member'>cur_delay</span></a> <span class='Operator'>+= </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) (</span><a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN978"><span class='Ref_to_Member'>cur_delay</span></a> <span class='Operator'>* 
+</span>                      <span class='Parentheses'>((</span><span class='Keyword'>double</span><span class='Parentheses'>) </span><a href="../../../port/random.c.html#LN20"><span class='Ref_to_Func'>random</span></a><span class='Parentheses'>() </span><span class='Operator'>/ </span><span class='Parentheses'>(</span><span class='Keyword'>double</span><span class='Parentheses'>) </span><a href="../../../include/pg_config_manual.h.html#LN199"><span class='Ref_to_Const'>MAX_RANDOM_VALUE</span></a><span class='Parentheses'>)</span> <span class='Operator'>+ </span><span class='Number'>0</span><span class='Operator'>.</span><span class='Number'>5</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* wrap back to minimum delay when max is exceeded */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN978"><span class='Ref_to_Member'>cur_delay</span></a> <span class='Operator'>&GT; </span><a href="s_lock.c.html#LN60"><span class='Ref_to_Const'>MAX_DELAY_USEC</span></a><span class='Parentheses'>) 
+</span>            <a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN978"><span class='Ref_to_Member'>cur_delay</span></a> <span class='Operator'>= </span><a href="s_lock.c.html#LN59"><span class='Ref_to_Const'>MIN_DELAY_USEC</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="s_lock.c.html#LN124"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN976"><span class='Ref_to_Member'>spins</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if ++(status-&GT;spins)&GT;=sp... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end perform_spin_delay &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * After acquiring a spinlock, update estimates about how long to loop. 
+ * 
+ * If we were able to acquire the lock without delaying, it's a good 
+ * indication we are in a multiprocessor.  If we had to delay, it's a sign 
+ * (but not a sure thing) that we are in a uniprocessor. Hence, we 
+ * decrement spins_per_delay slowly when we had to delay, and increase it 
+ * rapidly when we didn't.  It's expected that spins_per_delay will 
+ * converge to the minimum value on a uniprocessor and to the maximum 
+ * value on a multiprocessor. 
+ * 
+ * Note: spins_per_delay is local within our current process. We want to 
+ * average these observations across multiple backends, since it's 
+ * relatively rare for this function to even get entered, and so a single 
+ * backend might not live long enough to converge on a good value.  That 
+ * is handled by the two routines below. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN174"></a><span class='Declare_Function'>finish_spin_delay</span><span class='Parentheses'>(</span><a href="../../../include/storage/s_lock.h.html#LN974"><span class='Ref_to_Typedef'>SpinDelayStatus</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>status</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN174"><span class='Ref_to_Parameter'>status</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/s_lock.h.html#LN978"><span class='Ref_to_Member'>cur_delay</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* we never had to delay */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN65"><span class='Ref_to_Global_Var'>spins_per_delay</span></a> <span class='Operator'>&LT; </span><a href="s_lock.c.html#LN57"><span class='Ref_to_Const'>MAX_SPINS_PER_DELAY</span></a><span class='Parentheses'>) 
+</span>            <a href="s_lock.c.html#LN65"><span class='Ref_to_Global_Var'>spins_per_delay</span></a> <span class='Operator'>= </span><a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><a href="s_lock.c.html#LN65"><span class='Ref_to_Global_Var'>spins_per_delay</span></a> <span class='Operator'>+ </span><span class='Number'>100</span><span class='Delimiter'>, </span><a href="s_lock.c.html#LN57"><span class='Ref_to_Const'>MAX_SPINS_PER_DELAY</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN65"><span class='Ref_to_Global_Var'>spins_per_delay</span></a> <span class='Operator'>&GT; </span><a href="s_lock.c.html#LN56"><span class='Ref_to_Const'>MIN_SPINS_PER_DELAY</span></a><span class='Parentheses'>) 
+</span>            <a href="s_lock.c.html#LN65"><span class='Ref_to_Global_Var'>spins_per_delay</span></a> <span class='Operator'>= </span><a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN10"><span class='Ref_to_Macro'>Max</span></a><span class='Parentheses'>(</span><a href="s_lock.c.html#LN65"><span class='Ref_to_Global_Var'>spins_per_delay</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>, </span><a href="s_lock.c.html#LN56"><span class='Ref_to_Const'>MIN_SPINS_PER_DELAY</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Set local copy of spins_per_delay during backend startup. 
+ * 
+ * NB: this has to be pretty fast as it is called while holding a spinlock 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN195"></a><span class='Declare_Function'>set_spins_per_delay</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>shared_spins_per_delay</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="s_lock.c.html#LN65"><span class='Ref_to_Global_Var'>spins_per_delay</span></a> <span class='Operator'>= </span><a href="s_lock.c.html#LN195"><span class='Ref_to_Parameter'>shared_spins_per_delay</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Update shared estimate of spins_per_delay during backend exit. 
+ * 
+ * NB: this has to be pretty fast as it is called while holding a spinlock 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN206"></a><span class='Declare_Function'>update_spins_per_delay</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>shared_spins_per_delay</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * We use an exponential moving average with a relatively slow adaption 
+     * rate, so that noise in any one backend's result won't affect the shared 
+     * value too much.  As long as both inputs are within the allowed range, 
+     * the result must be too, so we need not worry about clamping the result. 
+     * 
+     * We deliberately truncate rather than rounding; this is so that single 
+     * adjustments inside a backend can affect the shared estimate (see the 
+     * asymmetric adjustment rules above). 
+     */ 
+</span>    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN206"><span class='Ref_to_Parameter'>shared_spins_per_delay</span></a> <span class='Operator'>* </span><span class='Number'>15</span> <span class='Operator'>+ </span><a href="s_lock.c.html#LN65"><span class='Ref_to_Global_Var'>spins_per_delay</span></a><span class='Parentheses'>) </span><span class='Operator'>/ </span><span class='Number'>16</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Various TAS implementations that cannot live in s_lock.h as no inline 
+ * definition exists (yet). 
+ * In the future, get rid of tas.[cso] and fold it into this file. 
+ * 
+ * If you change something here, you will likely need to modify s_lock.h too, 
+ * because the definitions for these are split between this file and s_lock.h. 
+ */ 
+</span> 
+ 
+<span class='Directive'>#ifdef</span> HAVE_SPINLOCKS           <span class='Comment_Single_Line'>/* skip spinlocks if requested */ 
+</span> 
+ 
+<span class='Directive'>#if</span> defined<span class='Parentheses'>(</span>__GNUC__<span class='Parentheses'>) 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * All the gcc flavors that are not inlined 
+ */ 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Note: all the if-tests here probably ought to be testing gcc version 
+ * rather than platform, but I don't have adequate info to know what to 
+ * write.  Ideally we'd flush all this in favor of the inline version. 
+ */ 
+</span><span class='Directive'>#if</span> defined<span class='Parentheses'>(</span>__m68k__<span class='Parentheses'>) </span><span class='Operator'>&& !</span>defined<span class='Parentheses'>(</span>__linux__<span class='Parentheses'>) 
+</span><span class='Comment_Multi_Line'>/* really means: extern int tas(slock_t* **lock); */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN250"></a><span class='Declare_Function'>tas_dummy</span><span class='Parentheses'>() 
+</span><span class='Delimiter'>{ 
+</span><a name="LN252"></a>    __asm__     <span class='Declare_Local'>__volatile__</span><span class='Parentheses'>( 
+</span><span class='Directive'>#if</span> defined<span class='Parentheses'>(</span>__NetBSD__<span class='Parentheses'>) </span><span class='Operator'>&& </span>defined<span class='Parentheses'>(</span>__ELF__<span class='Parentheses'>) 
+</span><span class='Comment_Multi_Line'>/* no underscore for label and % for registers */ 
+</span>                                         <span class='String'>"\ 
+.global     tas                 \n\ 
+tas:                            \n\ 
+            movel   %sp@(0x4),%a0   \n\ 
+            tas     %a0@        \n\ 
+            beq     _success    \n\ 
+            moveq   #-128,%d0   \n\ 
+            rts                 \n\ 
+_success:                       \n\ 
+            moveq   #0,%d0      \n\ 
+            rts                 \n"</span> 
+<span class='Directive'>#else</span> 
+                                         <span class='String'>"\ 
+.global     _tas                \n\ 
+_tas:                           \n\ 
+            movel   sp@(0x4),a0 \n\ 
+            tas     a0@         \n\ 
+            beq     _success    \n\ 
+            moveq   #-128,d0    \n\ 
+            rts                 \n\ 
+_success:                       \n\ 
+            moveq   #0,d0       \n\ 
+            rts                 \n"</span> 
+<span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* __NetBSD__ && __ELF__ */ 
+</span>    <span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end tas_dummy &raquo; </span> 
+<span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* __m68k__ && !__linux__ */ 
+</span><span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* not __GNUC__ */ 
+</span><span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* HAVE_SPINLOCKS */ 
+</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/*****************************************************************************/ 
+</span><span class='Directive'>#if</span> defined<span class='Parentheses'>(</span>S_LOCK_TEST<span class='Parentheses'>) 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * test program for verifying a port's spinlock support. 
+ */ 
+</span> 
+<a name="LN294"></a><span class='Control'>struct</span> <span class='Declare_Struct'>test_lock_struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN296"></a>    <span class='Keyword'>char</span>        <span class='Declare_Member'>pad1</span><span class='Delimiter'>; 
+</span><a name="LN297"></a>    <a href="../../../include/storage/s_lock.h.html#LN137"><span class='Ref_to_Typedef'>slock_t</span></a>     <span class='Declare_Member'>lock</span><span class='Delimiter'>; 
+</span><a name="LN298"></a>    <span class='Keyword'>char</span>        <span class='Declare_Member'>pad2</span><span class='Delimiter'>; 
+}; 
+</span> 
+<a name="LN301"></a><span class='Keyword'>volatile </span><span class='Control'>struct</span> <a href="s_lock.c.html#LN294"><span class='Ref_to_Struct'>test_lock_struct</span></a> <span class='Declare_Var'>test_lock</span><span class='Delimiter'>; 
+</span> 
+<span class='Keyword'>int 
+</span><a name="LN304"></a><span class='Declare_Function'>main</span><span class='Parentheses'>() 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../port/srandom.c.html#LN20"><span class='Ref_to_Func'>srandom</span></a><span class='Parentheses'>((</span><span class='Keyword'>unsigned int</span><span class='Parentheses'>) </span>time<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN296"><span class='Ref_to_Member'>pad1</span></a> <span class='Operator'>= </span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN298"><span class='Ref_to_Member'>pad2</span></a> <span class='Operator'>= </span><span class='Number'>0x44</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/s_lock.h.html#LN761"><span class='Ref_to_Macro'>S_INIT_LOCK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN297"><span class='Ref_to_Member'>lock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN296"><span class='Ref_to_Member'>pad1</span></a> <span class='Operator'>!= </span><span class='Number'>0x44</span> <span class='Operator'>|| </span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN298"><span class='Ref_to_Member'>pad2</span></a> <span class='Operator'>!= </span><span class='Number'>0x44</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: failed, declared datatype is wrong size\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/s_lock.h.html#LN770"><span class='Ref_to_Macro'>S_LOCK_FREE</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN297"><span class='Ref_to_Member'>lock</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: failed, lock not initialized\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/s_lock.h.html#LN908"><span class='Ref_to_Macro'>S_LOCK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN297"><span class='Ref_to_Member'>lock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN296"><span class='Ref_to_Member'>pad1</span></a> <span class='Operator'>!= </span><span class='Number'>0x44</span> <span class='Operator'>|| </span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN298"><span class='Ref_to_Member'>pad2</span></a> <span class='Operator'>!= </span><span class='Number'>0x44</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: failed, declared datatype is wrong size\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/s_lock.h.html#LN770"><span class='Ref_to_Macro'>S_LOCK_FREE</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN297"><span class='Ref_to_Member'>lock</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: failed, lock not locked\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/s_lock.h.html#LN310"><span class='Ref_to_Macro'>S_UNLOCK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN297"><span class='Ref_to_Member'>lock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN296"><span class='Ref_to_Member'>pad1</span></a> <span class='Operator'>!= </span><span class='Number'>0x44</span> <span class='Operator'>|| </span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN298"><span class='Ref_to_Member'>pad2</span></a> <span class='Operator'>!= </span><span class='Number'>0x44</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: failed, declared datatype is wrong size\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/s_lock.h.html#LN770"><span class='Ref_to_Macro'>S_LOCK_FREE</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN297"><span class='Ref_to_Member'>lock</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: failed, lock not unlocked\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/s_lock.h.html#LN908"><span class='Ref_to_Macro'>S_LOCK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN297"><span class='Ref_to_Member'>lock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN296"><span class='Ref_to_Member'>pad1</span></a> <span class='Operator'>!= </span><span class='Number'>0x44</span> <span class='Operator'>|| </span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN298"><span class='Ref_to_Member'>pad2</span></a> <span class='Operator'>!= </span><span class='Number'>0x44</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: failed, declared datatype is wrong size\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/s_lock.h.html#LN770"><span class='Ref_to_Macro'>S_LOCK_FREE</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN297"><span class='Ref_to_Member'>lock</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: failed, lock not re-locked\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: this will print %d stars and then\n"</span><span class='Delimiter'>, </span><a href="s_lock.c.html#LN58"><span class='Ref_to_Const'>NUM_DELAYS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"             exit with a 'stuck spinlock' message\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"             if S_LOCK() and TAS() are working.\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    fflush<span class='Parentheses'>(</span>stdout<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="s_lock.c.html#LN90"><span class='Ref_to_Func'>s_lock</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="s_lock.c.html#LN301"><span class='Ref_to_Global_Var'>test_lock</span></a><span class='Operator'>.</span><a href="s_lock.c.html#LN297"><span class='Ref_to_Member'>lock</span></a><span class='Delimiter'>, </span>__FILE__<span class='Delimiter'>, </span>__LINE__<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/port.h.html#LN173"><span class='Ref_to_Macro'>printf</span></a><span class='Parentheses'>(</span><span class='String'>"S_LOCK_TEST: failed, lock not locked\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end main &raquo; </span> 
+ 
+<span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* S_LOCK_TEST */ 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

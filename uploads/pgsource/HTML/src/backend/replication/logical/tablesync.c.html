@@ -1,0 +1,989 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\replication\logical\tablesync.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\replication\logical\tablesync.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:47 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * tablesync.c 
+ *    PostgreSQL logical replication 
+ * 
+ * Copyright (c) 2012-2017, PostgreSQL Global Development Group 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/replication/logical/tablesync.c 
+ * 
+ * NOTES 
+ *    This file contains code for initial table data synchronization for 
+ *    logical replication. 
+ * 
+ *    The initial data synchronization is done separately for each table, 
+ *    in a separate apply worker that only fetches the initial snapshot data 
+ *    from the publisher and then synchronizes the position in the stream with 
+ *    the main apply worker. 
+ * 
+ *    There are several reasons for doing the synchronization this way: 
+ *     - It allows us to parallelize the initial data synchronization 
+ *       which lowers the time needed for it to happen. 
+ *     - The initial synchronization does not have to hold the xid and LSN 
+ *       for the time it takes to copy data of all tables, causing less 
+ *       bloat and lower disk consumption compared to doing the 
+ *       synchronization in a single process for the whole database. 
+ *     - It allows us to synchronize any tables added after the initial 
+ *       synchronization has finished. 
+ * 
+ *    The stream position synchronization works in multiple steps. 
+ *     - Sync finishes copy and sets worker state as SYNCWAIT and waits for 
+ *       state to change in a loop. 
+ *     - Apply periodically checks tables that are synchronizing for SYNCWAIT. 
+ *       When the desired state appears, it will set the worker state to 
+ *       CATCHUP and starts loop-waiting until either the table state is set 
+ *       to SYNCDONE or the sync worker exits. 
+ *     - After the sync worker has seen the state change to CATCHUP, it will 
+ *       read the stream and apply changes (acting like an apply worker) until 
+ *       it catches up to the specified stream position.  Then it sets the 
+ *       state to SYNCDONE.  There might be zero changes applied between 
+ *       CATCHUP and SYNCDONE, because the sync worker might be ahead of the 
+ *       apply worker. 
+ *     - Once the state was set to SYNCDONE, the apply will continue tracking 
+ *       the table until it reaches the SYNCDONE stream position, at which 
+ *       point it sets state to READY and stops tracking.  Again, there might 
+ *       be zero changes in between. 
+ * 
+ *    So the state progression is always: INIT -&GT; DATASYNC -&GT; SYNCWAIT -&GT; CATCHUP -&GT; 
+ *    SYNCDONE -&GT; READY. 
+ * 
+ *    The catalog pg_subscription_rel is used to keep information about 
+ *    subscribed tables and their state.  Some transient state during data 
+ *    synchronization is kept in shared memory.  The states SYNCWAIT and 
+ *    CATCHUP only appear in memory. 
+ * 
+ *    Example flows look like this: 
+ *     - Apply is in front: 
+ *        sync:8 
+ *          -&GT; set in memory SYNCWAIT 
+ *        apply:10 
+ *          -&GT; set in memory CATCHUP 
+ *          -&GT; enter wait-loop 
+ *        sync:10 
+ *          -&GT; set in catalog SYNCDONE 
+ *          -&GT; exit 
+ *        apply:10 
+ *          -&GT; exit wait-loop 
+ *          -&GT; continue rep 
+ *        apply:11 
+ *          -&GT; set in catalog READY 
+ *     - Sync in front: 
+ *        sync:10 
+ *          -&GT; set in memory SYNCWAIT 
+ *        apply:8 
+ *          -&GT; set in memory CATCHUP 
+ *          -&GT; continue per-table filtering 
+ *        sync:10 
+ *          -&GT; set in catalog SYNCDONE 
+ *          -&GT; exit 
+ *        apply:10 
+ *          -&GT; set in catalog READY 
+ *          -&GT; stop per-table filtering 
+ *          -&GT; continue rep 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_subscription_rel.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_type.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"commands/copy.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"parser/parse_relation.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"replication/logicallauncher.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/logicalrelation.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/walreceiver.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/worker_internal.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"utils/snapmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"utils/builtins.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/lsyscache.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+ 
+<a name="LN111"></a><span class='Keyword'>static bool </span><span class='Declare_Var'>table_states_valid</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<a name="LN113"></a><a href="../../../include/lib/stringinfo.h.html#LN42"><span class='Ref_to_Typedef'>StringInfo</span></a>  <span class='Declare_Var'>copybuf</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Exit routine for synchronization worker. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN119"></a><span class='Declare_Function'>pg_attribute_noreturn</span><span class='Parentheses'>() 
+</span>finish_sync_worker<span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Commit any outstanding transaction. This is the usual case, unless 
+     * there was nothing to do for the table. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/xact.h.html#LN329"><span class='Ref_to_Proto'>IsTransactionState</span></a><span class='Parentheses'>())</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/access/xact.h.html#LN349"><span class='Ref_to_Proto'>CommitTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../postmaster/pgstat.c.html#LN810"><span class='Ref_to_Func'>pgstat_report_stat</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* And flush all writes. */ 
+</span>    <a href="../../../include/access/xlog.h.html#LN225"><span class='Ref_to_Proto'>XLogFlush</span></a><span class='Parentheses'>(</span><a href="../../../include/access/xlog.h.html#LN249"><span class='Ref_to_Proto'>GetXLogWriteRecPtr</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"logical replication table synchronization worker for subscription \"%s\", table \"%s\" has finished"</span><span class='Delimiter'>, 
+</span>                    <a href="worker.c.html#LN110"><span class='Ref_to_Global_Var'>MySubscription</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN79"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, 
+</span>                    <a href="../../../include/utils/lsyscache.h.html#LN124"><span class='Ref_to_Proto'>get_rel_name</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xact.h.html#LN349"><span class='Ref_to_Proto'>CommitTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Find the main apply worker and signal it. */ 
+</span>    <a href="../../../include/replication/worker_internal.h.html#LN76"><span class='Ref_to_Proto'>logicalrep_worker_wakeup</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Stop gracefully */ 
+</span>    <a href="../../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pg_attribute_noreturn &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Wait until the relation synchronization state is set in the catalog to the 
+ * expected one. 
+ * 
+ * Used when transitioning from CATCHUP state to SYNCDONE. 
+ * 
+ * Returns false if the synchronization worker has disappeared or the table state 
+ * has been reset. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN159"></a><span class='Declare_Function'>wait_for_relation_state_change</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relid</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Declare_Parameter'>expected_state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN161"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span><a name="LN162"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>state</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN166"></a>        <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>worker</span><span class='Delimiter'>; 
+</span><a name="LN167"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>statelsn</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* XXX use cache invalidation here to improve performance? */ 
+</span>        <a href="../../../include/utils/snapmgr.h.html#LN73"><span class='Ref_to_Proto'>PushActiveSnapshot</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/snapmgr.h.html#LN64"><span class='Ref_to_Proto'>GetLatestSnapshot</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN162"><span class='Ref_To_Local'>state</span></a> <span class='Operator'>= </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN74"><span class='Ref_to_Proto'>GetSubscriptionRelState</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, 
+</span>                                        <a href="tablesync.c.html#LN159"><span class='Ref_to_Parameter'>relid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN167"><span class='Ref_To_Local'>statelsn</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/snapmgr.h.html#LN76"><span class='Ref_to_Proto'>PopActiveSnapshot</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN162"><span class='Ref_To_Local'>state</span></a> <span class='Operator'>== </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN61"><span class='Ref_to_Const'>SUBREL_STATE_UNKNOWN</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN162"><span class='Ref_To_Local'>state</span></a> <span class='Operator'>== </span><a href="tablesync.c.html#LN159"><span class='Ref_to_Parameter'>expected_state</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Check if the sync worker is still running and bail if not. */ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Check if the opposite worker is still running and bail if not. */ 
+</span>        <a href="tablesync.c.html#LN166"><span class='Ref_To_Local'>worker</span></a> <span class='Operator'>= </span><a href="../../../include/replication/worker_internal.h.html#LN71"><span class='Ref_to_Proto'>logicalrep_worker_find</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, 
+</span>                                  <a href="../../../include/replication/worker_internal.h.html#LN86"><span class='Ref_to_Func'>am_tablesync_worker</span></a><span class='Parentheses'>() </span><span class='Operator'>? </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a> <span class='Operator'>: </span><a href="tablesync.c.html#LN159"><span class='Ref_to_Parameter'>relid</span></a><span class='Delimiter'>, 
+</span>                                        <span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN166"><span class='Ref_To_Local'>worker</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <a href="tablesync.c.html#LN161"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                       <span class='Number'>1000L</span><span class='Delimiter'>, </span><a href="../../../include/pgstat.h.html#LN814"><span class='Ref_to_EnumConst'>WAIT_EVENT_LOGICAL_SYNC_STATE_CHANGE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* emergency bailout if postmaster has died */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN161"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end wait_for_relation_state_change &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Wait until the apply worker changes the state of our synchronization 
+ * worker to the expected one. 
+ * 
+ * Used when transitioning from SYNCWAIT state to CATCHUP. 
+ * 
+ * Returns false if the apply worker has disappeared or the table state has been 
+ * reset. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN218"></a><span class='Declare_Function'>wait_for_worker_state_change</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Declare_Parameter'>expected_state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN220"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN224"></a>        <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>worker</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Bail if the apply has died. */ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN224"><span class='Ref_To_Local'>worker</span></a> <span class='Operator'>= </span><a href="../../../include/replication/worker_internal.h.html#LN71"><span class='Ref_to_Proto'>logicalrep_worker_find</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, 
+</span>                                        <a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN224"><span class='Ref_To_Local'>worker</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a> <span class='Operator'>== </span><a href="tablesync.c.html#LN218"><span class='Ref_to_Parameter'>expected_state</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+        <a href="tablesync.c.html#LN220"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                       <span class='Number'>1000L</span><span class='Delimiter'>, </span><a href="../../../include/pgstat.h.html#LN814"><span class='Ref_to_EnumConst'>WAIT_EVENT_LOGICAL_SYNC_STATE_CHANGE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* emergency bailout if postmaster has died */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN220"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end wait_for_worker_state_change &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Callback from syscache invalidation. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN257"></a><span class='Declare_Function'>invalidate_syncing_table_states</span><span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>cacheid</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Parameter'>hashvalue</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="tablesync.c.html#LN111"><span class='Ref_to_Global_Var'>table_states_valid</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Handle table synchronization cooperation from the synchronization 
+ * worker. 
+ * 
+ * If the sync worker is in CATCHUP state and reached (or passed) the 
+ * predetermined synchronization point in the WAL stream, mark the table as 
+ * SYNCDONE and finish. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN271"></a><span class='Declare_Function'>process_syncing_tables_for_sync</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>current_lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/xact.h.html#LN329"><span class='Ref_to_Proto'>IsTransactionState</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a> <span class='Operator'>== </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN63"><span class='Ref_to_Const'>SUBREL_STATE_CATCHUP</span></a> <span class='Operator'>&& 
+</span>        <a href="tablesync.c.html#LN271"><span class='Ref_to_Parameter'>current_lsn</span></a> <span class='Operator'>&GT;= </span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN280"></a>        <a href="../../../include/access/xlogdefs.h.html#LN44"><span class='Ref_to_Typedef'>TimeLineID</span></a>  <span class='Declare_Local'>tli</span><span class='Delimiter'>; 
+</span> 
+        <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a> <span class='Operator'>= </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN56"><span class='Ref_to_Const'>SUBREL_STATE_SYNCDONE</span></a><span class='Delimiter'>; 
+</span>        <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN271"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/catalog/pg_subscription_rel.h.html#LN72"><span class='Ref_to_Proto'>SetSubscriptionRelState</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, 
+</span>                                <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Delimiter'>, 
+</span>                                <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a><span class='Delimiter'>, 
+</span>                                <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a><span class='Delimiter'>, 
+</span>                                <span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/replication/walreceiver.h.html#LN253"><span class='Ref_to_Macro'>walrcv_endstreaming</span></a><span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN280"><span class='Ref_To_Local'>tli</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        finish_sync_worker<span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end process_syncing_tables_for_sync &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Handle table synchronization cooperation from the apply worker. 
+ * 
+ * Walk over all subscription tables that are individually tracked by the 
+ * apply process (currently, all that have state other than 
+ * SUBREL_STATE_READY) and manage synchronization for them. 
+ * 
+ * If there are tables that need synchronizing and are not being synchronized 
+ * yet, start sync workers for them (if there are free slots for sync 
+ * workers).  To prevent starting the sync worker for the same relation at a 
+ * high frequency after a failure, we store its last start time with each sync 
+ * state info.  We start the sync worker for the same relation after waiting 
+ * at least wal_retrieve_retry_interval. 
+ * 
+ * For tables that are being synchronized already, check if sync workers 
+ * either need action from the apply worker or have finished.  This is the 
+ * SYNCWAIT to CATCHUP transition. 
+ * 
+ * If the synchronization position is reached (SYNCDONE), then the table can 
+ * be marked as READY and is no longer tracked. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN322"></a><span class='Declare_Function'>process_syncing_tables_for_apply</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>current_lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN324"></a>    <span class='Control'>struct</span> <span class='Declare_Local'>tablesync_start_time_mapping</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN326"></a>        <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Member'>relid</span><span class='Delimiter'>; 
+</span><a name="LN327"></a>        <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Member'>last_start_time</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}; 
+</span><a name="LN329"></a>    <span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Local'>table_states</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN330"></a>    <span class='Keyword'>static </span><a href="../../utils/hash/dynahash.c.html#LN192"><span class='Ref_to_Struct'>HTAB</span></a> <span class='Operator'>*</span><span class='Declare_Local'>last_start_times</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN331"></a>    <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>lc</span><span class='Delimiter'>; 
+</span><a name="LN332"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>started_tx</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xact.h.html#LN329"><span class='Ref_to_Proto'>IsTransactionState</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We need up-to-date sync state info for subscription tables here. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN111"><span class='Ref_to_Global_Var'>table_states_valid</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN339"></a>        <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldctx</span><span class='Delimiter'>; 
+</span><a name="LN340"></a>        <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>rstates</span><span class='Delimiter'>; 
+</span><a name="LN341"></a>        <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>lc</span><span class='Delimiter'>; 
+</span><a name="LN342"></a>        <a href="../../../include/catalog/pg_subscription_rel.h.html#LN65"><span class='Ref_to_Struct'>SubscriptionRelState</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rstate</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Clean the old list. */ 
+</span>        <a href="../../../include/nodes/pg_list.h.html#LN266"><span class='Ref_to_Proto'>list_free_deep</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN329"><span class='Ref_To_Local'>table_states</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN329"><span class='Ref_To_Local'>table_states</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN332"><span class='Ref_To_Local'>started_tx</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Fetch all non-ready tables. */ 
+</span>        <a href="tablesync.c.html#LN340"><span class='Ref_To_Local'>rstates</span></a> <span class='Operator'>= </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN79"><span class='Ref_to_Proto'>GetSubscriptionNotReadyRelations</span></a><span class='Parentheses'>(</span><a href="worker.c.html#LN110"><span class='Ref_to_Global_Var'>MySubscription</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN76"><span class='Ref_to_Member'>oid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Allocate the tracking info in a permanent memory context. */ 
+</span>        <a href="tablesync.c.html#LN339"><span class='Ref_To_Local'>oldctx</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="../../utils/mmgr/mcxt.c.html#LN45"><span class='Ref_to_Global_Var'>CacheMemoryContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN341"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN340"><span class='Ref_To_Local'>rstates</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="tablesync.c.html#LN342"><span class='Ref_To_Local'>rstate</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN65"><span class='Ref_to_Struct'>SubscriptionRelState</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            memcpy<span class='Parentheses'>(</span><a href="tablesync.c.html#LN342"><span class='Ref_To_Local'>rstate</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN341"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN65"><span class='Ref_to_Struct'>SubscriptionRelState</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="tablesync.c.html#LN329"><span class='Ref_To_Local'>table_states</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN329"><span class='Ref_To_Local'>table_states</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN342"><span class='Ref_To_Local'>rstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN339"><span class='Ref_To_Local'>oldctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="tablesync.c.html#LN111"><span class='Ref_to_Global_Var'>table_states_valid</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !table_states_valid &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Prepare a hash table for tracking last start times of workers, to avoid 
+     * immediate restarts.  We don't need it if there are no tables that need 
+     * syncing. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN329"><span class='Ref_To_Local'>table_states</span></a> <span class='Operator'>&& !</span><a href="tablesync.c.html#LN330"><span class='Ref_To_Local'>last_start_times</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN374"></a>        <a href="../../../include/utils/hsearch.h.html#LN64"><span class='Ref_to_Struct'>HASHCTL</span></a>     <span class='Declare_Local'>ctl</span><span class='Delimiter'>; 
+</span> 
+        memset<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN374"><span class='Ref_To_Local'>ctl</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="tablesync.c.html#LN374"><span class='Ref_To_Local'>ctl</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN374"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../../include/utils/hsearch.h.html#LN71"><span class='Ref_to_Member'>keysize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN374"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../../include/utils/hsearch.h.html#LN72"><span class='Ref_to_Member'>entrysize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Control'>struct</span> <a href="tablesync.c.html#LN324"><span class='Ref_to_Struct'>tablesync_start_time_mapping</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN330"><span class='Ref_To_Local'>last_start_times</span></a> <span class='Operator'>= </span><a href="../../../include/utils/hsearch.h.html#LN121"><span class='Ref_to_Proto'>hash_create</span></a><span class='Parentheses'>(</span><span class='String'>"Logical replication table sync worker start times"</span><span class='Delimiter'>, 
+</span>                                       <span class='Number'>256</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN374"><span class='Ref_To_Local'>ctl</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/hsearch.h.html#LN86"><span class='Ref_to_Const'>HASH_ELEM</span></a> <span class='Operator'>| </span><a href="../../../include/utils/hsearch.h.html#LN87"><span class='Ref_to_Const'>HASH_BLOBS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Clean up the hash table when we're done with all tables (just to 
+     * release the bit of memory). 
+     */ 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN329"><span class='Ref_To_Local'>table_states</span></a> <span class='Operator'>&& </span><a href="tablesync.c.html#LN330"><span class='Ref_To_Local'>last_start_times</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/utils/hsearch.h.html#LN123"><span class='Ref_to_Proto'>hash_destroy</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN330"><span class='Ref_To_Local'>last_start_times</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN330"><span class='Ref_To_Local'>last_start_times</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Process all tables that are being synchronized. 
+     */ 
+</span>    <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN331"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN329"><span class='Ref_To_Local'>table_states</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN398"></a>        <a href="../../../include/catalog/pg_subscription_rel.h.html#LN65"><span class='Ref_to_Struct'>SubscriptionRelState</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rstate</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN65"><span class='Ref_to_Struct'>SubscriptionRelState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN331"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN69"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>== </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN56"><span class='Ref_to_Const'>SUBREL_STATE_SYNCDONE</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * Apply has caught up to the position where the table sync has 
+             * finished.  Mark the table as ready so that the apply will just 
+             * continue to replicate it normally. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN322"><span class='Ref_to_Parameter'>current_lsn</span></a> <span class='Operator'>&GT;= </span><a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN68"><span class='Ref_to_Member'>lsn</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN69"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>= </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN58"><span class='Ref_to_Const'>SUBREL_STATE_READY</span></a><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN68"><span class='Ref_to_Member'>lsn</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN322"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN332"><span class='Ref_To_Local'>started_tx</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>                    <a href="tablesync.c.html#LN332"><span class='Ref_To_Local'>started_tx</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>                <a href="../../../include/catalog/pg_subscription_rel.h.html#LN72"><span class='Ref_to_Proto'>SetSubscriptionRelState</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, 
+</span>                                        <a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN67"><span class='Ref_to_Member'>relid</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN69"><span class='Ref_to_Member'>state</span></a><span class='Delimiter'>, 
+</span>                                        <a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN68"><span class='Ref_to_Member'>lsn</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if rstate-&GT;state==SUBREL... &raquo; </span> 
+        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN423"></a>            <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>syncworker</span><span class='Delimiter'>; 
+</span><a name="LN424"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>nsyncworkers</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a> <span class='Operator'>= </span><a href="../../../include/replication/worker_internal.h.html#LN71"><span class='Ref_to_Proto'>logicalrep_worker_find</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, 
+</span>                                                <a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN67"><span class='Ref_to_Member'>relid</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN69"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN68"><span class='Ref_to_Member'>lsn</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a><span class='Delimiter'>; 
+</span>                <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+ 
+                <span class='Comment_Multi_Line'>/* 
+                 * If there is no sync worker for this table yet, count 
+                 * running sync workers for this subscription, while we have 
+                 * the lock, for later. 
+                 */ 
+</span>                <a href="tablesync.c.html#LN424"><span class='Ref_To_Local'>nsyncworkers</span></a> <span class='Operator'>= </span><a href="../../../include/replication/worker_internal.h.html#LN79"><span class='Ref_to_Proto'>logicalrep_sync_worker_count</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * There is a worker synchronizing the relation and waiting for 
+             * apply to do something. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a> <span class='Operator'>&& </span><a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN69"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>== </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN62"><span class='Ref_to_Const'>SUBREL_STATE_SYNCWAIT</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * Tell sync worker it can catchup now. We'll wait for it so 
+                 * it does not get lost. 
+                 */ 
+</span>                <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a> <span class='Operator'>= </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN63"><span class='Ref_to_Const'>SUBREL_STATE_CATCHUP</span></a><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a> <span class='Operator'>= 
+</span>                    <a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN10"><span class='Ref_to_Macro'>Max</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN322"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* Signal the sync worker, as it may be waiting for us. */ 
+</span>                <a href="../../../include/replication/worker_internal.h.html#LN77"><span class='Ref_to_Proto'>logicalrep_worker_wakeup_ptr</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * Enter busy loop and wait for synchronization worker to 
+                 * reach expected state (or die trying). 
+                 */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN332"><span class='Ref_To_Local'>started_tx</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>                    <a href="tablesync.c.html#LN332"><span class='Ref_To_Local'>started_tx</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>                <a href="tablesync.c.html#LN158"><span class='Ref_to_Func'>wait_for_relation_state_change</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN67"><span class='Ref_to_Member'>relid</span></a><span class='Delimiter'>, 
+</span>                                               <a href="../../../include/catalog/pg_subscription_rel.h.html#LN56"><span class='Ref_to_Const'>SUBREL_STATE_SYNCDONE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if syncworker&&rstate-&GT;s... &raquo; </span> 
+ 
+            <span class='Comment_Multi_Line'>/* 
+             * If there is no sync worker registered for the table and there 
+             * is some free sync worker slot, start a new sync worker for the 
+             * table. 
+             */ 
+</span>            <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN423"><span class='Ref_To_Local'>syncworker</span></a> <span class='Operator'>&& </span><a href="tablesync.c.html#LN424"><span class='Ref_To_Local'>nsyncworkers</span></a> <span class='Operator'>&LT; </span><a href="launcher.c.html#LN60"><span class='Ref_to_Global_Var'>max_sync_workers_per_subscription</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN485"></a>                <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>now</span> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN486"></a>                <span class='Control'>struct</span> <a href="tablesync.c.html#LN324"><span class='Ref_to_Struct'>tablesync_start_time_mapping</span></a> <span class='Operator'>*</span><span class='Declare_Local'>hentry</span><span class='Delimiter'>; 
+</span><a name="LN487"></a>                <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+                <a href="tablesync.c.html#LN486"><span class='Ref_To_Local'>hentry</span></a> <span class='Operator'>= </span><a href="../../../include/utils/hsearch.h.html#LN125"><span class='Ref_to_Proto'>hash_search</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN330"><span class='Ref_To_Local'>last_start_times</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN67"><span class='Ref_to_Member'>relid</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/hsearch.h.html#LN105"><span class='Ref_to_EnumConst'>HASH_ENTER</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN487"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN487"><span class='Ref_To_Local'>found</span></a> <span class='Operator'>|| 
+</span>                    <a href="../../../include/utils/timestamp.h.html#LN74"><span class='Ref_to_Proto'>TimestampDifferenceExceeds</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN486"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="tablesync.c.html#LN327"><span class='Ref_to_Member'>last_start_time</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN485"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, 
+</span>                                               <a href="../../access/transam/xlog.c.html#LN106"><span class='Ref_to_Global_Var'>wal_retrieve_retry_interval</span></a><span class='Parentheses'>))</span> 
+                <span class='Delimiter'>{ 
+</span>                    <a href="../../../include/replication/worker_internal.h.html#LN73"><span class='Ref_to_Proto'>logicalrep_worker_launch</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN36"><span class='Ref_to_Member'>dbid</span></a><span class='Delimiter'>, 
+</span>                                             <a href="worker.c.html#LN110"><span class='Ref_to_Global_Var'>MySubscription</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN76"><span class='Ref_to_Member'>oid</span></a><span class='Delimiter'>, 
+</span>                                             <a href="worker.c.html#LN110"><span class='Ref_to_Global_Var'>MySubscription</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN79"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, 
+</span>                                             <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN39"><span class='Ref_to_Member'>userid</span></a><span class='Delimiter'>, 
+</span>                                             <a href="tablesync.c.html#LN398"><span class='Ref_To_Local'>rstate</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN67"><span class='Ref_to_Member'>relid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="tablesync.c.html#LN486"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="tablesync.c.html#LN327"><span class='Ref_to_Member'>last_start_time</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN485"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !syncworker&&nsyncwor... &raquo; </span> 
+        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN332"><span class='Ref_To_Local'>started_tx</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/access/xact.h.html#LN349"><span class='Ref_to_Proto'>CommitTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../postmaster/pgstat.c.html#LN810"><span class='Ref_to_Func'>pgstat_report_stat</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end process_syncing_tables_for_apply &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Process state possible change(s) of tables that are being synchronized. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN517"></a><span class='Declare_Function'>process_syncing_tables</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>current_lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/replication/worker_internal.h.html#LN86"><span class='Ref_to_Func'>am_tablesync_worker</span></a><span class='Parentheses'>())</span> 
+        <a href="tablesync.c.html#LN270"><span class='Ref_to_Func'>process_syncing_tables_for_sync</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN517"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="tablesync.c.html#LN321"><span class='Ref_to_Func'>process_syncing_tables_for_apply</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN517"><span class='Ref_to_Parameter'>current_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Create list of columns for COPY based on logical relation mapping. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN529"></a><span class='Declare_Function'>make_copy_attnamelist</span><span class='Parentheses'>(</span><a href="../../../include/replication/logicalrelation.h.html#LN16"><span class='Ref_to_Struct'>LogicalRepRelMapEntry</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>rel</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN531"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>attnamelist</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN532"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN532"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="tablesync.c.html#LN532"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="tablesync.c.html#LN529"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalrelation.h.html#LN18"><span class='Ref_to_Member'>remoterel</span></a><span class='Operator'>.</span><a href="../../../include/replication/logicalproto.h.html#LN47"><span class='Ref_to_Member'>natts</span></a><span class='Delimiter'>; </span><a href="tablesync.c.html#LN532"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="tablesync.c.html#LN531"><span class='Ref_To_Local'>attnamelist</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN531"><span class='Ref_To_Local'>attnamelist</span></a><span class='Delimiter'>, 
+</span>                              <a href="../../nodes/value.c.html#LN51"><span class='Ref_to_Func'>makeString</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN529"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalrelation.h.html#LN18"><span class='Ref_to_Member'>remoterel</span></a><span class='Operator'>.</span><a href="../../../include/replication/logicalproto.h.html#LN48"><span class='Ref_to_Member'>attnames</span></a><span class='Delimiter'>[</span><a href="tablesync.c.html#LN532"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+ 
+    <span class='Control'>return</span> <a href="tablesync.c.html#LN531"><span class='Ref_To_Local'>attnamelist</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Data source callback for the COPY FROM, which reads from the remote 
+ * connection and passes the data back to our local COPY. 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN549"></a><span class='Declare_Function'>copy_read_data</span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>outbuf</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>minread</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>maxread</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN551"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>bytesread</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN552"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>avail</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If there are some leftover data from previous read, use it. */ 
+</span>    <a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN37"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>- </span><a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN39"><span class='Ref_to_Member'>cursor</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a> <span class='Operator'>&GT; </span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>maxread</span></a><span class='Parentheses'>) 
+</span>            <a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>maxread</span></a><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>outbuf</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>[</span><a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN39"><span class='Ref_to_Member'>cursor</span></a><span class='Delimiter'>], </span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN39"><span class='Ref_to_Member'>cursor</span></a> <span class='Operator'>+= </span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>maxread</span></a> <span class='Operator'>-= </span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN551"><span class='Ref_To_Local'>bytesread</span></a> <span class='Operator'>+= </span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>maxread</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="tablesync.c.html#LN551"><span class='Ref_To_Local'>bytesread</span></a> <span class='Operator'>&LT; </span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>minread</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN568"></a>        <a href="../../../include/port.h.html#LN25"><span class='Ref_to_Typedef'>pgsocket</span></a>    <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../../include/port.h.html#LN23"><span class='Ref_to_Const'>PGINVALID_SOCKET</span></a><span class='Delimiter'>; 
+</span><a name="LN569"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span><a name="LN570"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>len</span><span class='Delimiter'>; 
+</span><a name="LN571"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>buf</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Try read the data. */ 
+</span>            <a href="tablesync.c.html#LN570"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>= </span><a href="../../../include/replication/walreceiver.h.html#LN255"><span class='Ref_to_Macro'>walrcv_receive</span></a><span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN571"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN568"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN570"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN570"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="tablesync.c.html#LN551"><span class='Ref_To_Local'>bytesread</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* Process the data */ 
+</span>                <a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN571"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN37"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN570"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN39"><span class='Ref_to_Member'>cursor</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+                <a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN37"><span class='Ref_to_Member'>len</span></a> <span class='Operator'>- </span><a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN39"><span class='Ref_to_Member'>cursor</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a> <span class='Operator'>&GT; </span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>maxread</span></a><span class='Parentheses'>) 
+</span>                    <a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>maxread</span></a><span class='Delimiter'>; 
+</span>                memcpy<span class='Parentheses'>(</span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>outbuf</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>[</span><a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN39"><span class='Ref_to_Member'>cursor</span></a><span class='Delimiter'>], </span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>outbuf</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) ((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>outbuf</span></a> <span class='Operator'>+ </span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a><span class='Operator'>-&GT;</span><a href="../../../include/lib/stringinfo.h.html#LN39"><span class='Ref_to_Member'>cursor</span></a> <span class='Operator'>+= </span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>maxread</span></a> <span class='Operator'>-= </span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Delimiter'>; 
+</span>                <a href="tablesync.c.html#LN551"><span class='Ref_To_Local'>bytesread</span></a> <span class='Operator'>+= </span><a href="tablesync.c.html#LN552"><span class='Ref_To_Local'>avail</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>maxread</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="tablesync.c.html#LN551"><span class='Ref_To_Local'>bytesread</span></a> <span class='Operator'>&GT;= </span><a href="tablesync.c.html#LN549"><span class='Ref_to_Parameter'>minread</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="tablesync.c.html#LN551"><span class='Ref_To_Local'>bytesread</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* 
+         * Wait for more data or latch. 
+         */ 
+</span>        <a href="tablesync.c.html#LN569"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/storage/latch.h.html#LN165"><span class='Ref_to_Proto'>WaitLatchOrSocket</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                               <a href="../../../include/storage/latch.h.html#LN124"><span class='Ref_to_Const'>WL_SOCKET_READABLE</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| 
+</span>                               <a href="../../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                               <a href="tablesync.c.html#LN568"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>, </span><span class='Number'>1000L</span><span class='Delimiter'>, </span><a href="../../../include/pgstat.h.html#LN813"><span class='Ref_to_EnumConst'>WAIT_EVENT_LOGICAL_SYNC_DATA</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Emergency bailout if postmaster has died */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN569"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while maxread&GT;0&&bytesread&LT;... &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="tablesync.c.html#LN551"><span class='Ref_To_Local'>bytesread</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end copy_read_data &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Get information about remote relation in similar fashion the RELATION 
+ * message provides during replication. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN629"></a><span class='Declare_Function'>fetch_remote_table_info</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>nspname</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>relname</span><span class='Delimiter'>, 
+</span><a name="LN630"></a>                        <a href="../../../include/replication/logicalproto.h.html#LN41"><span class='Ref_to_Struct'>LogicalRepRelation</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>lrel</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN632"></a>    <a href="../../../include/replication/walreceiver.h.html#LN184"><span class='Ref_to_Struct'>WalRcvExecResult</span></a> <span class='Operator'>*</span><span class='Declare_Local'>res</span><span class='Delimiter'>; 
+</span><a name="LN633"></a>    <a href="../../../include/lib/stringinfo.h.html#LN34"><span class='Ref_to_Struct'>StringInfoData</span></a> <span class='Declare_Local'>cmd</span><span class='Delimiter'>; 
+</span><a name="LN634"></a>    <a href="../../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN635"></a>    <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>tableRow</span><span class='Delimiter'>[</span><span class='Number'>2</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Delimiter'>{</span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN27"><span class='Ref_to_Const'>OIDOID</span></a><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN19"><span class='Ref_to_Const'>CHAROID</span></a><span class='Delimiter'>}; 
+</span><a name="LN636"></a>    <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>attrRow</span><span class='Delimiter'>[</span><span class='Number'>4</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Delimiter'>{</span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN26"><span class='Ref_to_Const'>TEXTOID</span></a><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN27"><span class='Ref_to_Const'>OIDOID</span></a><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN24"><span class='Ref_to_Const'>INT4OID</span></a><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN17"><span class='Ref_to_Const'>BOOLOID</span></a><span class='Delimiter'>}; 
+</span><a name="LN637"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>isnull</span><span class='Delimiter'>; 
+</span><a name="LN638"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>natt</span><span class='Delimiter'>; 
+</span> 
+    <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN45"><span class='Ref_to_Member'>nspname</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>nspname</span></a><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN46"><span class='Ref_to_Member'>relname</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>relname</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* First fetch Oid and replica identity. */ 
+</span>    <a href="../../lib/stringinfo.c.html#LN44"><span class='Ref_to_Func'>initStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN633"><span class='Ref_To_Local'>cmd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../bin/pg_waldump/compat.c.html#LN69"><span class='Ref_to_Func'>appendStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN633"><span class='Ref_To_Local'>cmd</span></a><span class='Delimiter'>, </span><span class='String'>"SELECT c.oid, c.relreplident"</span> 
+                     <span class='String'>"  FROM pg_catalog.pg_class c"</span> 
+                     <span class='String'>"  INNER JOIN pg_catalog.pg_namespace n"</span> 
+                     <span class='String'>"        ON (c.relnamespace = n.oid)"</span> 
+                     <span class='String'>" WHERE n.nspname = %s"</span> 
+                     <span class='String'>"   AND c.relname = %s"</span> 
+                     <span class='String'>"   AND c.relkind = 'r'"</span><span class='Delimiter'>, 
+</span>                     <a href="../../utils/adt/quote.c.html#LN100"><span class='Ref_to_Func'>quote_literal_cstr</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>nspname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../../utils/adt/quote.c.html#LN100"><span class='Ref_to_Func'>quote_literal_cstr</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>relname</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="../../../include/replication/walreceiver.h.html#LN261"><span class='Ref_to_Macro'>walrcv_exec</span></a><span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN633"><span class='Ref_To_Local'>cmd</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>, </span><span class='Number'>2</span><span class='Delimiter'>, </span><a href="tablesync.c.html#LN635"><span class='Ref_To_Local'>tableRow</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN186"><span class='Ref_to_Member'>status</span></a> <span class='Operator'>!= </span><a href="../../../include/replication/walreceiver.h.html#LN173"><span class='Ref_to_EnumConst'>WALRCV_OK_TUPLES</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not fetch table info for table \"%s.%s\" from publisher: %s"</span><span class='Delimiter'>, 
+</span>                        <a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>nspname</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>relname</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN187"><span class='Ref_to_Member'>err</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../../../include/executor/tuptable.h.html#LN144"><span class='Ref_to_Proto'>MakeSingleTupleTableSlot</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN189"><span class='Ref_to_Member'>tupledesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/utils/tuplestore.h.html#LN72"><span class='Ref_to_Proto'>tuplestore_gettupleslot</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN188"><span class='Ref_to_Member'>tuplestore</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"table \"%s.%s\" not found on publisher"</span><span class='Delimiter'>, 
+</span>                        <a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>nspname</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>relname</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN44"><span class='Ref_to_Member'>remoteid</span></a> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN505"><span class='Ref_to_Macro'>DatumGetObjectId</span></a><span class='Parentheses'>(</span><a href="../../../include/executor/tuptable.h.html#LN167"><span class='Ref_to_Proto'>slot_getattr</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN637"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN637"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN50"><span class='Ref_to_Member'>replident</span></a> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN414"><span class='Ref_to_Macro'>DatumGetChar</span></a><span class='Parentheses'>(</span><a href="../../../include/executor/tuptable.h.html#LN167"><span class='Ref_to_Proto'>slot_getattr</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><span class='Number'>2</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN637"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN637"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/executor/tuptable.h.html#LN145"><span class='Ref_to_Proto'>ExecDropSingleTupleTableSlot</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/replication/walreceiver.h.html#LN266"><span class='Ref_to_Func'>walrcv_clear_result</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now fetch columns. */ 
+</span>    <a href="../../lib/stringinfo.c.html#LN60"><span class='Ref_to_Func'>resetStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN633"><span class='Ref_To_Local'>cmd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../bin/pg_waldump/compat.c.html#LN69"><span class='Ref_to_Func'>appendStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN633"><span class='Ref_To_Local'>cmd</span></a><span class='Delimiter'>, 
+</span>                     <span class='String'>"SELECT a.attname,"</span> 
+                     <span class='String'>"       a.atttypid,"</span> 
+                     <span class='String'>"       a.atttypmod,"</span> 
+                     <span class='String'>"       a.attnum = ANY(i.indkey)"</span> 
+                     <span class='String'>"  FROM pg_catalog.pg_attribute a"</span> 
+                     <span class='String'>"  LEFT JOIN pg_catalog.pg_index i"</span> 
+               <span class='String'>"       ON (i.indexrelid = pg_get_replica_identity_index(%u))"</span> 
+                     <span class='String'>" WHERE a.attnum &GT; 0::pg_catalog.int2"</span> 
+                     <span class='String'>"   AND NOT a.attisdropped"</span> 
+                     <span class='String'>"   AND a.attrelid = %u"</span> 
+                     <span class='String'>" ORDER BY a.attnum"</span><span class='Delimiter'>, 
+</span>                     <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN44"><span class='Ref_to_Member'>remoteid</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN44"><span class='Ref_to_Member'>remoteid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="../../../include/replication/walreceiver.h.html#LN261"><span class='Ref_to_Macro'>walrcv_exec</span></a><span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN633"><span class='Ref_To_Local'>cmd</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>, </span><span class='Number'>4</span><span class='Delimiter'>, </span><a href="tablesync.c.html#LN636"><span class='Ref_To_Local'>attrRow</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN186"><span class='Ref_to_Member'>status</span></a> <span class='Operator'>!= </span><a href="../../../include/replication/walreceiver.h.html#LN173"><span class='Ref_to_EnumConst'>WALRCV_OK_TUPLES</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not fetch table info for table \"%s.%s\": %s"</span><span class='Delimiter'>, 
+</span>                        <a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>nspname</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>relname</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN187"><span class='Ref_to_Member'>err</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We don't know the number of rows coming, so allocate enough space. */ 
+</span>    <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN48"><span class='Ref_to_Member'>attnames</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><a href="../../../include/access/htup_details.h.html#LN32"><span class='Ref_to_Const'>MaxTupleAttributeNumber</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN49"><span class='Ref_to_Member'>atttyps</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><a href="../../../include/access/htup_details.h.html#LN32"><span class='Ref_to_Const'>MaxTupleAttributeNumber</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN51"><span class='Ref_to_Member'>attkeys</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <a href="tablesync.c.html#LN638"><span class='Ref_To_Local'>natt</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../../../include/executor/tuptable.h.html#LN144"><span class='Ref_to_Proto'>MakeSingleTupleTableSlot</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN189"><span class='Ref_to_Member'>tupledesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="../../../include/utils/tuplestore.h.html#LN72"><span class='Ref_to_Proto'>tuplestore_gettupleslot</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN188"><span class='Ref_to_Member'>tuplestore</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN48"><span class='Ref_to_Member'>attnames</span></a><span class='Delimiter'>[</span><a href="tablesync.c.html#LN638"><span class='Ref_To_Local'>natt</span></a><span class='Delimiter'>] </span><span class='Operator'>= 
+</span>            <a href="../../../include/utils/builtins.h.html#LN91"><span class='Ref_to_Macro'>TextDatumGetCString</span></a><span class='Parentheses'>(</span><a href="../../../include/executor/tuptable.h.html#LN167"><span class='Ref_to_Proto'>slot_getattr</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN637"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN637"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN49"><span class='Ref_to_Member'>atttyps</span></a><span class='Delimiter'>[</span><a href="tablesync.c.html#LN638"><span class='Ref_To_Local'>natt</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN505"><span class='Ref_to_Macro'>DatumGetObjectId</span></a><span class='Parentheses'>(</span><a href="../../../include/executor/tuptable.h.html#LN167"><span class='Ref_to_Proto'>slot_getattr</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><span class='Number'>2</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN637"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tablesync.c.html#LN637"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN398"><span class='Ref_to_Macro'>DatumGetBool</span></a><span class='Parentheses'>(</span><a href="../../../include/executor/tuptable.h.html#LN167"><span class='Ref_to_Proto'>slot_getattr</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><span class='Number'>4</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN637"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>)))</span> 
+            <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN51"><span class='Ref_to_Member'>attkeys</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/bitmapset.h.html#LN89"><span class='Ref_to_Proto'>bms_add_member</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN51"><span class='Ref_to_Member'>attkeys</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN638"><span class='Ref_To_Local'>natt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Should never happen. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>++</span><a href="tablesync.c.html#LN638"><span class='Ref_To_Local'>natt</span></a> <span class='Operator'>&GT;= </span><a href="../../../include/access/htup_details.h.html#LN32"><span class='Ref_to_Const'>MaxTupleAttributeNumber</span></a><span class='Parentheses'>) 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"too many columns in remote table \"%s.%s\""</span><span class='Delimiter'>, 
+</span>                 <a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>nspname</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN629"><span class='Ref_to_Parameter'>relname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../../include/executor/tuptable.h.html#LN145"><span class='Ref_to_Proto'>ExecDropSingleTupleTableSlot</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN634"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="tablesync.c.html#LN630"><span class='Ref_to_Parameter'>lrel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalproto.h.html#LN47"><span class='Ref_to_Member'>natts</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN638"><span class='Ref_To_Local'>natt</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/replication/walreceiver.h.html#LN266"><span class='Ref_to_Func'>walrcv_clear_result</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN632"><span class='Ref_To_Local'>res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN633"><span class='Ref_To_Local'>cmd</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end fetch_remote_table_info &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Copy existing data of a table from publisher. 
+ * 
+ * Caller is responsible for locking the local relation. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN735"></a><span class='Declare_Function'>copy_table</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN737"></a>    <a href="../../../include/replication/logicalrelation.h.html#LN16"><span class='Ref_to_Struct'>LogicalRepRelMapEntry</span></a> <span class='Operator'>*</span><span class='Declare_Local'>relmapentry</span><span class='Delimiter'>; 
+</span><a name="LN738"></a>    <a href="../../../include/replication/logicalproto.h.html#LN41"><span class='Ref_to_Struct'>LogicalRepRelation</span></a> <span class='Declare_Local'>lrel</span><span class='Delimiter'>; 
+</span><a name="LN739"></a>    <a href="../../../include/replication/walreceiver.h.html#LN184"><span class='Ref_to_Struct'>WalRcvExecResult</span></a> <span class='Operator'>*</span><span class='Declare_Local'>res</span><span class='Delimiter'>; 
+</span><a name="LN740"></a>    <a href="../../../include/lib/stringinfo.h.html#LN34"><span class='Ref_to_Struct'>StringInfoData</span></a> <span class='Declare_Local'>cmd</span><span class='Delimiter'>; 
+</span><a name="LN741"></a>    <a href="../../../include/commands/copy.h.html#LN22"><span class='Ref_to_Typedef'>CopyState</span></a>   <span class='Declare_Local'>cstate</span><span class='Delimiter'>; 
+</span><a name="LN742"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>attnamelist</span><span class='Delimiter'>; 
+</span><a name="LN743"></a>    <a href="../../../include/parser/parse_node.h.html#LN164"><span class='Ref_to_Struct'>ParseState</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pstate</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get the publisher relation info. */ 
+</span>    <a href="tablesync.c.html#LN628"><span class='Ref_to_Func'>fetch_remote_table_info</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/lsyscache.h.html#LN175"><span class='Ref_to_Proto'>get_namespace_name</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN443"><span class='Ref_to_Macro'>RelationGetNamespace</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN735"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>))</span><span class='Delimiter'>, 
+</span>                            <a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN735"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN738"><span class='Ref_To_Local'>lrel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Put the relation into relmap. */ 
+</span>    <a href="../../../include/replication/logicalrelation.h.html#LN31"><span class='Ref_to_Proto'>logicalrep_relmap_update</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN738"><span class='Ref_To_Local'>lrel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Map the publisher relation to local one. */ 
+</span>    <a href="tablesync.c.html#LN737"><span class='Ref_To_Local'>relmapentry</span></a> <span class='Operator'>= </span><a href="../../../include/replication/logicalrelation.h.html#LN33"><span class='Ref_to_Proto'>logicalrep_rel_open</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN738"><span class='Ref_To_Local'>lrel</span></a><span class='Operator'>.</span><a href="../../../include/replication/logicalproto.h.html#LN44"><span class='Ref_to_Member'>remoteid</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN33"><span class='Ref_to_Const'>NoLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="tablesync.c.html#LN735"><span class='Ref_to_Parameter'>rel</span></a> <span class='Operator'>== </span><a href="tablesync.c.html#LN737"><span class='Ref_To_Local'>relmapentry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/logicalrelation.h.html#LN22"><span class='Ref_to_Member'>localrel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Start copy on the publisher. */ 
+</span>    <a href="../../lib/stringinfo.c.html#LN44"><span class='Ref_to_Func'>initStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN740"><span class='Ref_To_Local'>cmd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../bin/pg_waldump/compat.c.html#LN69"><span class='Ref_to_Func'>appendStringInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="tablesync.c.html#LN740"><span class='Ref_To_Local'>cmd</span></a><span class='Delimiter'>, </span><span class='String'>"COPY %s TO STDOUT"</span><span class='Delimiter'>, 
+</span>                     <a href="../../../include/utils/builtins.h.html#LN78"><span class='Ref_to_Proto'>quote_qualified_identifier</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN738"><span class='Ref_To_Local'>lrel</span></a><span class='Operator'>.</span><a href="../../../include/replication/logicalproto.h.html#LN45"><span class='Ref_to_Member'>nspname</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN738"><span class='Ref_To_Local'>lrel</span></a><span class='Operator'>.</span><a href="../../../include/replication/logicalproto.h.html#LN46"><span class='Ref_to_Member'>relname</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN739"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="../../../include/replication/walreceiver.h.html#LN261"><span class='Ref_to_Macro'>walrcv_exec</span></a><span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN740"><span class='Ref_To_Local'>cmd</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN740"><span class='Ref_To_Local'>cmd</span></a><span class='Operator'>.</span><a href="../../../include/lib/stringinfo.h.html#LN36"><span class='Ref_to_Member'>data</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN739"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN186"><span class='Ref_to_Member'>status</span></a> <span class='Operator'>!= </span><a href="../../../include/replication/walreceiver.h.html#LN175"><span class='Ref_to_EnumConst'>WALRCV_OK_COPY_OUT</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not start initial contents copy for table \"%s.%s\": %s"</span><span class='Delimiter'>, 
+</span>                        <a href="tablesync.c.html#LN738"><span class='Ref_To_Local'>lrel</span></a><span class='Operator'>.</span><a href="../../../include/replication/logicalproto.h.html#LN45"><span class='Ref_to_Member'>nspname</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN738"><span class='Ref_To_Local'>lrel</span></a><span class='Operator'>.</span><a href="../../../include/replication/logicalproto.h.html#LN46"><span class='Ref_to_Member'>relname</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN739"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN187"><span class='Ref_to_Member'>err</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/replication/walreceiver.h.html#LN266"><span class='Ref_to_Func'>walrcv_clear_result</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN739"><span class='Ref_To_Local'>res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="tablesync.c.html#LN113"><span class='Ref_to_Global_Var'>copybuf</span></a> <span class='Operator'>= </span><a href="../../lib/stringinfo.c.html#LN26"><span class='Ref_to_Func'>makeStringInfo</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="tablesync.c.html#LN743"><span class='Ref_To_Local'>pstate</span></a> <span class='Operator'>= </span><a href="../../parser/parse_node.c.html#LN42"><span class='Ref_to_Func'>make_parsestate</span></a><span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/parser/parse_relation.h.html#LN69"><span class='Ref_to_Proto'>addRangeTableEntryForRelation</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN743"><span class='Ref_To_Local'>pstate</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN735"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="tablesync.c.html#LN742"><span class='Ref_To_Local'>attnamelist</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN528"><span class='Ref_to_Func'>make_copy_attnamelist</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN737"><span class='Ref_To_Local'>relmapentry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN741"><span class='Ref_To_Local'>cstate</span></a> <span class='Operator'>= </span><a href="../../../include/commands/copy.h.html#LN30"><span class='Ref_to_Proto'>BeginCopyFrom</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN743"><span class='Ref_To_Local'>pstate</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN735"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="tablesync.c.html#LN548"><span class='Ref_to_Func'>copy_read_data</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN742"><span class='Ref_To_Local'>attnamelist</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Do the copy */ 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="../../../include/commands/copy.h.html#LN39"><span class='Ref_to_Proto'>CopyFrom</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN741"><span class='Ref_To_Local'>cstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/replication/logicalrelation.h.html#LN35"><span class='Ref_to_Proto'>logicalrep_rel_close</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN737"><span class='Ref_To_Local'>relmapentry</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN33"><span class='Ref_to_Const'>NoLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end copy_table &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Start syncing the table in the sync worker. 
+ * 
+ * The returned slot name is palloc'ed in current memory context. 
+ */ 
+</span><span class='Keyword'>char </span><span class='Operator'>* 
+</span><a name="LN788"></a><span class='Declare_Function'>LogicalRepSyncTableStart</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>origin_startpos</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN790"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>slotname</span><span class='Delimiter'>; 
+</span><a name="LN791"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>err</span><span class='Delimiter'>; 
+</span><a name="LN792"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>relstate</span><span class='Delimiter'>; 
+</span><a name="LN793"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>relstate_lsn</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Check the state of the table synchronization. */ 
+</span>    <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="tablesync.c.html#LN792"><span class='Ref_To_Local'>relstate</span></a> <span class='Operator'>= </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN74"><span class='Ref_to_Proto'>GetSubscriptionRelState</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, 
+</span>                                       <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Delimiter'>, 
+</span>                                       <span class='Operator'>&</span><a href="tablesync.c.html#LN793"><span class='Ref_To_Local'>relstate_lsn</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xact.h.html#LN349"><span class='Ref_to_Proto'>CommitTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN792"><span class='Ref_To_Local'>relstate</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a> <span class='Operator'>= </span><a href="tablesync.c.html#LN793"><span class='Ref_To_Local'>relstate_lsn</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * To build a slot name for the sync work, we are limited to NAMEDATALEN - 
+     * 1 characters.  We cut the original slot name to NAMEDATALEN - 28 chars 
+     * and append _%u_sync_%u (1 + 10 + 6 + 10 + '\0').  (It's actually the 
+     * NAMEDATALEN on the remote that matters, but this scheme will also work 
+     * reasonably if that is different.) 
+     */ 
+</span>    <a href="../../../include/c.h.html#LN751"><span class='Ref_to_Macro'>StaticAssertStmt</span></a><span class='Parentheses'>(</span><a href="../../../interfaces/ecpg/include/sqlda-native.h.html#LN15"><span class='Ref_to_Const'>NAMEDATALEN</span></a> <span class='Operator'>&GT;= </span><span class='Number'>32</span><span class='Delimiter'>, </span><span class='String'>"NAMEDATALEN too small"</span><span class='Parentheses'>)</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* for sanity */ 
+</span>    <a href="tablesync.c.html#LN790"><span class='Ref_To_Local'>slotname</span></a> <span class='Operator'>= </span><a href="../../../common/psprintf.c.html#LN44"><span class='Ref_to_Func'>psprintf</span></a><span class='Parentheses'>(</span><span class='String'>"%.*s_%u_sync_%u"</span><span class='Delimiter'>, 
+</span>                        <a href="../../../interfaces/ecpg/include/sqlda-native.h.html#LN15"><span class='Ref_to_Const'>NAMEDATALEN</span></a> <span class='Operator'>- </span><span class='Number'>28</span><span class='Delimiter'>, 
+</span>                        <a href="worker.c.html#LN110"><span class='Ref_to_Global_Var'>MySubscription</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN83"><span class='Ref_to_Member'>slotname</span></a><span class='Delimiter'>, 
+</span>                        <a href="worker.c.html#LN110"><span class='Ref_to_Global_Var'>MySubscription</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN76"><span class='Ref_to_Member'>oid</span></a><span class='Delimiter'>, 
+</span>                        <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Here we use the slot name instead of the subscription name as the 
+     * application_name, so that it is different from the main apply worker, 
+     * so that synchronous replication can distinguish them. 
+     */ 
+</span>    <a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a> <span class='Operator'>= </span><a href="../../../include/replication/walreceiver.h.html#LN241"><span class='Ref_to_Macro'>walrcv_connect</span></a><span class='Parentheses'>(</span><a href="worker.c.html#LN110"><span class='Ref_to_Global_Var'>MySubscription</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN82"><span class='Ref_to_Member'>conninfo</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><a href="tablesync.c.html#LN790"><span class='Ref_To_Local'>slotname</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="tablesync.c.html#LN791"><span class='Ref_To_Local'>err</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not connect to the publisher: %s"</span><span class='Delimiter'>, </span><a href="tablesync.c.html#LN791"><span class='Ref_To_Local'>err</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="../../../include/catalog/pg_subscription_rel.h.html#LN53"><span class='Ref_to_Const'>SUBREL_STATE_INIT</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="../../../include/catalog/pg_subscription_rel.h.html#LN54"><span class='Ref_to_Const'>SUBREL_STATE_DATASYNC</span></a><span class='Operator'>: 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN836"></a>                <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>rel</span><span class='Delimiter'>; 
+</span><a name="LN837"></a>                <a href="../../../include/replication/walreceiver.h.html#LN184"><span class='Ref_to_Struct'>WalRcvExecResult</span></a> <span class='Operator'>*</span><span class='Declare_Local'>res</span><span class='Delimiter'>; 
+</span> 
+                <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a> <span class='Operator'>= </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN54"><span class='Ref_to_Const'>SUBREL_STATE_DATASYNC</span></a><span class='Delimiter'>; 
+</span>                <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>                <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* Update the state and make it visible to others. */ 
+</span>                <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/catalog/pg_subscription_rel.h.html#LN72"><span class='Ref_to_Proto'>SetSubscriptionRelState</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, 
+</span>                                        <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Delimiter'>, 
+</span>                                        <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a><span class='Delimiter'>, 
+</span>                                        <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a><span class='Delimiter'>, 
+</span>                                        <span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/access/xact.h.html#LN349"><span class='Ref_to_Proto'>CommitTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>                <a href="../../postmaster/pgstat.c.html#LN810"><span class='Ref_to_Func'>pgstat_report_stat</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * We want to do the table data sync in a single transaction. 
+                 */ 
+</span>                <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * Use a standard write lock here. It might be better to 
+                 * disallow access to the table while it's being synchronized. 
+                 * But we don't want to block the main apply process from 
+                 * working and it has to open the relation in RowExclusiveLock 
+                 * when remapping remote relation id to local one. 
+                 */ 
+</span>                <a href="tablesync.c.html#LN836"><span class='Ref_To_Local'>rel</span></a> <span class='Operator'>= </span><a href="../../../include/access/heapam.h.html#LN91"><span class='Ref_to_Proto'>heap_open</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN37"><span class='Ref_to_Const'>RowExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * Create a temporary slot for the sync process. We do this 
+                 * inside the transaction so that we can use the snapshot made 
+                 * by the slot to get existing data. 
+                 */ 
+</span>                <a href="tablesync.c.html#LN837"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="../../../include/replication/walreceiver.h.html#LN261"><span class='Ref_to_Macro'>walrcv_exec</span></a><span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Delimiter'>, 
+</span>                                  <span class='String'>"BEGIN READ ONLY ISOLATION LEVEL "</span> 
+                                  <span class='String'>"REPEATABLE READ"</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN837"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN186"><span class='Ref_to_Member'>status</span></a> <span class='Operator'>!= </span><a href="../../../include/replication/walreceiver.h.html#LN171"><span class='Ref_to_EnumConst'>WALRCV_OK_COMMAND</span></a><span class='Parentheses'>) 
+</span>                    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                            <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"table copy could not start transaction on publisher"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                             <a href="../../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The error was: %s"</span><span class='Delimiter'>, </span><a href="tablesync.c.html#LN837"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN187"><span class='Ref_to_Member'>err</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/replication/walreceiver.h.html#LN266"><span class='Ref_to_Func'>walrcv_clear_result</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN837"><span class='Ref_To_Local'>res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * Create new temporary logical decoding slot. 
+                 * 
+                 * We'll use slot for data copy so make sure the snapshot is 
+                 * used for the transaction; that way the COPY will get data 
+                 * that is consistent with the lsn used by the slot to start 
+                 * decoding. 
+                 */ 
+</span>                <a href="../../../include/replication/walreceiver.h.html#LN259"><span class='Ref_to_Macro'>walrcv_create_slot</span></a><span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN790"><span class='Ref_To_Local'>slotname</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, 
+</span>                                   <a href="../../../include/replication/walsender.h.html#LN25"><span class='Ref_to_EnumConst'>CRS_USE_SNAPSHOT</span></a><span class='Delimiter'>, </span><a href="tablesync.c.html#LN788"><span class='Ref_to_Parameter'>origin_startpos</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="tablesync.c.html#LN734"><span class='Ref_to_Func'>copy_table</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN836"><span class='Ref_To_Local'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="tablesync.c.html#LN837"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="../../../include/replication/walreceiver.h.html#LN261"><span class='Ref_to_Macro'>walrcv_exec</span></a><span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Delimiter'>, </span><span class='String'>"COMMIT"</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tablesync.c.html#LN837"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN186"><span class='Ref_to_Member'>status</span></a> <span class='Operator'>!= </span><a href="../../../include/replication/walreceiver.h.html#LN171"><span class='Ref_to_EnumConst'>WALRCV_OK_COMMAND</span></a><span class='Parentheses'>) 
+</span>                    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                            <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"table copy could not finish transaction on publisher"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                             <a href="../../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The error was: %s"</span><span class='Delimiter'>, </span><a href="tablesync.c.html#LN837"><span class='Ref_To_Local'>res</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/walreceiver.h.html#LN187"><span class='Ref_to_Member'>err</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/replication/walreceiver.h.html#LN266"><span class='Ref_to_Func'>walrcv_clear_result</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN837"><span class='Ref_To_Local'>res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="../../../include/access/heapam.h.html#LN96"><span class='Ref_to_Macro'>heap_close</span></a><span class='Parentheses'>(</span><a href="tablesync.c.html#LN836"><span class='Ref_To_Local'>rel</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN33"><span class='Ref_to_Const'>NoLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* Make the copy visible. */ 
+</span>                <a href="../../../include/access/xact.h.html#LN346"><span class='Ref_to_Proto'>CommandCounterIncrement</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * We are done with the initial data synchronization, update 
+                 * the state. 
+                 */ 
+</span>                <a href="../../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a> <span class='Operator'>= </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN62"><span class='Ref_to_Const'>SUBREL_STATE_SYNCWAIT</span></a><span class='Delimiter'>; 
+</span>                <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a> <span class='Operator'>= *</span><a href="tablesync.c.html#LN788"><span class='Ref_to_Parameter'>origin_startpos</span></a><span class='Delimiter'>; 
+</span>                <a href="../../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* Wait for main apply worker to tell us to catchup. */ 
+</span>                <a href="tablesync.c.html#LN217"><span class='Ref_to_Func'>wait_for_worker_state_change</span></a><span class='Parentheses'>(</span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN63"><span class='Ref_to_Const'>SUBREL_STATE_CATCHUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/*---------- 
+                 * There are now two possible states here: 
+                 * a) Sync is behind the apply.  If that's the case we need to 
+                 *    catch up with it by consuming the logical replication 
+                 *    stream up to the relstate_lsn.  For that, we exit this 
+                 *    function and continue in ApplyWorkerMain(). 
+                 * b) Sync is caught up with the apply.  So it can just set 
+                 *    the state to SYNCDONE and finish. 
+                 *---------- 
+                 */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="tablesync.c.html#LN788"><span class='Ref_to_Parameter'>origin_startpos</span></a> <span class='Operator'>&GT;= </span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <span class='Comment_Multi_Line'>/* 
+                     * Update the new state in catalog.  No need to bother 
+                     * with the shmem state as we are exiting for good. 
+                     */ 
+</span>                    <a href="../../../include/catalog/pg_subscription_rel.h.html#LN72"><span class='Ref_to_Proto'>SetSubscriptionRelState</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Delimiter'>, 
+</span>                                            <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Delimiter'>, 
+</span>                                            <a href="../../../include/catalog/pg_subscription_rel.h.html#LN56"><span class='Ref_to_Const'>SUBREL_STATE_SYNCDONE</span></a><span class='Delimiter'>, 
+</span>                                            <span class='Operator'>*</span><a href="tablesync.c.html#LN788"><span class='Ref_to_Parameter'>origin_startpos</span></a><span class='Delimiter'>, 
+</span>                                            <span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    finish_sync_worker<span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Control'>case</span> <a href="../../../include/catalog/pg_subscription_rel.h.html#LN56"><span class='Ref_to_Const'>SUBREL_STATE_SYNCDONE</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="../../../include/catalog/pg_subscription_rel.h.html#LN58"><span class='Ref_to_Const'>SUBREL_STATE_READY</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="../../../include/catalog/pg_subscription_rel.h.html#LN61"><span class='Ref_to_Const'>SUBREL_STATE_UNKNOWN</span></a><span class='Operator'>: 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Nothing to do here but finish.  (UNKNOWN means the relation was 
+             * removed from pg_subscription_rel before the sync worker could 
+             * start.) 
+             */ 
+</span>            finish_sync_worker<span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unknown relation state \"%c\""</span><span class='Delimiter'>, 
+</span>                 <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch MyLogicalRepWorker-&GT;r... &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="tablesync.c.html#LN790"><span class='Ref_To_Local'>slotname</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end LogicalRepSyncTableStart &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

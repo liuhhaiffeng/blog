@@ -1,0 +1,932 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\libpq\be-fsstubs.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\libpq\be-fsstubs.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:40 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * be-fsstubs.c 
+ *    Builtin functions for open/close/read/write operations on large objects 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/libpq/be-fsstubs.c 
+ * 
+ * NOTES 
+ *    This should be moved to a more appropriate place.  It is here 
+ *    for lack of a better place. 
+ * 
+ *    These functions store LargeObjectDesc structs in a private MemoryContext, 
+ *    which means that large object descriptors hang around until we destroy 
+ *    the context at transaction end.  It'd be possible to prolong the lifetime 
+ *    of the context so that LO FDs are good across transactions (for example, 
+ *    we could release the context only if we see that no FDs remain open). 
+ *    But we'd need additional state in order to do the right thing at the 
+ *    end of an aborted transaction.  FDs opened during an aborted xact would 
+ *    still need to be closed, since they might not be pointing at valid 
+ *    relations at all.  Locking semantics are also an interesting problem 
+ *    if LOs stay open across transactions.  For now, we'll stick with the 
+ *    existing documented semantics of LO FDs: they're only good within a 
+ *    transaction. 
+ * 
+ *    As of PostgreSQL 8.0, much of the angst expressed above is no longer 
+ *    relevant, and in fact it'd be pretty easy to allow LO FDs to stay 
+ *    open across transactions.  (Snapshot relevancy would still be an issue.) 
+ *    However backwards compatibility suggests that we should stick to the 
+ *    status quo. 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;fcntl.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/stat.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"libpq/be-fsstubs.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"libpq/libpq-fs.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/fd.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/large_object.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/acl.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/builtins.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * compatibility flag for permission checks 
+ */ 
+</span><a name="LN56"></a><span class='Keyword'>bool</span>        <span class='Declare_Var'>lo_compat_privileges</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* define this to enable debug logging */ 
+/* #define FSDB 1 */ 
+/* chunk size for lo_import/lo_export transfers */ 
+</span><a name="LN61"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>BUFSIZE</span>         <span class='Number'>8192</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * LO "FD"s are indexes into the cookies array. 
+ * 
+ * A non-null entry is a pointer to a LargeObjectDesc allocated in the 
+ * LO private memory context "fscxt".  The cookies array itself is also 
+ * dynamically allocated in that context.  Its current allocated size is 
+ * cookies_len entries, of which any unused entries will be NULL. 
+ */ 
+</span><a name="LN71"></a><span class='Keyword'>static </span><a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>**</span><span class='Declare_Var'>cookies</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN72"></a><span class='Keyword'>static int</span>  <span class='Declare_Var'>cookies_size</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+<a name="LN74"></a><span class='Keyword'>static </span><a href="../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Var'>fscxt</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+<a name="LN76"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>CreateFSContext</span><span class='Parentheses'>() </span><span class='Operator'>\ 
+</span>    <span class='Control'>do</span> <span class='Delimiter'>{ </span><span class='Operator'>\ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>            <a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a> <span class='Operator'>= </span><a href="../../include/utils/memutils.h.html#LN145"><span class='Ref_to_Proto'>AllocSetContextCreate</span></a><span class='Parentheses'>(</span><a href="../utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>                                          <span class='String'>"Filesystem"</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>                                          <a href="../../include/utils/memutils.h.html#LN164"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_SIZES</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; </span><span class='Operator'>\ 
+</span>    <span class='Delimiter'>} </span><span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>) 
+</span> 
+ 
+<a name="LN85"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>newLOfd</span><span class='Parentheses'>(</span><a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>lobjCookie</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN86"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>deleteLOfd</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>fd</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN87"></a><span class='Keyword'>static </span><a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>  <span class='Declare_Prototype'>lo_import_internal</span><span class='Parentheses'>(</span><a href="../../../contrib/seg/segparse.y.html#LN46"><span class='Ref_to_Global_Var'>text</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>filename</span><span class='Delimiter'>, </span><a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>lobjOid</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/***************************************************************************** 
+ *  File Interfaces for Large Objects 
+ *****************************************************************************/ 
+</span> 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN95"></a><span class='Declare_Function'>be_lo_open</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN97"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>lobjId</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN98"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>mode</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN99"></a>    <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>lobjDesc</span><span class='Delimiter'>; 
+</span><a name="LN100"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>fd</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#if</span> FSDB 
+    <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN21"><span class='Ref_to_Const'>DEBUG4</span></a><span class='Delimiter'>, </span><span class='String'>"lo_open(%u,%d)"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN97"><span class='Ref_To_Local'>lobjId</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN98"><span class='Ref_To_Local'>mode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="be-fsstubs.c.html#LN76"><span class='Ref_to_Macro'>CreateFSContext</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN99"><span class='Ref_To_Local'>lobjDesc</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN87"><span class='Ref_to_Proto'>inv_open</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN97"><span class='Ref_To_Local'>lobjId</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN98"><span class='Ref_To_Local'>mode</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN99"><span class='Ref_To_Local'>lobjDesc</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{</span>                           <span class='Comment_Single_Line'>/* lookup failed */ 
+</span><span class='Directive'>#if</span> FSDB 
+        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN21"><span class='Ref_to_Const'>DEBUG4</span></a><span class='Delimiter'>, </span><span class='String'>"could not open large object %u"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN97"><span class='Ref_To_Local'>lobjId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+        <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><span class='Operator'>-</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="be-fsstubs.c.html#LN100"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN85"><span class='Ref_to_Proto'>newLOfd</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN99"><span class='Ref_To_Local'>lobjDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN100"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end be_lo_open &raquo; </span> 
+ 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN124"></a><span class='Declare_Function'>be_lo_close</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN126"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN126"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN126"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&GT;= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN126"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_UNDEFINED_OBJECT<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid large-object descriptor: %d"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN126"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#if</span> FSDB 
+    <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN21"><span class='Ref_to_Const'>DEBUG4</span></a><span class='Delimiter'>, </span><span class='String'>"lo_close(%d)"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN126"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="../../include/storage/large_object.h.html#LN88"><span class='Ref_to_Proto'>inv_close</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN126"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN86"><span class='Ref_to_Proto'>deleteLOfd</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN126"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end be_lo_close &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/***************************************************************************** 
+ *  Bare Read/Write operations --- these are not fmgr-callable! 
+ * 
+ *  We assume the large object supports byte oriented reads and seeks so 
+ *  that our work is easier. 
+ * 
+ *****************************************************************************/ 
+</span> 
+<span class='Keyword'>int 
+</span><a name="LN154"></a><span class='Declare_Function'>lo_read</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>fd</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>buf</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>len</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN156"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN157"></a>    <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>lobj</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN154"><span class='Ref_to_Parameter'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN154"><span class='Ref_to_Parameter'>fd</span></a> <span class='Operator'>&GT;= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN154"><span class='Ref_to_Parameter'>fd</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_UNDEFINED_OBJECT<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid large-object descriptor: %d"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN154"><span class='Ref_to_Parameter'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN157"><span class='Ref_To_Local'>lobj</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN154"><span class='Ref_to_Parameter'>fd</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We don't bother to check IFS_RDLOCK, since it's always set */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* Permission checks --- first time through only */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="be-fsstubs.c.html#LN157"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../include/storage/large_object.h.html#LN49"><span class='Ref_to_Const'>IFS_RD_PERM_OK</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="be-fsstubs.c.html#LN56"><span class='Ref_to_Global_Var'>lo_compat_privileges</span></a> <span class='Operator'>&& 
+</span>            <a href="../../include/utils/acl.h.html#LN287"><span class='Ref_to_Proto'>pg_largeobject_aclcheck_snapshot</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN157"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN40"><span class='Ref_to_Member'>id</span></a><span class='Delimiter'>, 
+</span>                                             <a href="../utils/init/miscinit.c.html#LN281"><span class='Ref_to_Func'>GetUserId</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                                             <a href="../../include/nodes/parsenodes.h.html#LN72"><span class='Ref_to_Const'>ACL_SELECT</span></a><span class='Delimiter'>, 
+</span>                                             <a href="be-fsstubs.c.html#LN157"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN41"><span class='Ref_to_Member'>snapshot</span></a><span class='Parentheses'>)</span> <span class='Operator'>!= </span><a href="../../include/utils/acl.h.html#LN171"><span class='Ref_to_EnumConst'>ACLCHECK_OK</span></a><span class='Parentheses'>)</span> 
+            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_PRIVILEGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"permission denied for large object %u"</span><span class='Delimiter'>, 
+</span>                            <a href="be-fsstubs.c.html#LN157"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN40"><span class='Ref_to_Member'>id</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <a href="be-fsstubs.c.html#LN157"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>|= </span><a href="../../include/storage/large_object.h.html#LN49"><span class='Ref_to_Const'>IFS_RD_PERM_OK</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="be-fsstubs.c.html#LN156"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN92"><span class='Ref_to_Proto'>inv_read</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN157"><span class='Ref_To_Local'>lobj</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN154"><span class='Ref_to_Parameter'>buf</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN154"><span class='Ref_to_Parameter'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="be-fsstubs.c.html#LN156"><span class='Ref_To_Local'>status</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end lo_read &raquo; </span> 
+ 
+<span class='Keyword'>int 
+</span><a name="LN188"></a><span class='Declare_Function'>lo_write</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>fd</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>buf</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>len</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN190"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN191"></a>    <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>lobj</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN188"><span class='Ref_to_Parameter'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN188"><span class='Ref_to_Parameter'>fd</span></a> <span class='Operator'>&GT;= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN188"><span class='Ref_to_Parameter'>fd</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_UNDEFINED_OBJECT<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid large-object descriptor: %d"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN188"><span class='Ref_to_Parameter'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN191"><span class='Ref_To_Local'>lobj</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN188"><span class='Ref_to_Parameter'>fd</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="be-fsstubs.c.html#LN191"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../include/storage/large_object.h.html#LN48"><span class='Ref_to_Const'>IFS_WRLOCK</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>              <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"large object descriptor %d was not opened for writing"</span><span class='Delimiter'>, 
+</span>                     <a href="be-fsstubs.c.html#LN188"><span class='Ref_to_Parameter'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Permission checks --- first time through only */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="be-fsstubs.c.html#LN191"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../include/storage/large_object.h.html#LN50"><span class='Ref_to_Const'>IFS_WR_PERM_OK</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="be-fsstubs.c.html#LN56"><span class='Ref_to_Global_Var'>lo_compat_privileges</span></a> <span class='Operator'>&& 
+</span>            <a href="../../include/utils/acl.h.html#LN287"><span class='Ref_to_Proto'>pg_largeobject_aclcheck_snapshot</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN191"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN40"><span class='Ref_to_Member'>id</span></a><span class='Delimiter'>, 
+</span>                                             <a href="../utils/init/miscinit.c.html#LN281"><span class='Ref_to_Func'>GetUserId</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                                             <a href="../../include/nodes/parsenodes.h.html#LN73"><span class='Ref_to_Const'>ACL_UPDATE</span></a><span class='Delimiter'>, 
+</span>                                             <a href="be-fsstubs.c.html#LN191"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN41"><span class='Ref_to_Member'>snapshot</span></a><span class='Parentheses'>)</span> <span class='Operator'>!= </span><a href="../../include/utils/acl.h.html#LN171"><span class='Ref_to_EnumConst'>ACLCHECK_OK</span></a><span class='Parentheses'>)</span> 
+            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_PRIVILEGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"permission denied for large object %u"</span><span class='Delimiter'>, 
+</span>                            <a href="be-fsstubs.c.html#LN191"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN40"><span class='Ref_to_Member'>id</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <a href="be-fsstubs.c.html#LN191"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>|= </span><a href="../../include/storage/large_object.h.html#LN50"><span class='Ref_to_Const'>IFS_WR_PERM_OK</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="be-fsstubs.c.html#LN190"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN93"><span class='Ref_to_Proto'>inv_write</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN191"><span class='Ref_To_Local'>lobj</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN188"><span class='Ref_to_Parameter'>buf</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN188"><span class='Ref_to_Parameter'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="be-fsstubs.c.html#LN190"><span class='Ref_To_Local'>status</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end lo_write &raquo; </span> 
+ 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN226"></a><span class='Declare_Function'>be_lo_lseek</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN228"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN229"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>offset</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN230"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>whence</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN231"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN228"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN228"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&GT;= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN228"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_UNDEFINED_OBJECT<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid large-object descriptor: %d"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN228"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN231"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN90"><span class='Ref_to_Proto'>inv_seek</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN228"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>], </span><a href="be-fsstubs.c.html#LN229"><span class='Ref_To_Local'>offset</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN230"><span class='Ref_To_Local'>whence</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* guard against result overflow */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN231"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>!= </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a><span class='Parentheses'>) </span><a href="be-fsstubs.c.html#LN231"><span class='Ref_To_Local'>status</span></a><span class='Parentheses'>)</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>        <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"lo_lseek result out of range for large-object descriptor %d"</span><span class='Delimiter'>, 
+</span>               <a href="be-fsstubs.c.html#LN228"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>((</span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a><span class='Parentheses'>) </span><a href="be-fsstubs.c.html#LN231"><span class='Ref_To_Local'>status</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end be_lo_lseek &raquo; </span> 
+ 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN251"></a><span class='Declare_Function'>be_lo_lseek64</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN253"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN254"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>offset</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN246"><span class='Ref_to_Macro'>PG_GETARG_INT64</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN255"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>whence</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN256"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN253"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN253"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&GT;= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN253"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_UNDEFINED_OBJECT<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid large-object descriptor: %d"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN253"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN256"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN90"><span class='Ref_to_Proto'>inv_seek</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN253"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>], </span><a href="be-fsstubs.c.html#LN254"><span class='Ref_To_Local'>offset</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN255"><span class='Ref_To_Local'>whence</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN326"><span class='Ref_to_Macro'>PG_RETURN_INT64</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN256"><span class='Ref_To_Local'>status</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN269"></a><span class='Declare_Function'>be_lo_creat</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN271"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>lobjId</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We don't actually need to store into fscxt, but create it anyway to 
+     * ensure that AtEOXact_LargeObject knows there is state to clean up 
+     */ 
+</span>    <a href="be-fsstubs.c.html#LN76"><span class='Ref_to_Macro'>CreateFSContext</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN271"><span class='Ref_To_Local'>lobjId</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN86"><span class='Ref_to_Proto'>inv_create</span></a><span class='Parentheses'>(</span><a href="../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN319"><span class='Ref_to_Macro'>PG_RETURN_OID</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN271"><span class='Ref_To_Local'>lobjId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN285"></a><span class='Declare_Function'>be_lo_create</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN287"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>lobjId</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We don't actually need to store into fscxt, but create it anyway to 
+     * ensure that AtEOXact_LargeObject knows there is state to clean up 
+     */ 
+</span>    <a href="be-fsstubs.c.html#LN76"><span class='Ref_to_Macro'>CreateFSContext</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN287"><span class='Ref_To_Local'>lobjId</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN86"><span class='Ref_to_Proto'>inv_create</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN287"><span class='Ref_To_Local'>lobjId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN319"><span class='Ref_to_Macro'>PG_RETURN_OID</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN287"><span class='Ref_To_Local'>lobjId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN301"></a><span class='Declare_Function'>be_lo_tell</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN303"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN304"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>offset</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN303"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN303"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&GT;= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN303"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_UNDEFINED_OBJECT<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid large-object descriptor: %d"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN303"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN304"><span class='Ref_To_Local'>offset</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN91"><span class='Ref_to_Proto'>inv_tell</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN303"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* guard against result overflow */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN304"><span class='Ref_To_Local'>offset</span></a> <span class='Operator'>!= </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a><span class='Parentheses'>) </span><a href="be-fsstubs.c.html#LN304"><span class='Ref_To_Local'>offset</span></a><span class='Parentheses'>)</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>         <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"lo_tell result out of range for large-object descriptor %d"</span><span class='Delimiter'>, 
+</span>                <a href="be-fsstubs.c.html#LN303"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>((</span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a><span class='Parentheses'>) </span><a href="be-fsstubs.c.html#LN304"><span class='Ref_To_Local'>offset</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end be_lo_tell &raquo; </span> 
+ 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN324"></a><span class='Declare_Function'>be_lo_tell64</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN326"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN327"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>offset</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN326"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN326"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&GT;= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN326"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_UNDEFINED_OBJECT<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid large-object descriptor: %d"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN326"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN327"><span class='Ref_To_Local'>offset</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN91"><span class='Ref_to_Proto'>inv_tell</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN326"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN326"><span class='Ref_to_Macro'>PG_RETURN_INT64</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN327"><span class='Ref_To_Local'>offset</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN340"></a><span class='Declare_Function'>be_lo_unlink</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN342"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>lobjId</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Must be owner of the largeobject */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="be-fsstubs.c.html#LN56"><span class='Ref_to_Global_Var'>lo_compat_privileges</span></a> <span class='Operator'>&& 
+</span>        <span class='Operator'>!</span><a href="../../include/utils/acl.h.html#LN313"><span class='Ref_to_Proto'>pg_largeobject_ownercheck</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN342"><span class='Ref_To_Local'>lobjId</span></a><span class='Delimiter'>, </span><a href="../utils/init/miscinit.c.html#LN281"><span class='Ref_to_Func'>GetUserId</span></a><span class='Parentheses'>()))</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_PRIVILEGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"must be owner of large object %u"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN342"><span class='Ref_To_Local'>lobjId</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If there are any open LO FDs referencing that ID, close 'em. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN356"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN356"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="be-fsstubs.c.html#LN356"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a><span class='Delimiter'>; </span><a href="be-fsstubs.c.html#LN356"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN356"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN356"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN40"><span class='Ref_to_Member'>id</span></a> <span class='Operator'>== </span><a href="be-fsstubs.c.html#LN342"><span class='Ref_To_Local'>lobjId</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="../../include/storage/large_object.h.html#LN88"><span class='Ref_to_Proto'>inv_close</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN356"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="be-fsstubs.c.html#LN86"><span class='Ref_to_Proto'>deleteLOfd</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN356"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * inv_drop does not create a need for end-of-transaction cleanup and 
+     * hence we don't need to have created fscxt. 
+     */ 
+</span>    <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><a href="../../include/storage/large_object.h.html#LN89"><span class='Ref_to_Proto'>inv_drop</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN342"><span class='Ref_To_Local'>lobjId</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end be_lo_unlink &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/***************************************************************************** 
+ *  Read/Write using bytea 
+ *****************************************************************************/ 
+</span> 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN380"></a><span class='Declare_Function'>be_loread</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN382"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN383"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>len</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN384"></a>    <a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>retval</span><span class='Delimiter'>; 
+</span><a name="LN385"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>totalread</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN383"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="be-fsstubs.c.html#LN383"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN384"><span class='Ref_To_Local'>retval</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN444"><span class='Ref_to_Const'>VARHDRSZ</span></a> <span class='Operator'>+ </span><a href="be-fsstubs.c.html#LN383"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN385"><span class='Ref_To_Local'>totalread</span></a> <span class='Operator'>= </span><a href="../../include/libpq/be-fsstubs.h.html#LN26"><span class='Ref_to_Proto'>lo_read</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN382"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN302"><span class='Ref_to_Macro'>VARDATA</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN384"><span class='Ref_To_Local'>retval</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN383"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/postgres.h.html#LN327"><span class='Ref_to_Macro'>SET_VARSIZE</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN384"><span class='Ref_To_Local'>retval</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN385"><span class='Ref_To_Local'>totalread</span></a> <span class='Operator'>+ </span><a href="../../include/c.h.html#LN444"><span class='Ref_to_Const'>VARHDRSZ</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN328"><span class='Ref_to_Macro'>PG_RETURN_BYTEA_P</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN384"><span class='Ref_To_Local'>retval</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN398"></a><span class='Declare_Function'>be_lowrite</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN400"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN401"></a>    <a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>wbuf</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN271"><span class='Ref_to_Macro'>PG_GETARG_BYTEA_PP</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN402"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>bytestowrite</span><span class='Delimiter'>; 
+</span><a name="LN403"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>totalwritten</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN402"><span class='Ref_To_Local'>bytestowrite</span></a> <span class='Operator'>= </span><a href="../../include/postgres.h.html#LN339"><span class='Ref_to_Macro'>VARSIZE_ANY_EXHDR</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN401"><span class='Ref_To_Local'>wbuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN403"><span class='Ref_To_Local'>totalwritten</span></a> <span class='Operator'>= </span><a href="../../include/libpq/be-fsstubs.h.html#LN27"><span class='Ref_to_Proto'>lo_write</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN400"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN346"><span class='Ref_to_Macro'>VARDATA_ANY</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN401"><span class='Ref_To_Local'>wbuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN402"><span class='Ref_To_Local'>bytestowrite</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN403"><span class='Ref_To_Local'>totalwritten</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/***************************************************************************** 
+ *   Import/Export of Large Object 
+ *****************************************************************************/ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * lo_import - 
+ *    imports a file as an (inversion) large object. 
+ */ 
+</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN419"></a><span class='Declare_Function'>be_lo_import</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN421"></a>    <a href="../../../contrib/seg/segparse.y.html#LN46"><span class='Ref_to_Global_Var'>text</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>filename</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN272"><span class='Ref_to_Macro'>PG_GETARG_TEXT_PP</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN319"><span class='Ref_to_Macro'>PG_RETURN_OID</span></a><span class='Parentheses'>(</span><a href="../../interfaces/libpq/fe-lobj.c.html#LN45"><span class='Ref_to_Proto'>lo_import_internal</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN421"><span class='Ref_To_Local'>filename</span></a><span class='Delimiter'>, </span><a href="../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * lo_import_with_oid - 
+ *    imports a file as an (inversion) large object specifying oid. 
+ */ 
+</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN431"></a><span class='Declare_Function'>be_lo_import_with_oid</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN433"></a>    <a href="../../../contrib/seg/segparse.y.html#LN46"><span class='Ref_to_Global_Var'>text</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>filename</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN272"><span class='Ref_to_Macro'>PG_GETARG_TEXT_PP</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN434"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>oid</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN319"><span class='Ref_to_Macro'>PG_RETURN_OID</span></a><span class='Parentheses'>(</span><a href="../../interfaces/libpq/fe-lobj.c.html#LN45"><span class='Ref_to_Proto'>lo_import_internal</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN433"><span class='Ref_To_Local'>filename</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN434"><span class='Ref_To_Local'>oid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>static </span><a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> 
+<a name="LN440"></a><span class='Declare_Function'>lo_import_internal</span><span class='Parentheses'>(</span><a href="../../../contrib/seg/segparse.y.html#LN46"><span class='Ref_to_Global_Var'>text</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>filename</span><span class='Delimiter'>, </span><a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>lobjOid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN442"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>fd</span><span class='Delimiter'>; 
+</span><a name="LN443"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nbytes</span><span class='Delimiter'>, 
+</span><a name="LN444"></a>                tmp <span class='Declare_Local'>PG_USED_FOR_ASSERTS_ONLY</span><span class='Delimiter'>; 
+</span><a name="LN445"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>buf</span><span class='Delimiter'>[</span><a href="../../test/examples/testlo.c.html#LN25"><span class='Ref_to_Const'>BUFSIZE</span></a><span class='Delimiter'>]; 
+</span><a name="LN446"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>fnamebuf</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN447"></a>    <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>lobj</span><span class='Delimiter'>; 
+</span><a name="LN448"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>oid</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifndef</span> ALLOW_DANGEROUS_LO_FUNCTIONS 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../utils/misc/superuser.c.html#LN45"><span class='Ref_to_Func'>superuser</span></a><span class='Parentheses'>())</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_PRIVILEGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"must be superuser to use server-side lo_import()"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Anyone can use the client-side lo_import() provided by libpq."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="be-fsstubs.c.html#LN76"><span class='Ref_to_Macro'>CreateFSContext</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * open the file to be read in 
+     */ 
+</span>    <a href="../../include/utils/builtins.h.html#LN88"><span class='Ref_to_Proto'>text_to_cstring_buffer</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN440"><span class='Ref_to_Parameter'>filename</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN446"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN446"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN442"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>= </span><a href="../../include/storage/fd.h.html#LN96"><span class='Ref_to_Proto'>OpenTransientFile</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN446"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Delimiter'>, </span>O_RDONLY <span class='Operator'>| </span><a href="../../include/c.h.html#LN1032"><span class='Ref_to_Const'>PG_BINARY</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN427"><span class='Ref_to_Const'>S_IRWXU</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN442"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not open server file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="be-fsstubs.c.html#LN446"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * create an inversion object 
+     */ 
+</span>    <a href="be-fsstubs.c.html#LN448"><span class='Ref_To_Local'>oid</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN86"><span class='Ref_to_Proto'>inv_create</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN440"><span class='Ref_to_Parameter'>lobjOid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * read in from the filesystem and write to the inversion object 
+     */ 
+</span>    <a href="be-fsstubs.c.html#LN447"><span class='Ref_To_Local'>lobj</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN87"><span class='Ref_to_Proto'>inv_open</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN448"><span class='Ref_To_Local'>oid</span></a><span class='Delimiter'>, </span><a href="../../include/libpq/libpq-fs.h.html#LN20"><span class='Ref_to_Const'>INV_WRITE</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="be-fsstubs.c.html#LN443"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>= </span><a href="../../interfaces/libpq/win32.h.html#LN12"><span class='Ref_to_Macro'>read</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN442"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN445"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../test/examples/testlo.c.html#LN25"><span class='Ref_to_Const'>BUFSIZE</span></a><span class='Parentheses'>))</span> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        tmp <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN93"><span class='Ref_to_Proto'>inv_write</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN447"><span class='Ref_To_Local'>lobj</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN445"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN443"><span class='Ref_To_Local'>nbytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span>tmp <span class='Operator'>== </span><a href="be-fsstubs.c.html#LN443"><span class='Ref_To_Local'>nbytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN443"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not read server file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="be-fsstubs.c.html#LN446"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/large_object.h.html#LN88"><span class='Ref_to_Proto'>inv_close</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN447"><span class='Ref_To_Local'>lobj</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/fd.h.html#LN97"><span class='Ref_to_Proto'>CloseTransientFile</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN442"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="be-fsstubs.c.html#LN448"><span class='Ref_To_Local'>oid</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end lo_import_internal &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * lo_export - 
+ *    exports an (inversion) large object. 
+ */ 
+</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN504"></a><span class='Declare_Function'>be_lo_export</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN506"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>lobjId</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN507"></a>    <a href="../../../contrib/seg/segparse.y.html#LN46"><span class='Ref_to_Global_Var'>text</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>filename</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN272"><span class='Ref_to_Macro'>PG_GETARG_TEXT_PP</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN508"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>fd</span><span class='Delimiter'>; 
+</span><a name="LN509"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nbytes</span><span class='Delimiter'>, 
+</span><a name="LN510"></a>                <span class='Declare_Local'>tmp</span><span class='Delimiter'>; 
+</span><a name="LN511"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>buf</span><span class='Delimiter'>[</span><a href="../../test/examples/testlo.c.html#LN25"><span class='Ref_to_Const'>BUFSIZE</span></a><span class='Delimiter'>]; 
+</span><a name="LN512"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>fnamebuf</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN513"></a>    <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>lobj</span><span class='Delimiter'>; 
+</span><a name="LN514"></a>    <a href="../../include/port/win32.h.html#LN422"><span class='Ref_to_Typedef'>mode_t</span></a>      <span class='Declare_Local'>oumask</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifndef</span> ALLOW_DANGEROUS_LO_FUNCTIONS 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../utils/misc/superuser.c.html#LN45"><span class='Ref_to_Func'>superuser</span></a><span class='Parentheses'>())</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_PRIVILEGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"must be superuser to use server-side lo_export()"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Anyone can use the client-side lo_export() provided by libpq."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="be-fsstubs.c.html#LN76"><span class='Ref_to_Macro'>CreateFSContext</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * open the inversion object (no need to test for failure) 
+     */ 
+</span>    <a href="be-fsstubs.c.html#LN513"><span class='Ref_To_Local'>lobj</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN87"><span class='Ref_to_Proto'>inv_open</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN506"><span class='Ref_To_Local'>lobjId</span></a><span class='Delimiter'>, </span><a href="../../include/libpq/libpq-fs.h.html#LN21"><span class='Ref_to_Const'>INV_READ</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * open the file to be written to 
+     * 
+     * Note: we reduce backend's normal 077 umask to the slightly friendlier 
+     * 022. This code used to drop it all the way to 0, but creating 
+     * world-writable export files doesn't seem wise. 
+     */ 
+</span>    <a href="../../include/utils/builtins.h.html#LN88"><span class='Ref_to_Proto'>text_to_cstring_buffer</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN507"><span class='Ref_To_Local'>filename</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN512"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN512"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN514"><span class='Ref_To_Local'>oumask</span></a> <span class='Operator'>= </span>umask<span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN448"><span class='Ref_to_Const'>S_IWGRP</span></a> <span class='Operator'>| </span><a href="../../include/port/win32.h.html#LN452"><span class='Ref_to_Const'>S_IWOTH</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN508"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>= </span><a href="../../include/storage/fd.h.html#LN96"><span class='Ref_to_Proto'>OpenTransientFile</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN512"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Delimiter'>, </span>O_CREAT <span class='Operator'>| </span>O_WRONLY <span class='Operator'>| </span>O_TRUNC <span class='Operator'>| </span><a href="../../include/c.h.html#LN1032"><span class='Ref_to_Const'>PG_BINARY</span></a><span class='Delimiter'>, 
+</span>                           <a href="../../include/port/win32.h.html#LN424"><span class='Ref_to_Const'>S_IRUSR</span></a> <span class='Operator'>| </span><a href="../../include/port/win32.h.html#LN425"><span class='Ref_to_Const'>S_IWUSR</span></a> <span class='Operator'>| </span><a href="../../include/port/win32.h.html#LN447"><span class='Ref_to_Const'>S_IRGRP</span></a> <span class='Operator'>| </span><a href="../../include/port/win32.h.html#LN451"><span class='Ref_to_Const'>S_IROTH</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    umask<span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN514"><span class='Ref_To_Local'>oumask</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN508"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not create server file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="be-fsstubs.c.html#LN512"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * read in from the inversion file and write to the filesystem 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="be-fsstubs.c.html#LN509"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN92"><span class='Ref_to_Proto'>inv_read</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN513"><span class='Ref_To_Local'>lobj</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN511"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../test/examples/testlo.c.html#LN25"><span class='Ref_to_Const'>BUFSIZE</span></a><span class='Parentheses'>))</span> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="be-fsstubs.c.html#LN510"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="../../interfaces/libpq/win32.h.html#LN13"><span class='Ref_to_Macro'>write</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN508"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN511"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN509"><span class='Ref_To_Local'>nbytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN510"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>!= </span><a href="be-fsstubs.c.html#LN509"><span class='Ref_To_Local'>nbytes</span></a><span class='Parentheses'>) 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not write server file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                            <a href="be-fsstubs.c.html#LN512"><span class='Ref_To_Local'>fnamebuf</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../include/storage/fd.h.html#LN97"><span class='Ref_to_Proto'>CloseTransientFile</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN508"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/large_object.h.html#LN88"><span class='Ref_to_Proto'>inv_close</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN513"><span class='Ref_To_Local'>lobj</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end be_lo_export &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * lo_truncate - 
+ *    truncate a large object to a specified length 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN573"></a><span class='Declare_Function'>lo_truncate_internal</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> <span class='Declare_Parameter'>fd</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a> <span class='Declare_Parameter'>len</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN575"></a>    <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>lobj</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN573"><span class='Ref_to_Parameter'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN573"><span class='Ref_to_Parameter'>fd</span></a> <span class='Operator'>&GT;= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>|| </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN573"><span class='Ref_to_Parameter'>fd</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_UNDEFINED_OBJECT<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"invalid large-object descriptor: %d"</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN573"><span class='Ref_to_Parameter'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN575"><span class='Ref_To_Local'>lobj</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN573"><span class='Ref_to_Parameter'>fd</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="be-fsstubs.c.html#LN575"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../include/storage/large_object.h.html#LN48"><span class='Ref_to_Const'>IFS_WRLOCK</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>              <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"large object descriptor %d was not opened for writing"</span><span class='Delimiter'>, 
+</span>                     <a href="be-fsstubs.c.html#LN573"><span class='Ref_to_Parameter'>fd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Permission checks --- first time through only */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="be-fsstubs.c.html#LN575"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../include/storage/large_object.h.html#LN50"><span class='Ref_to_Const'>IFS_WR_PERM_OK</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="be-fsstubs.c.html#LN56"><span class='Ref_to_Global_Var'>lo_compat_privileges</span></a> <span class='Operator'>&& 
+</span>            <a href="../../include/utils/acl.h.html#LN287"><span class='Ref_to_Proto'>pg_largeobject_aclcheck_snapshot</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN575"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN40"><span class='Ref_to_Member'>id</span></a><span class='Delimiter'>, 
+</span>                                             <a href="../utils/init/miscinit.c.html#LN281"><span class='Ref_to_Func'>GetUserId</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                                             <a href="../../include/nodes/parsenodes.h.html#LN73"><span class='Ref_to_Const'>ACL_UPDATE</span></a><span class='Delimiter'>, 
+</span>                                             <a href="be-fsstubs.c.html#LN575"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN41"><span class='Ref_to_Member'>snapshot</span></a><span class='Parentheses'>)</span> <span class='Operator'>!= </span><a href="../../include/utils/acl.h.html#LN171"><span class='Ref_to_EnumConst'>ACLCHECK_OK</span></a><span class='Parentheses'>)</span> 
+            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_PRIVILEGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"permission denied for large object %u"</span><span class='Delimiter'>, 
+</span>                            <a href="be-fsstubs.c.html#LN575"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN40"><span class='Ref_to_Member'>id</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <a href="be-fsstubs.c.html#LN575"><span class='Ref_To_Local'>lobj</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN44"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>|= </span><a href="../../include/storage/large_object.h.html#LN50"><span class='Ref_to_Const'>IFS_WR_PERM_OK</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../include/storage/large_object.h.html#LN94"><span class='Ref_to_Proto'>inv_truncate</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN575"><span class='Ref_To_Local'>lobj</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN573"><span class='Ref_to_Parameter'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end lo_truncate_internal &raquo; </span> 
+ 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN608"></a><span class='Declare_Function'>be_lo_truncate</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN610"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN611"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>len</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN572"><span class='Ref_to_Func'>lo_truncate_internal</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN610"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN611"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN618"></a><span class='Declare_Function'>be_lo_truncate64</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN620"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>fd</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN621"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>len</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN246"><span class='Ref_to_Macro'>PG_GETARG_INT64</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN572"><span class='Ref_to_Func'>lo_truncate_internal</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN620"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN621"><span class='Ref_To_Local'>len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/fmgr.h.html#LN313"><span class='Ref_to_Macro'>PG_RETURN_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * AtEOXact_LargeObject - 
+ *       prepares large objects for transaction commit 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN632"></a><span class='Declare_Function'>AtEOXact_LargeObject</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>isCommit</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN634"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>;</span>                 <span class='Comment_Single_Line'>/* no LO operations in this xact */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Close LO fds and clear cookies array so that LO fds are no longer good. 
+     * On abort we skip the close step. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN634"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="be-fsstubs.c.html#LN634"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a><span class='Delimiter'>; </span><a href="be-fsstubs.c.html#LN634"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN634"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN632"><span class='Ref_to_Parameter'>isCommit</span></a><span class='Parentheses'>) 
+</span>                <a href="../../include/storage/large_object.h.html#LN88"><span class='Ref_to_Proto'>inv_close</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN634"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="be-fsstubs.c.html#LN86"><span class='Ref_to_Proto'>deleteLOfd</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN634"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Needn't actually pfree since we're about to zap context */ 
+</span>    <a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Release the LO memory context to prevent permanent memory leaks. */ 
+</span>    <a href="../../include/utils/memutils.h.html#LN74"><span class='Ref_to_Proto'>MemoryContextDelete</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Give inv_api.c a chance to clean up, too */ 
+</span>    <a href="../../include/storage/large_object.h.html#LN85"><span class='Ref_to_Proto'>close_lo_relation</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN632"><span class='Ref_to_Parameter'>isCommit</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end AtEOXact_LargeObject &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * AtEOSubXact_LargeObject 
+ *      Take care of large objects at subtransaction commit/abort 
+ * 
+ * Reassign LOs created/opened during a committing subtransaction 
+ * to the parent subtransaction.  On abort, just close them. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN673"></a><span class='Declare_Function'>AtEOSubXact_LargeObject</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>isCommit</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN400"><span class='Ref_to_Typedef'>SubTransactionId</span></a> <span class='Declare_Parameter'>mySubid</span><span class='Delimiter'>, 
+</span><a name="LN674"></a>                        <a href="../../include/c.h.html#LN400"><span class='Ref_to_Typedef'>SubTransactionId</span></a> <span class='Declare_Parameter'>parentSubid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN676"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span>          <span class='Comment_Single_Line'>/* no LO operations in this xact */ 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN676"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="be-fsstubs.c.html#LN676"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a><span class='Delimiter'>; </span><a href="be-fsstubs.c.html#LN676"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN683"></a>        <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>lo</span> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN676"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN683"><span class='Ref_To_Local'>lo</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& </span><a href="be-fsstubs.c.html#LN683"><span class='Ref_To_Local'>lo</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN42"><span class='Ref_to_Member'>subid</span></a> <span class='Operator'>== </span><a href="be-fsstubs.c.html#LN673"><span class='Ref_to_Parameter'>mySubid</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN673"><span class='Ref_to_Parameter'>isCommit</span></a><span class='Parentheses'>) 
+</span>                <a href="be-fsstubs.c.html#LN683"><span class='Ref_To_Local'>lo</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN42"><span class='Ref_to_Member'>subid</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN674"><span class='Ref_to_Parameter'>parentSubid</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * Make sure we do not call inv_close twice if it errors out 
+                 * for some reason.  Better a leak than a crash. 
+                 */ 
+</span>                <a href="be-fsstubs.c.html#LN86"><span class='Ref_to_Proto'>deleteLOfd</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN676"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../include/storage/large_object.h.html#LN88"><span class='Ref_to_Proto'>inv_close</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN683"><span class='Ref_To_Local'>lo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end AtEOSubXact_LargeObject &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/***************************************************************************** 
+ *  Support routines for this file 
+ *****************************************************************************/ 
+</span> 
+<span class='Keyword'>static int 
+</span><a name="LN707"></a><span class='Declare_Function'>newLOfd</span><span class='Parentheses'>(</span><a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>lobjCookie</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN709"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>, 
+</span><a name="LN710"></a>                <span class='Declare_Local'>newsize</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Try to find a free slot */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a><span class='Delimiter'>; </span><a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="be-fsstubs.c.html#LN707"><span class='Ref_to_Parameter'>lobjCookie</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* No free slot, so make the array bigger */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* First time through, arbitrarily make 64-element array */ 
+</span>        <a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="be-fsstubs.c.html#LN710"><span class='Ref_To_Local'>newsize</span></a> <span class='Operator'>= </span><span class='Number'>64</span><span class='Delimiter'>; 
+</span>        <a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>**</span><span class='Parentheses'>) 
+</span>            <a href="../../include/utils/palloc.h.html#LN71"><span class='Ref_to_Proto'>MemoryContextAllocZero</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN710"><span class='Ref_To_Local'>newsize</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN710"><span class='Ref_To_Local'>newsize</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Double size of array */ 
+</span>        <a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a><span class='Delimiter'>; 
+</span>        <a href="be-fsstubs.c.html#LN710"><span class='Ref_To_Local'>newsize</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>* </span><span class='Number'>2</span><span class='Delimiter'>; 
+</span>        <a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>**</span><span class='Parentheses'>) 
+</span>            <a href="../../include/common/fe_memutils.h.html#LN36"><span class='Ref_to_Proto'>repalloc</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN710"><span class='Ref_To_Local'>newsize</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a> <span class='Operator'>+ </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>               <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN710"><span class='Ref_To_Local'>newsize</span></a> <span class='Operator'>- </span><a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="be-fsstubs.c.html#LN72"><span class='Ref_to_Global_Var'>cookies_size</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN710"><span class='Ref_To_Local'>newsize</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="be-fsstubs.c.html#LN707"><span class='Ref_to_Parameter'>lobjCookie</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="be-fsstubs.c.html#LN709"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end newLOfd &raquo; </span> 
+ 
+<span class='Keyword'>static void 
+</span><a name="LN750"></a><span class='Declare_Function'>deleteLOfd</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>fd</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="be-fsstubs.c.html#LN71"><span class='Ref_to_Global_Var'>cookies</span></a><span class='Delimiter'>[</span><a href="be-fsstubs.c.html#LN750"><span class='Ref_to_Parameter'>fd</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/***************************************************************************** 
+ *  Wrappers oriented toward SQL callers 
+ *****************************************************************************/ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Read [offset, offset+nbytes) within LO; when nbytes is -1, read to end. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a> <span class='Operator'>* 
+</span><a name="LN763"></a><span class='Declare_Function'>lo_get_fragment_internal</span><span class='Parentheses'>(</span><a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>loOid</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a> <span class='Declare_Parameter'>offset</span><span class='Delimiter'>, </span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> <span class='Declare_Parameter'>nbytes</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN765"></a>    <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>loDesc</span><span class='Delimiter'>; 
+</span><a name="LN766"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>loSize</span><span class='Delimiter'>; 
+</span><a name="LN767"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>result_length</span><span class='Delimiter'>; 
+</span><a name="LN768"></a>    <span class='Keyword'>int </span>total_read <span class='Declare_Local'>PG_USED_FOR_ASSERTS_ONLY</span><span class='Delimiter'>; 
+</span><a name="LN769"></a>    <a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>result</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We don't actually need to store into fscxt, but create it anyway to 
+     * ensure that AtEOXact_LargeObject knows there is state to clean up 
+     */ 
+</span>    <a href="be-fsstubs.c.html#LN76"><span class='Ref_to_Macro'>CreateFSContext</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN765"><span class='Ref_To_Local'>loDesc</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN87"><span class='Ref_to_Proto'>inv_open</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN763"><span class='Ref_to_Parameter'>loOid</span></a><span class='Delimiter'>, </span><a href="../../include/libpq/libpq-fs.h.html#LN21"><span class='Ref_to_Const'>INV_READ</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Permission check */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="be-fsstubs.c.html#LN56"><span class='Ref_to_Global_Var'>lo_compat_privileges</span></a> <span class='Operator'>&& 
+</span>        <a href="../../include/utils/acl.h.html#LN287"><span class='Ref_to_Proto'>pg_largeobject_aclcheck_snapshot</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN765"><span class='Ref_To_Local'>loDesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN40"><span class='Ref_to_Member'>id</span></a><span class='Delimiter'>, 
+</span>                                         <a href="../utils/init/miscinit.c.html#LN281"><span class='Ref_to_Func'>GetUserId</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                                         <a href="../../include/nodes/parsenodes.h.html#LN72"><span class='Ref_to_Const'>ACL_SELECT</span></a><span class='Delimiter'>, 
+</span>                                         <a href="be-fsstubs.c.html#LN765"><span class='Ref_To_Local'>loDesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN41"><span class='Ref_to_Member'>snapshot</span></a><span class='Parentheses'>)</span> <span class='Operator'>!= </span><a href="../../include/utils/acl.h.html#LN171"><span class='Ref_to_EnumConst'>ACLCHECK_OK</span></a><span class='Parentheses'>)</span> 
+        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INSUFFICIENT_PRIVILEGE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"permission denied for large object %u"</span><span class='Delimiter'>, 
+</span>                        <a href="be-fsstubs.c.html#LN765"><span class='Ref_To_Local'>loDesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/large_object.h.html#LN40"><span class='Ref_to_Member'>id</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Compute number of bytes we'll actually read, accommodating nbytes == -1 
+     * and reads beyond the end of the LO. 
+     */ 
+</span>    <a href="be-fsstubs.c.html#LN766"><span class='Ref_To_Local'>loSize</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN90"><span class='Ref_to_Proto'>inv_seek</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN765"><span class='Ref_To_Local'>loDesc</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span>SEEK_END<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN766"><span class='Ref_To_Local'>loSize</span></a> <span class='Operator'>&GT; </span><a href="be-fsstubs.c.html#LN763"><span class='Ref_to_Parameter'>offset</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN763"><span class='Ref_to_Parameter'>nbytes</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="be-fsstubs.c.html#LN763"><span class='Ref_to_Parameter'>nbytes</span></a> <span class='Operator'>&LT;= </span><a href="be-fsstubs.c.html#LN766"><span class='Ref_To_Local'>loSize</span></a> <span class='Operator'>- </span><a href="be-fsstubs.c.html#LN763"><span class='Ref_to_Parameter'>offset</span></a><span class='Parentheses'>) 
+</span>            <a href="be-fsstubs.c.html#LN767"><span class='Ref_To_Local'>result_length</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN763"><span class='Ref_to_Parameter'>nbytes</span></a><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* request is wholly inside LO */ 
+</span>        <span class='Control'>else</span> 
+            <a href="be-fsstubs.c.html#LN767"><span class='Ref_To_Local'>result_length</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN766"><span class='Ref_To_Local'>loSize</span></a> <span class='Operator'>- </span><a href="be-fsstubs.c.html#LN763"><span class='Ref_to_Parameter'>offset</span></a><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* adjust to end of LO */ 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <a href="be-fsstubs.c.html#LN767"><span class='Ref_To_Local'>result_length</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* request is wholly outside LO */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * A result_length calculated from loSize may not fit in a size_t.  Check 
+     * that the size will satisfy this and subsequently-enforced size limits. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN767"><span class='Ref_To_Local'>result_length</span></a> <span class='Operator'>&GT; </span><a href="../../common/psprintf.c.html#LN27"><span class='Ref_to_Const'>MaxAllocSize</span></a> <span class='Operator'>- </span><a href="../../include/c.h.html#LN444"><span class='Ref_to_Const'>VARHDRSZ</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_PROGRAM_LIMIT_EXCEEDED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"large object read request is too large"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN769"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN444"><span class='Ref_to_Const'>VARHDRSZ</span></a> <span class='Operator'>+ </span><a href="be-fsstubs.c.html#LN767"><span class='Ref_To_Local'>result_length</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/large_object.h.html#LN90"><span class='Ref_to_Proto'>inv_seek</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN765"><span class='Ref_To_Local'>loDesc</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN763"><span class='Ref_to_Parameter'>offset</span></a><span class='Delimiter'>, </span>SEEK_SET<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    total_read <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN92"><span class='Ref_to_Proto'>inv_read</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN765"><span class='Ref_To_Local'>loDesc</span></a><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN302"><span class='Ref_to_Macro'>VARDATA</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN769"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN767"><span class='Ref_To_Local'>result_length</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span>total_read <span class='Operator'>== </span><a href="be-fsstubs.c.html#LN767"><span class='Ref_To_Local'>result_length</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/postgres.h.html#LN327"><span class='Ref_to_Macro'>SET_VARSIZE</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN769"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN767"><span class='Ref_To_Local'>result_length</span></a> <span class='Operator'>+ </span><a href="../../include/c.h.html#LN444"><span class='Ref_to_Const'>VARHDRSZ</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/large_object.h.html#LN88"><span class='Ref_to_Proto'>inv_close</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN765"><span class='Ref_To_Local'>loDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="be-fsstubs.c.html#LN769"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end lo_get_fragment_internal &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Read entire LO 
+ */ 
+</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN830"></a><span class='Declare_Function'>be_lo_get</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN832"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>loOid</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN833"></a>    <a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN833"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN762"><span class='Ref_to_Func'>lo_get_fragment_internal</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN832"><span class='Ref_To_Local'>loOid</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN328"><span class='Ref_to_Macro'>PG_RETURN_BYTEA_P</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN833"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Read range within LO 
+ */ 
+</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN844"></a><span class='Declare_Function'>be_lo_get_fragment</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN846"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>loOid</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN847"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>offset</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN246"><span class='Ref_to_Macro'>PG_GETARG_INT64</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN848"></a>    <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>nbytes</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN233"><span class='Ref_to_Macro'>PG_GETARG_INT32</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN849"></a>    <a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN848"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INVALID_PARAMETER_VALUE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"requested length cannot be negative"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN849"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="be-fsstubs.c.html#LN762"><span class='Ref_to_Func'>lo_get_fragment_internal</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN846"><span class='Ref_To_Local'>loOid</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN847"><span class='Ref_To_Local'>offset</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN848"><span class='Ref_To_Local'>nbytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN328"><span class='Ref_to_Macro'>PG_RETURN_BYTEA_P</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN849"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Create LO with initial contents given by a bytea argument 
+ */ 
+</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN865"></a><span class='Declare_Function'>be_lo_from_bytea</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN867"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>loOid</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN868"></a>    <a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>str</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN271"><span class='Ref_to_Macro'>PG_GETARG_BYTEA_PP</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN869"></a>    <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>loDesc</span><span class='Delimiter'>; 
+</span><a name="LN870"></a>    <span class='Keyword'>int </span>written <span class='Declare_Local'>PG_USED_FOR_ASSERTS_ONLY</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN76"><span class='Ref_to_Macro'>CreateFSContext</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN867"><span class='Ref_To_Local'>loOid</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN86"><span class='Ref_to_Proto'>inv_create</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN867"><span class='Ref_To_Local'>loOid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="be-fsstubs.c.html#LN869"><span class='Ref_To_Local'>loDesc</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN87"><span class='Ref_to_Proto'>inv_open</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN867"><span class='Ref_To_Local'>loOid</span></a><span class='Delimiter'>, </span><a href="../../include/libpq/libpq-fs.h.html#LN20"><span class='Ref_to_Const'>INV_WRITE</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    written <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN93"><span class='Ref_to_Proto'>inv_write</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN869"><span class='Ref_To_Local'>loDesc</span></a><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN346"><span class='Ref_to_Macro'>VARDATA_ANY</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN868"><span class='Ref_To_Local'>str</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN339"><span class='Ref_to_Macro'>VARSIZE_ANY_EXHDR</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN868"><span class='Ref_To_Local'>str</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span>written <span class='Operator'>== </span><a href="../../include/postgres.h.html#LN339"><span class='Ref_to_Macro'>VARSIZE_ANY_EXHDR</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN868"><span class='Ref_To_Local'>str</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/large_object.h.html#LN88"><span class='Ref_to_Proto'>inv_close</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN869"><span class='Ref_To_Local'>loDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN319"><span class='Ref_to_Macro'>PG_RETURN_OID</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN867"><span class='Ref_To_Local'>loOid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Update range within LO 
+ */ 
+</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN887"></a><span class='Declare_Function'>be_lo_put</span><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN889"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>loOid</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN890"></a>    <a href="../../include/c.h.html#LN294"><span class='Ref_to_Typedef'>int64</span></a>       <span class='Declare_Local'>offset</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN246"><span class='Ref_to_Macro'>PG_GETARG_INT64</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN891"></a>    <a href="../../include/c.h.html#LN451"><span class='Ref_to_Typedef'>bytea</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>str</span> <span class='Operator'>= </span><a href="../../include/fmgr.h.html#LN271"><span class='Ref_to_Macro'>PG_GETARG_BYTEA_PP</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN892"></a>    <a href="../../include/storage/large_object.h.html#LN38"><span class='Ref_to_Struct'>LargeObjectDesc</span></a> <span class='Operator'>*</span><span class='Declare_Local'>loDesc</span><span class='Delimiter'>; 
+</span><a name="LN893"></a>    <span class='Keyword'>int </span>written <span class='Declare_Local'>PG_USED_FOR_ASSERTS_ONLY</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN76"><span class='Ref_to_Macro'>CreateFSContext</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="be-fsstubs.c.html#LN892"><span class='Ref_To_Local'>loDesc</span></a> <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN87"><span class='Ref_to_Proto'>inv_open</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN889"><span class='Ref_To_Local'>loOid</span></a><span class='Delimiter'>, </span><a href="../../include/libpq/libpq-fs.h.html#LN20"><span class='Ref_to_Const'>INV_WRITE</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN74"><span class='Ref_to_Global_Var'>fscxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/large_object.h.html#LN90"><span class='Ref_to_Proto'>inv_seek</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN892"><span class='Ref_To_Local'>loDesc</span></a><span class='Delimiter'>, </span><a href="be-fsstubs.c.html#LN890"><span class='Ref_To_Local'>offset</span></a><span class='Delimiter'>, </span>SEEK_SET<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    written <span class='Operator'>= </span><a href="../../include/storage/large_object.h.html#LN93"><span class='Ref_to_Proto'>inv_write</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN892"><span class='Ref_To_Local'>loDesc</span></a><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN346"><span class='Ref_to_Macro'>VARDATA_ANY</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN891"><span class='Ref_To_Local'>str</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN339"><span class='Ref_to_Macro'>VARSIZE_ANY_EXHDR</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN891"><span class='Ref_To_Local'>str</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span>written <span class='Operator'>== </span><a href="../../include/postgres.h.html#LN339"><span class='Ref_to_Macro'>VARSIZE_ANY_EXHDR</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN891"><span class='Ref_To_Local'>str</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/large_object.h.html#LN88"><span class='Ref_to_Proto'>inv_close</span></a><span class='Parentheses'>(</span><a href="be-fsstubs.c.html#LN892"><span class='Ref_To_Local'>loDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/fmgr.h.html#LN308"><span class='Ref_to_Macro'>PG_RETURN_VOID</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

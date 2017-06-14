@@ -1,0 +1,1048 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\transam\xlogutils.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\transam\xlogutils.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:31 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * xlogutils.c 
+ * 
+ * PostgreSQL write-ahead log manager utility routines 
+ * 
+ * This file contains support routines that are used by XLOG replay functions. 
+ * None of this code is used during normal system operation. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * src/backend/access/transam/xlogutils.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/timeline.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog_internal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlogutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/catalog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/smgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/guc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/hsearch.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/rel.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * During XLOG replay, we may see XLOG records for incremental updates of 
+ * pages that no longer exist, because their relation was later dropped or 
+ * truncated.  (Note: this is only possible when full_page_writes = OFF, 
+ * since when it's ON, the first reference we see to a page should always 
+ * be a full-page rewrite not an incremental update.)  Rather than simply 
+ * ignoring such records, we make a note of the referenced page, and then 
+ * complain if we don't actually see a drop or truncate covering the page 
+ * later in replay. 
+ */ 
+</span><a name="LN44"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>xl_invalid_page_key</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN46"></a>    <a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Member'>node</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* the relation */ 
+</span><a name="LN47"></a>    <a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a>  <span class='Declare_Member'>forkno</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* the fork number */ 
+</span><a name="LN48"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Member'>blkno</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* the page */ 
+</span><a name="LN49"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>xl_invalid_page_key</span><span class='Delimiter'>; 
+</span> 
+<a name="LN51"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>xl_invalid_page</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN53"></a>    <a href="xlogutils.c.html#LN44"><span class='Ref_to_Struct'>xl_invalid_page_key</span></a> <span class='Declare_Member'>key</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* hash key ... must be first */ 
+</span><a name="LN54"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>present</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* page existed but contained zeroes */ 
+</span><a name="LN55"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>xl_invalid_page</span><span class='Delimiter'>; 
+</span> 
+<a name="LN57"></a><span class='Keyword'>static </span><a href="../../utils/hash/dynahash.c.html#LN192"><span class='Ref_to_Struct'>HTAB</span></a> <span class='Operator'>*</span><span class='Declare_Var'>invalid_page_tab</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* Report a reference to an invalid page */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN62"></a><span class='Declare_Function'>report_invalid_page</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>elevel</span><span class='Delimiter'>, </span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forkno</span><span class='Delimiter'>, 
+</span><a name="LN63"></a>                    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>blkno</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>present</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN65"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>path</span> <span class='Operator'>= </span><a href="../../../include/common/relpath.h.html#LN66"><span class='Ref_to_Macro'>relpathperm</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN62"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN62"><span class='Ref_to_Parameter'>forkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN63"><span class='Ref_to_Parameter'>present</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN62"><span class='Ref_to_Parameter'>elevel</span></a><span class='Delimiter'>, </span><span class='String'>"page %u of relation %s is uninitialized"</span><span class='Delimiter'>, 
+</span>             <a href="xlogutils.c.html#LN63"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN65"><span class='Ref_To_Local'>path</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN62"><span class='Ref_to_Parameter'>elevel</span></a><span class='Delimiter'>, </span><span class='String'>"page %u of relation %s does not exist"</span><span class='Delimiter'>, 
+</span>             <a href="xlogutils.c.html#LN63"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN65"><span class='Ref_To_Local'>path</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN65"><span class='Ref_To_Local'>path</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* Log a reference to an invalid page */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN78"></a><span class='Declare_Function'>log_invalid_page</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forkno</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>blkno</span><span class='Delimiter'>, 
+</span><a name="LN79"></a>                 <span class='Keyword'>bool </span><span class='Declare_Parameter'>present</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN81"></a>    <a href="xlogutils.c.html#LN44"><span class='Ref_to_Struct'>xl_invalid_page_key</span></a> <span class='Declare_Local'>key</span><span class='Delimiter'>; 
+</span><a name="LN82"></a>    <a href="xlogutils.c.html#LN51"><span class='Ref_to_Struct'>xl_invalid_page</span></a> <span class='Operator'>*</span><span class='Declare_Local'>hentry</span><span class='Delimiter'>; 
+</span><a name="LN83"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Once recovery has reached a consistent state, the invalid-page table 
+     * should be empty and remain so. If a reference to an invalid page is 
+     * found after consistency is reached, PANIC immediately. This might seem 
+     * aggressive, but it's better than letting the invalid reference linger 
+     * in the hash table until the end of recovery and PANIC there, which 
+     * might come only much later if this is a standby server. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlog.c.html#LN830"><span class='Ref_to_Global_Var'>reachedConsistency</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="xlogutils.c.html#LN61"><span class='Ref_to_Func'>report_invalid_page</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN78"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN78"><span class='Ref_to_Parameter'>forkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN78"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN79"><span class='Ref_to_Parameter'>present</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"WAL contains references to invalid pages"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Log references to invalid pages at DEBUG1 level.  This allows some 
+     * tracing of the cause (note the elog context mechanism will tell us 
+     * something about the XLOG record that generated the reference). 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../utils/misc/guc.c.html#LN450"><span class='Ref_to_Global_Var'>log_min_messages</span></a> <span class='Operator'>&LT;= </span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a> <span class='Operator'>|| </span><a href="../../utils/misc/guc.c.html#LN451"><span class='Ref_to_Global_Var'>client_min_messages</span></a> <span class='Operator'>&LT;= </span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Parentheses'>) 
+</span>        <a href="xlogutils.c.html#LN61"><span class='Ref_to_Func'>report_invalid_page</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN78"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN78"><span class='Ref_to_Parameter'>forkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN78"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN79"><span class='Ref_to_Parameter'>present</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* create hash table when first needed */ 
+</span><a name="LN110"></a>        <a href="../../../include/utils/hsearch.h.html#LN64"><span class='Ref_to_Struct'>HASHCTL</span></a>     <span class='Declare_Local'>ctl</span><span class='Delimiter'>; 
+</span> 
+        memset<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogutils.c.html#LN110"><span class='Ref_To_Local'>ctl</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN110"><span class='Ref_To_Local'>ctl</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="xlogutils.c.html#LN110"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../../include/utils/hsearch.h.html#LN71"><span class='Ref_to_Member'>keysize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN44"><span class='Ref_to_Struct'>xl_invalid_page_key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xlogutils.c.html#LN110"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../../include/utils/hsearch.h.html#LN72"><span class='Ref_to_Member'>entrysize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN51"><span class='Ref_to_Struct'>xl_invalid_page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a> <span class='Operator'>= </span><a href="../../../include/utils/hsearch.h.html#LN121"><span class='Ref_to_Proto'>hash_create</span></a><span class='Parentheses'>(</span><span class='String'>"XLOG invalid-page table"</span><span class='Delimiter'>, 
+</span>                                       <span class='Number'>100</span><span class='Delimiter'>, 
+</span>                                       <span class='Operator'>&</span><a href="xlogutils.c.html#LN110"><span class='Ref_To_Local'>ctl</span></a><span class='Delimiter'>, 
+</span>                                       <a href="../../../include/utils/hsearch.h.html#LN86"><span class='Ref_to_Const'>HASH_ELEM</span></a> <span class='Operator'>| </span><a href="../../../include/utils/hsearch.h.html#LN87"><span class='Ref_to_Const'>HASH_BLOBS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* we currently assume xl_invalid_page_key contains no padding */ 
+</span>    <a href="xlogutils.c.html#LN81"><span class='Ref_To_Local'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN46"><span class='Ref_to_Member'>node</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN78"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN81"><span class='Ref_To_Local'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN47"><span class='Ref_to_Member'>forkno</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN78"><span class='Ref_to_Parameter'>forkno</span></a><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN81"><span class='Ref_To_Local'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN48"><span class='Ref_to_Member'>blkno</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN78"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN82"><span class='Ref_To_Local'>hentry</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN51"><span class='Ref_to_Struct'>xl_invalid_page</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/hsearch.h.html#LN125"><span class='Ref_to_Proto'>hash_search</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="xlogutils.c.html#LN81"><span class='Ref_To_Local'>key</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/hsearch.h.html#LN105"><span class='Ref_to_EnumConst'>HASH_ENTER</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogutils.c.html#LN83"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="xlogutils.c.html#LN83"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* hash_search already filled in the key */ 
+</span>        <a href="xlogutils.c.html#LN82"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN54"><span class='Ref_to_Member'>present</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN79"><span class='Ref_to_Parameter'>present</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* repeat reference ... leave "present" as it was */ 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end log_invalid_page &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* Forget any invalid pages &GT;= minblkno, because they've been dropped */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN142"></a><span class='Declare_Function'>forget_invalid_pages</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forkno</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>minblkno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN144"></a>    <a href="../../../include/utils/hsearch.h.html#LN111"><span class='Ref_to_Typedef'>HASH_SEQ_STATUS</span></a> <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN145"></a>    <a href="xlogutils.c.html#LN51"><span class='Ref_to_Struct'>xl_invalid_page</span></a> <span class='Operator'>*</span><span class='Declare_Local'>hentry</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>;</span>                 <span class='Comment_Single_Line'>/* nothing to do */ 
+</span> 
+    <a href="../../../include/utils/hsearch.h.html#LN134"><span class='Ref_to_Proto'>hash_seq_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogutils.c.html#LN144"><span class='Ref_To_Local'>status</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="xlogutils.c.html#LN145"><span class='Ref_To_Local'>hentry</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN51"><span class='Ref_to_Struct'>xl_invalid_page</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/utils/hsearch.h.html#LN135"><span class='Ref_to_Proto'>hash_seq_search</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogutils.c.html#LN144"><span class='Ref_To_Local'>status</span></a><span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN87"><span class='Ref_to_Macro'>RelFileNodeEquals</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN145"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN46"><span class='Ref_to_Member'>node</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN142"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>) </span><span class='Operator'>&& 
+</span>            <a href="xlogutils.c.html#LN145"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN47"><span class='Ref_to_Member'>forkno</span></a> <span class='Operator'>== </span><a href="xlogutils.c.html#LN142"><span class='Ref_to_Parameter'>forkno</span></a> <span class='Operator'>&& 
+</span>            <a href="xlogutils.c.html#LN145"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN48"><span class='Ref_to_Member'>blkno</span></a> <span class='Operator'>&GT;= </span><a href="xlogutils.c.html#LN142"><span class='Ref_to_Parameter'>minblkno</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../utils/misc/guc.c.html#LN450"><span class='Ref_to_Global_Var'>log_min_messages</span></a> <span class='Operator'>&LT;= </span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a> <span class='Operator'>|| </span><a href="../../utils/misc/guc.c.html#LN451"><span class='Ref_to_Global_Var'>client_min_messages</span></a> <span class='Operator'>&LT;= </span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN160"></a>                <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>path</span> <span class='Operator'>= </span><a href="../../../include/common/relpath.h.html#LN66"><span class='Ref_to_Macro'>relpathperm</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN145"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN46"><span class='Ref_to_Member'>node</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN142"><span class='Ref_to_Parameter'>forkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, </span><span class='String'>"page %u of relation %s has been dropped"</span><span class='Delimiter'>, 
+</span>                     <a href="xlogutils.c.html#LN145"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN48"><span class='Ref_to_Member'>blkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN160"><span class='Ref_To_Local'>path</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN160"><span class='Ref_To_Local'>path</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/utils/hsearch.h.html#LN125"><span class='Ref_to_Proto'>hash_search</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a><span class='Delimiter'>, 
+</span>                            <span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="xlogutils.c.html#LN145"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Delimiter'>, 
+</span>                            <a href="../../../include/utils/hsearch.h.html#LN106"><span class='Ref_to_EnumConst'>HASH_REMOVE</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"hash table corrupted"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while (hentry=(xl_invalid_p... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end forget_invalid_pages &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* Forget any invalid pages in a whole database */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN177"></a><span class='Declare_Function'>forget_invalid_pages_db</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>dbid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN179"></a>    <a href="../../../include/utils/hsearch.h.html#LN111"><span class='Ref_to_Typedef'>HASH_SEQ_STATUS</span></a> <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN180"></a>    <a href="xlogutils.c.html#LN51"><span class='Ref_to_Struct'>xl_invalid_page</span></a> <span class='Operator'>*</span><span class='Declare_Local'>hentry</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>;</span>                 <span class='Comment_Single_Line'>/* nothing to do */ 
+</span> 
+    <a href="../../../include/utils/hsearch.h.html#LN134"><span class='Ref_to_Proto'>hash_seq_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogutils.c.html#LN179"><span class='Ref_To_Local'>status</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="xlogutils.c.html#LN180"><span class='Ref_To_Local'>hentry</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN51"><span class='Ref_to_Struct'>xl_invalid_page</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/utils/hsearch.h.html#LN135"><span class='Ref_to_Proto'>hash_seq_search</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogutils.c.html#LN179"><span class='Ref_To_Local'>status</span></a><span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN180"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN46"><span class='Ref_to_Member'>node</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN59"><span class='Ref_to_Member'>dbNode</span></a> <span class='Operator'>== </span><a href="xlogutils.c.html#LN177"><span class='Ref_to_Parameter'>dbid</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../utils/misc/guc.c.html#LN450"><span class='Ref_to_Global_Var'>log_min_messages</span></a> <span class='Operator'>&LT;= </span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a> <span class='Operator'>|| </span><a href="../../utils/misc/guc.c.html#LN451"><span class='Ref_to_Global_Var'>client_min_messages</span></a> <span class='Operator'>&LT;= </span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN193"></a>                <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>path</span> <span class='Operator'>= </span><a href="../../../include/common/relpath.h.html#LN66"><span class='Ref_to_Macro'>relpathperm</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN180"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN46"><span class='Ref_to_Member'>node</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN180"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN47"><span class='Ref_to_Member'>forkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, </span><span class='String'>"page %u of relation %s has been dropped"</span><span class='Delimiter'>, 
+</span>                     <a href="xlogutils.c.html#LN180"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN48"><span class='Ref_to_Member'>blkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN193"><span class='Ref_To_Local'>path</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN193"><span class='Ref_To_Local'>path</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/utils/hsearch.h.html#LN125"><span class='Ref_to_Proto'>hash_search</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a><span class='Delimiter'>, 
+</span>                            <span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="xlogutils.c.html#LN180"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Delimiter'>, 
+</span>                            <a href="../../../include/utils/hsearch.h.html#LN106"><span class='Ref_to_EnumConst'>HASH_REMOVE</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"hash table corrupted"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end forget_invalid_pages_db &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* Are there any unresolved references to invalid pages? */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN210"></a><span class='Declare_Function'>XLogHaveInvalidPages</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL </span><span class='Operator'>&& 
+</span>        <a href="../../../include/utils/hsearch.h.html#LN133"><span class='Ref_to_Proto'>hash_get_num_entries</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* Complain about any remaining invalid-page entries */ 
+</span><span class='Keyword'>void 
+</span><a name="LN220"></a><span class='Declare_Function'>XLogCheckInvalidPages</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN222"></a>    <a href="../../../include/utils/hsearch.h.html#LN111"><span class='Ref_to_Typedef'>HASH_SEQ_STATUS</span></a> <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN223"></a>    <a href="xlogutils.c.html#LN51"><span class='Ref_to_Struct'>xl_invalid_page</span></a> <span class='Operator'>*</span><span class='Declare_Local'>hentry</span><span class='Delimiter'>; 
+</span><a name="LN224"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>foundone</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>;</span>                 <span class='Comment_Single_Line'>/* nothing to do */ 
+</span> 
+    <a href="../../../include/utils/hsearch.h.html#LN134"><span class='Ref_to_Proto'>hash_seq_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogutils.c.html#LN222"><span class='Ref_To_Local'>status</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Our strategy is to emit WARNING messages for all remaining entries and 
+     * only PANIC after we've dumped all the available info. 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="xlogutils.c.html#LN223"><span class='Ref_To_Local'>hentry</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN51"><span class='Ref_to_Struct'>xl_invalid_page</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/utils/hsearch.h.html#LN135"><span class='Ref_to_Proto'>hash_seq_search</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogutils.c.html#LN222"><span class='Ref_To_Local'>status</span></a><span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="xlogutils.c.html#LN61"><span class='Ref_to_Func'>report_invalid_page</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN223"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN46"><span class='Ref_to_Member'>node</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN223"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN47"><span class='Ref_to_Member'>forkno</span></a><span class='Delimiter'>, 
+</span>                            <a href="xlogutils.c.html#LN223"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN53"><span class='Ref_to_Member'>key</span></a><span class='Operator'>.</span><a href="xlogutils.c.html#LN48"><span class='Ref_to_Member'>blkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN223"><span class='Ref_To_Local'>hentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN54"><span class='Ref_to_Member'>present</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xlogutils.c.html#LN224"><span class='Ref_To_Local'>foundone</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN224"><span class='Ref_To_Local'>foundone</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"WAL contains references to invalid pages"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/hsearch.h.html#LN123"><span class='Ref_to_Proto'>hash_destroy</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN57"><span class='Ref_to_Global_Var'>invalid_page_tab</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogCheckInvalidPages &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * XLogReadBufferForRedo 
+ *      Read a page during XLOG replay 
+ * 
+ * Reads a block referenced by a WAL record into shared buffer cache, and 
+ * determines what needs to be done to redo the changes to it.  If the WAL 
+ * record includes a full-page image of the page, it is restored. 
+ * 
+ * 'lsn' is the LSN of the record being replayed.  It is compared with the 
+ * page's LSN to determine if the record has already been replayed. 
+ * 'block_id' is the ID number the block was registered with, when the WAL 
+ * record was created. 
+ * 
+ * Returns one of the following: 
+ * 
+ *  BLK_NEEDS_REDO  - changes from the WAL record need to be applied 
+ *  BLK_DONE        - block doesn't need replaying 
+ *  BLK_RESTORED    - block was restored from a full-page image included in 
+ *                    the record 
+ *  BLK_NOTFOUND    - block was not found (because it was truncated away by 
+ *                    an operation later in the WAL stream) 
+ * 
+ * On return, the buffer is locked in exclusive-mode, and returned in *buf. 
+ * Note that the buffer is locked and returned even if it doesn't need 
+ * replaying.  (Getting the buffer lock is not really necessary during 
+ * single-process crash recovery, but some subroutines such as MarkBufferDirty 
+ * will complain if we don't have the lock.  In hot standby mode it's 
+ * definitely necessary.) 
+ * 
+ * Note: when a backup block is available in XLOG with the BKPIMAGE_APPLY flag 
+ * set, we restore it, even if the page in the database appears newer.  This 
+ * is to protect ourselves against database pages that were partially or 
+ * incorrectly written during a crash.  We assume that the XLOG data must be 
+ * good because it has passed a CRC check, while the database page might not 
+ * be.  This will force us to replay all subsequent modifications of the page 
+ * that appear in XLOG, rather than possibly ignoring them as already 
+ * applied, but that's not a huge drawback. 
+ */ 
+</span><a href="../../../include/access/xlogutils.h.html#LN26"><span class='Ref_to_Typedef'>XLogRedoAction</span></a> 
+<a name="LN289"></a><span class='Declare_Function'>XLogReadBufferForRedo</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN68"><span class='Ref_to_Struct'>XLogReaderState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>record</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>block_id</span><span class='Delimiter'>, 
+</span><a name="LN290"></a>                      <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>buf</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="../../../include/access/xlogutils.h.html#LN38"><span class='Ref_to_Proto'>XLogReadBufferForRedoExtended</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN289"><span class='Ref_to_Parameter'>record</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN289"><span class='Ref_to_Parameter'>block_id</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN39"><span class='Ref_to_EnumConst'>RBM_NORMAL</span></a><span class='Delimiter'>, 
+</span>                                         <span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN290"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Pin and lock a buffer referenced by a WAL record, for the purpose of 
+ * re-initializing it. 
+ */ 
+</span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> 
+<a name="LN301"></a><span class='Declare_Function'>XLogInitBufferForRedo</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN68"><span class='Ref_to_Struct'>XLogReaderState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>record</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>block_id</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN303"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xlogutils.h.html#LN38"><span class='Ref_to_Proto'>XLogReadBufferForRedoExtended</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN301"><span class='Ref_to_Parameter'>record</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN301"><span class='Ref_to_Parameter'>block_id</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN40"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_LOCK</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, 
+</span>                                  <span class='Operator'>&</span><a href="xlogutils.c.html#LN303"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="xlogutils.c.html#LN303"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * XLogReadBufferForRedoExtended 
+ *      Like XLogReadBufferForRedo, but with extra options. 
+ * 
+ * In RBM_ZERO_* modes, if the page doesn't exist, the relation is extended 
+ * with all-zeroes pages up to the referenced block number.  In 
+ * RBM_ZERO_AND_LOCK and RBM_ZERO_AND_CLEANUP_LOCK modes, the return value 
+ * is always BLK_NEEDS_REDO. 
+ * 
+ * (The RBM_ZERO_AND_CLEANUP_LOCK mode is redundant with the get_cleanup_lock 
+ * parameter. Do not use an inconsistent combination!) 
+ * 
+ * If 'get_cleanup_lock' is true, a "cleanup lock" is acquired on the buffer 
+ * using LockBufferForCleanup(), instead of a regular exclusive lock. 
+ */ 
+</span><a href="../../../include/access/xlogutils.h.html#LN26"><span class='Ref_to_Typedef'>XLogRedoAction</span></a> 
+<a name="LN326"></a><span class='Declare_Function'>XLogReadBufferForRedoExtended</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN68"><span class='Ref_to_Struct'>XLogReaderState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>record</span><span class='Delimiter'>, 
+</span><a name="LN327"></a>                              <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>block_id</span><span class='Delimiter'>, 
+</span><a name="LN328"></a>                              <a href="../../../include/storage/bufmgr.h.html#LN37"><span class='Ref_to_Typedef'>ReadBufferMode</span></a> <span class='Declare_Parameter'>mode</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>get_cleanup_lock</span><span class='Delimiter'>, 
+</span><a name="LN329"></a>                              <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>buf</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN331"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>lsn</span> <span class='Operator'>= </span><a href="xlogutils.c.html#LN326"><span class='Ref_to_Parameter'>record</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN114"><span class='Ref_to_Member'>EndRecPtr</span></a><span class='Delimiter'>; 
+</span><a name="LN332"></a>    <a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Local'>rnode</span><span class='Delimiter'>; 
+</span><a name="LN333"></a>    <a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a>  <span class='Declare_Local'>forknum</span><span class='Delimiter'>; 
+</span><a name="LN334"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>blkno</span><span class='Delimiter'>; 
+</span><a name="LN335"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span><a name="LN336"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>zeromode</span><span class='Delimiter'>; 
+</span><a name="LN337"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>willinit</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xlogreader.h.html#LN231"><span class='Ref_to_Proto'>XLogRecGetBlockTag</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN326"><span class='Ref_to_Parameter'>record</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN327"><span class='Ref_to_Parameter'>block_id</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogutils.c.html#LN332"><span class='Ref_To_Local'>rnode</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogutils.c.html#LN333"><span class='Ref_To_Local'>forknum</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogutils.c.html#LN334"><span class='Ref_To_Local'>blkno</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Caller specified a bogus block_id */ 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"failed to locate backup block with ID %d"</span><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN327"><span class='Ref_to_Parameter'>block_id</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Make sure that if the block is marked with WILL_INIT, the caller is 
+     * going to initialize it. And vice versa. 
+     */ 
+</span>    <a href="xlogutils.c.html#LN336"><span class='Ref_To_Local'>zeromode</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN328"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>== </span><a href="../../../include/storage/bufmgr.h.html#LN40"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_LOCK</span></a> <span class='Operator'>|| </span><a href="xlogutils.c.html#LN328"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>== </span><a href="../../../include/storage/bufmgr.h.html#LN42"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_CLEANUP_LOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN337"><span class='Ref_To_Local'>willinit</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN326"><span class='Ref_to_Parameter'>record</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN133"><span class='Ref_to_Member'>blocks</span></a><span class='Delimiter'>[</span><a href="xlogutils.c.html#LN327"><span class='Ref_to_Parameter'>block_id</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/access/xlogreader.h.html#LN50"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../../include/access/xlogrecord.h.html#LN181"><span class='Ref_to_Const'>BKPBLOCK_WILL_INIT</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN337"><span class='Ref_To_Local'>willinit</span></a> <span class='Operator'>&& !</span><a href="xlogutils.c.html#LN336"><span class='Ref_To_Local'>zeromode</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"block with WILL_INIT flag in WAL record must be zeroed by redo routine"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="xlogutils.c.html#LN337"><span class='Ref_To_Local'>willinit</span></a> <span class='Operator'>&& </span><a href="xlogutils.c.html#LN336"><span class='Ref_To_Local'>zeromode</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If it has a full-page image and it should be restored, do it. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN226"><span class='Ref_to_Macro'>XLogRecBlockImageApply</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN326"><span class='Ref_to_Parameter'>record</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN327"><span class='Ref_to_Parameter'>block_id</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN224"><span class='Ref_to_Macro'>XLogRecHasBlockImage</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN326"><span class='Ref_to_Parameter'>record</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN327"><span class='Ref_to_Parameter'>block_id</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="xlogutils.c.html#LN329"><span class='Ref_to_Parameter'>buf</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogutils.h.html#LN43"><span class='Ref_to_Proto'>XLogReadBufferExtended</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN332"><span class='Ref_To_Local'>rnode</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN333"><span class='Ref_To_Local'>forknum</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN334"><span class='Ref_To_Local'>blkno</span></a><span class='Delimiter'>, 
+</span>           <a href="xlogutils.c.html#LN328"><span class='Ref_to_Parameter'>get_cleanup_lock</span></a> <span class='Operator'>? </span><a href="../../../include/storage/bufmgr.h.html#LN42"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_CLEANUP_LOCK</span></a> <span class='Operator'>: </span><a href="../../../include/storage/bufmgr.h.html#LN40"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_LOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xlogutils.c.html#LN335"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xlogutils.c.html#LN329"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xlogreader.h.html#LN229"><span class='Ref_to_Proto'>RestoreBlockImage</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN326"><span class='Ref_to_Parameter'>record</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN327"><span class='Ref_to_Parameter'>block_id</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN335"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"failed to restore block image"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * The page may be uninitialized. If so, we can't set the LSN because 
+         * that would corrupt the page. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/bufpage.h.html#LN225"><span class='Ref_to_Macro'>PageIsNew</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN335"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/bufpage.h.html#LN364"><span class='Ref_to_Macro'>PageSetLSN</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN335"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN331"><span class='Ref_To_Local'>lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="../../../include/storage/bufmgr.h.html#LN176"><span class='Ref_to_Proto'>MarkBufferDirty</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xlogutils.c.html#LN329"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * At the end of crash recovery the init forks of unlogged relations 
+         * are copied, without going through shared buffers. So we need to 
+         * force the on-disk state of init forks to always be in sync with the 
+         * state in shared buffers. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN333"><span class='Ref_To_Local'>forknum</span></a> <span class='Operator'>== </span><a href="../../../include/common/relpath.h.html#LN29"><span class='Ref_to_EnumConst'>INIT_FORKNUM</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN190"><span class='Ref_to_Proto'>FlushOneBuffer</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xlogutils.c.html#LN329"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>return</span> <a href="../../../include/access/xlogutils.h.html#LN30"><span class='Ref_to_EnumConst'>BLK_RESTORED</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if XLogRecBlockImageAppl... &raquo; </span> 
+    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="xlogutils.c.html#LN329"><span class='Ref_to_Parameter'>buf</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogutils.h.html#LN43"><span class='Ref_to_Proto'>XLogReadBufferExtended</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN332"><span class='Ref_To_Local'>rnode</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN333"><span class='Ref_To_Local'>forknum</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN334"><span class='Ref_To_Local'>blkno</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN328"><span class='Ref_to_Parameter'>mode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xlogutils.c.html#LN329"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN328"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/bufmgr.h.html#LN40"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_LOCK</span></a> <span class='Operator'>&& </span><a href="xlogutils.c.html#LN328"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/bufmgr.h.html#LN42"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_CLEANUP_LOCK</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN328"><span class='Ref_to_Parameter'>get_cleanup_lock</span></a><span class='Parentheses'>) 
+</span>                    <a href="../../../include/storage/bufmgr.h.html#LN216"><span class='Ref_to_Proto'>LockBufferForCleanup</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xlogutils.c.html#LN329"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>else</span> 
+                    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xlogutils.c.html#LN329"><span class='Ref_to_Parameter'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN331"><span class='Ref_To_Local'>lsn</span></a> <span class='Operator'>&LT;= </span><a href="../../../include/storage/bufpage.h.html#LN362"><span class='Ref_to_Macro'>PageGetLSN</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xlogutils.c.html#LN329"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)))</span> 
+                <span class='Control'>return</span> <a href="../../../include/access/xlogutils.h.html#LN29"><span class='Ref_to_EnumConst'>BLK_DONE</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <span class='Control'>return</span> <a href="../../../include/access/xlogutils.h.html#LN28"><span class='Ref_to_EnumConst'>BLK_NEEDS_REDO</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+            <span class='Control'>return</span> <a href="../../../include/access/xlogutils.h.html#LN31"><span class='Ref_to_EnumConst'>BLK_NOTFOUND</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end XLogReadBufferForRedoExtended &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * XLogReadBufferExtended 
+ *      Read a page during XLOG replay 
+ * 
+ * This is functionally comparable to ReadBufferExtended. There's some 
+ * differences in the behavior wrt. the "mode" argument: 
+ * 
+ * In RBM_NORMAL mode, if the page doesn't exist, or contains all-zeroes, we 
+ * return InvalidBuffer. In this case the caller should silently skip the 
+ * update on this page. (In this situation, we expect that the page was later 
+ * dropped or truncated. If we don't see evidence of that later in the WAL 
+ * sequence, we'll complain at the end of WAL replay.) 
+ * 
+ * In RBM_ZERO_* modes, if the page doesn't exist, the relation is extended 
+ * with all-zeroes pages up to the given block number. 
+ * 
+ * In RBM_NORMAL_NO_LOG mode, we return InvalidBuffer if the page doesn't 
+ * exist, and we don't check for all-zeroes.  Thus, no log entry is made 
+ * to imply that the page should be dropped or truncated later. 
+ * 
+ * NB: A redo function should normally not call this directly. To get a page 
+ * to modify, use XLogReadBufferForRedoExtended instead. It is important that 
+ * all pages modified by a WAL record are registered in the WAL records, or 
+ * they will be invisible to tools that that need to know which pages are 
+ * modified. 
+ */ 
+</span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> 
+<a name="LN437"></a><span class='Declare_Function'>XLogReadBufferExtended</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forknum</span><span class='Delimiter'>, 
+</span><a name="LN438"></a>                       <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>blkno</span><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN37"><span class='Ref_to_Typedef'>ReadBufferMode</span></a> <span class='Declare_Parameter'>mode</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN440"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>lastblock</span><span class='Delimiter'>; 
+</span><a name="LN441"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buffer</span><span class='Delimiter'>; 
+</span><a name="LN442"></a>    <a href="../../../include/storage/smgr.h.html#LN77"><span class='Ref_to_Typedef'>SMgrRelation</span></a> <span class='Declare_Local'>smgr</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>blkno</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/bufmgr.h.html#LN81"><span class='Ref_to_Const'>P_NEW</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Open the relation at smgr level */ 
+</span>    <a href="xlogutils.c.html#LN442"><span class='Ref_To_Local'>smgr</span></a> <span class='Operator'>= </span><a href="../../../include/storage/smgr.h.html#LN83"><span class='Ref_to_Proto'>smgropen</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/backendid.h.html#LN22"><span class='Ref_to_Const'>InvalidBackendId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create the target file if it doesn't already exist.  This lets us cope 
+     * if the replay sequence contains writes to a relation that is later 
+     * deleted.  (The original coding of this routine would instead suppress 
+     * the writes, but that seems like it risks losing valuable data if the 
+     * filesystem loses an inode during a crash.  Better to write the data 
+     * until we are actually told to delete the file.) 
+     */ 
+</span>    <a href="../../../include/storage/smgr.h.html#LN90"><span class='Ref_to_Proto'>smgrcreate</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN442"><span class='Ref_To_Local'>smgr</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>forknum</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="xlogutils.c.html#LN440"><span class='Ref_To_Local'>lastblock</span></a> <span class='Operator'>= </span><a href="../../../include/storage/smgr.h.html#LN104"><span class='Ref_to_Proto'>smgrnblocks</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN442"><span class='Ref_To_Local'>smgr</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>forknum</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>blkno</span></a> <span class='Operator'>&LT; </span><a href="xlogutils.c.html#LN440"><span class='Ref_To_Local'>lastblock</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* page exists in file */ 
+</span>        <a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN171"><span class='Ref_to_Proto'>ReadBufferWithoutRelcache</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>forknum</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, 
+</span>                                           <a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* hm, page doesn't exist in file */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>== </span><a href="../../../include/storage/bufmgr.h.html#LN39"><span class='Ref_to_EnumConst'>RBM_NORMAL</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="xlogutils.c.html#LN77"><span class='Ref_to_Func'>log_invalid_page</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>forknum</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>== </span><a href="../../../include/storage/bufmgr.h.html#LN45"><span class='Ref_to_EnumConst'>RBM_NORMAL_NO_LOG</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* OK to extend the file */ 
+</span>        <span class='Comment_Multi_Line'>/* we do this in recovery only - no rel-extension lock needed */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlog.c.html#LN191"><span class='Ref_to_Global_Var'>InRecovery</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a> <span class='Operator'>= </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>do</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>== </span><a href="../../../include/storage/bufmgr.h.html#LN40"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_LOCK</span></a> <span class='Operator'>|| </span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>== </span><a href="../../../include/storage/bufmgr.h.html#LN42"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_CLEANUP_LOCK</span></a><span class='Parentheses'>) 
+</span>                    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN171"><span class='Ref_to_Proto'>ReadBufferWithoutRelcache</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>forknum</span></a><span class='Delimiter'>, 
+</span>                                               <a href="../../../include/storage/bufmgr.h.html#LN81"><span class='Ref_to_Const'>P_NEW</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN187"><span class='Ref_to_Proto'>BufferGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>blkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* Handle the corner case that P_NEW returns non-consecutive pages */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN187"><span class='Ref_to_Proto'>BufferGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>blkno</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>== </span><a href="../../../include/storage/bufmgr.h.html#LN40"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_LOCK</span></a> <span class='Operator'>|| </span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>== </span><a href="../../../include/storage/bufmgr.h.html#LN42"><span class='Ref_to_EnumConst'>RBM_ZERO_AND_CLEANUP_LOCK</span></a><span class='Parentheses'>) 
+</span>                <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN171"><span class='Ref_to_Proto'>ReadBufferWithoutRelcache</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>forknum</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, 
+</span>                                               <a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>mode</span></a> <span class='Operator'>== </span><a href="../../../include/storage/bufmgr.h.html#LN39"><span class='Ref_to_EnumConst'>RBM_NORMAL</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* check that page has been initialized */ 
+</span><a name="LN507"></a>        <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * We assume that PageIsNew is safe without a lock. During recovery, 
+         * there should be no other backends that could modify the buffer at 
+         * the same time. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN225"><span class='Ref_to_Macro'>PageIsNew</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN507"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="xlogutils.c.html#LN77"><span class='Ref_to_Func'>log_invalid_page</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN437"><span class='Ref_to_Parameter'>forknum</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN438"><span class='Ref_to_Parameter'>blkno</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="xlogutils.c.html#LN441"><span class='Ref_To_Local'>buffer</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogReadBufferExtended &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Struct actually returned by XLogFakeRelcacheEntry, though the declared 
+ * return type is Relation. 
+ */ 
+</span><span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN531"></a>    <a href="../../../include/utils/rel.h.html#LN82"><span class='Ref_to_Struct'>RelationData</span></a> <span class='Declare_Member'>reldata</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* Note: this must be first */ 
+</span><a name="LN532"></a>    FormData_pg_class <span class='Declare_Member'>pgc</span><span class='Delimiter'>; 
+</span><a name="LN533"></a>} <span class='Declare_Typedef'>FakeRelCacheEntryData</span><span class='Delimiter'>; 
+</span> 
+<a name="LN535"></a><span class='Control'>typedef</span> <a href="xlogutils.c.html#LN529"><span class='Ref_to_Typedef'>FakeRelCacheEntryData</span></a> <span class='Operator'>*</span><span class='Declare_Typedef'>FakeRelCacheEntry</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Create a fake relation cache entry for a physical relation 
+ * 
+ * It's often convenient to use the same functions in XLOG replay as in the 
+ * main codepath, but those functions typically work with a relcache entry. 
+ * We don't have a working relation cache during XLOG replay, but this 
+ * function can be used to create a fake relcache entry instead. Only the 
+ * fields related to physical storage, like rd_rel, are initialized, so the 
+ * fake entry is only usable in low-level operations like ReadBuffer(). 
+ * 
+ * Caller must free the returned entry with FreeFakeRelcacheEntry(). 
+ */ 
+</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> 
+<a name="LN550"></a><span class='Declare_Function'>CreateFakeRelcacheEntry</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>rnode</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN552"></a>    <a href="xlogutils.c.html#LN535"><span class='Ref_to_Typedef'>FakeRelCacheEntry</span></a> <span class='Declare_Local'>fakeentry</span><span class='Delimiter'>; 
+</span><a name="LN553"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>rel</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlog.c.html#LN191"><span class='Ref_to_Global_Var'>InRecovery</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Allocate the Relation struct and all related space in one block. */ 
+</span>    <a href="xlogutils.c.html#LN552"><span class='Ref_To_Local'>fakeentry</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN529"><span class='Ref_to_Typedef'>FakeRelCacheEntryData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a><span class='Parentheses'>) </span><a href="xlogutils.c.html#LN552"><span class='Ref_To_Local'>fakeentry</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN113"><span class='Ref_to_Member'>rd_rel</span></a> <span class='Operator'>= &</span><a href="xlogutils.c.html#LN552"><span class='Ref_To_Local'>fakeentry</span></a><span class='Operator'>-&GT;</span><a href="xlogutils.c.html#LN532"><span class='Ref_to_Member'>pgc</span></a><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN84"><span class='Ref_to_Member'>rd_node</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN550"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* We will never be working with temp rels during recovery */ 
+</span>    <a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN88"><span class='Ref_to_Member'>rd_backend</span></a> <span class='Operator'>= </span><a href="../../../include/storage/backendid.h.html#LN22"><span class='Ref_to_Const'>InvalidBackendId</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* It must be a permanent table if we're in recovery. */ 
+</span>    <a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN113"><span class='Ref_to_Member'>rd_rel</span></a><span class='Operator'>-&GT;</span>relpersistence <span class='Operator'>= </span><a href="../../../include/catalog/pg_class.h.html#LN169"><span class='Ref_to_Const'>RELPERSISTENCE_PERMANENT</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We don't know the name of the relation; use relfilenode instead */ 
+</span>    <a href="../../../include/port.h.html#LN170"><span class='Ref_to_Macro'>sprintf</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"%u"</span><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN550"><span class='Ref_to_Parameter'>rnode</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN60"><span class='Ref_to_Member'>relNode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We set up the lockRelId in case anything tries to lock the dummy 
+     * relation.  Note that this is fairly bogus since relNode may be 
+     * different from the relation's OID.  It shouldn't really matter though, 
+     * since we are presumably running by ourselves and can't have any lock 
+     * conflicts ... 
+     */ 
+</span>    <a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN116"><span class='Ref_to_Member'>rd_lockInfo</span></a><span class='Operator'>.</span><a href="../../../include/utils/rel.h.html#LN43"><span class='Ref_to_Member'>lockRelId</span></a><span class='Operator'>.</span><a href="../../../include/utils/rel.h.html#LN38"><span class='Ref_to_Member'>dbId</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN550"><span class='Ref_to_Parameter'>rnode</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN59"><span class='Ref_to_Member'>dbNode</span></a><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN116"><span class='Ref_to_Member'>rd_lockInfo</span></a><span class='Operator'>.</span><a href="../../../include/utils/rel.h.html#LN43"><span class='Ref_to_Member'>lockRelId</span></a><span class='Operator'>.</span><a href="../../../include/utils/rel.h.html#LN37"><span class='Ref_to_Member'>relId</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN550"><span class='Ref_to_Parameter'>rnode</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN60"><span class='Ref_to_Member'>relNode</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="xlogutils.c.html#LN553"><span class='Ref_To_Local'>rel</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end CreateFakeRelcacheEntry &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Free a fake relation cache entry. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN591"></a><span class='Declare_Function'>FreeFakeRelcacheEntry</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>fakerel</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* make sure the fakerel is not referenced by the SmgrRelation anymore */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN591"><span class='Ref_to_Parameter'>fakerel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/smgr.h.html#LN86"><span class='Ref_to_Proto'>smgrclearowner</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogutils.c.html#LN591"><span class='Ref_to_Parameter'>fakerel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN591"><span class='Ref_to_Parameter'>fakerel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN591"><span class='Ref_to_Parameter'>fakerel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Drop a relation during XLOG replay 
+ * 
+ * This is called when the relation is about to be deleted; we need to remove 
+ * any open "invalid-page" records for the relation. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN606"></a><span class='Declare_Function'>XLogDropRelation</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forknum</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="xlogutils.c.html#LN141"><span class='Ref_to_Func'>forget_invalid_pages</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN606"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN606"><span class='Ref_to_Parameter'>forknum</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Drop a whole database during XLOG replay 
+ * 
+ * As above, but for DROP DATABASE instead of dropping a single rel 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN617"></a><span class='Declare_Function'>XLogDropDatabase</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>dbid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * This is unnecessarily heavy-handed, as it will close SMgrRelation 
+     * objects for other databases as well. DROP DATABASE occurs seldom enough 
+     * that it's not worth introducing a variant of smgrclose for just this 
+     * purpose. XXX: Or should we rather leave the smgr entries dangling? 
+     */ 
+</span>    <a href="../../../include/storage/smgr.h.html#LN88"><span class='Ref_to_Proto'>smgrcloseall</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="xlogutils.c.html#LN176"><span class='Ref_to_Func'>forget_invalid_pages_db</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN617"><span class='Ref_to_Parameter'>dbid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Truncate a relation during XLOG replay 
+ * 
+ * We need to clean up any open "invalid-page" records for the dropped pages. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN636"></a><span class='Declare_Function'>XLogTruncateRelation</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forkNum</span><span class='Delimiter'>, 
+</span><a name="LN637"></a>                     <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>nblocks</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="xlogutils.c.html#LN141"><span class='Ref_to_Func'>forget_invalid_pages</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN636"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN636"><span class='Ref_to_Parameter'>forkNum</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN637"><span class='Ref_to_Parameter'>nblocks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Read 'count' bytes from WAL into 'buf', starting at location 'startptr' 
+ * in timeline 'tli'. 
+ * 
+ * Will open, and keep open, one WAL segment stored in the static file 
+ * descriptor 'sendFile'. This means if XLogRead is used once, there will 
+ * always be one descriptor left open until the process ends, but never 
+ * more than one. 
+ * 
+ * XXX This is very similar to pg_waldump's XLogDumpXLogRead and to XLogRead 
+ * in walsender.c but for small differences (such as lack of elog() in 
+ * frontend).  Probably these should be merged at some point. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN656"></a><span class='Declare_Function'>XLogRead</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>buf</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN44"><span class='Ref_to_Typedef'>TimeLineID</span></a> <span class='Declare_Parameter'>tli</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>startptr</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>count</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN658"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>p</span><span class='Delimiter'>; 
+</span><a name="LN659"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span><span class='Delimiter'>; 
+</span><a name="LN660"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>nbytes</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* state maintained across calls */ 
+</span><a name="LN663"></a>    <span class='Keyword'>static int</span>  <span class='Declare_Local'>sendFile</span> <span class='Operator'>= -</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span><a name="LN664"></a>    <span class='Keyword'>static </span><a href="../../../include/access/xlogdefs.h.html#LN33"><span class='Ref_to_Typedef'>XLogSegNo</span></a> <span class='Declare_Local'>sendSegNo</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN665"></a>    <span class='Keyword'>static </span><a href="../../../include/access/xlogdefs.h.html#LN44"><span class='Ref_to_Typedef'>TimeLineID</span></a> <span class='Declare_Local'>sendTLI</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN666"></a>    <span class='Keyword'>static </span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Local'>sendOff</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="xlogutils.c.html#LN658"><span class='Ref_To_Local'>p</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN656"><span class='Ref_to_Parameter'>buf</span></a><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN659"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN656"><span class='Ref_to_Parameter'>startptr</span></a><span class='Delimiter'>; 
+</span>    <a href="xlogutils.c.html#LN660"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN656"><span class='Ref_to_Parameter'>count</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN660"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN674"></a>        <a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Local'>startoff</span><span class='Delimiter'>; 
+</span><a name="LN675"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>segbytes</span><span class='Delimiter'>; 
+</span><a name="LN676"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>readbytes</span><span class='Delimiter'>; 
+</span> 
+        <a href="xlogutils.c.html#LN674"><span class='Ref_To_Local'>startoff</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN659"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>% </span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Do we need to switch to a different xlog segment? */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN663"><span class='Ref_To_Local'>sendFile</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| !</span><a href="../../../include/access/xlog_internal.h.html#LN117"><span class='Ref_to_Macro'>XLByteInSeg</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN659"><span class='Ref_To_Local'>recptr</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN664"><span class='Ref_To_Local'>sendSegNo</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>            <a href="xlogutils.c.html#LN665"><span class='Ref_To_Local'>sendTLI</span></a> <span class='Operator'>!= </span><a href="xlogutils.c.html#LN656"><span class='Ref_to_Parameter'>tli</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN684"></a>            <span class='Keyword'>char</span>        <span class='Declare_Local'>path</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN663"><span class='Ref_To_Local'>sendFile</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <a href="../../../interfaces/libpq/win32.h.html#LN11"><span class='Ref_to_Macro'>close</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN663"><span class='Ref_To_Local'>sendFile</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/access/xlog_internal.h.html#LN105"><span class='Ref_to_Macro'>XLByteToSeg</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN659"><span class='Ref_To_Local'>recptr</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN664"><span class='Ref_To_Local'>sendSegNo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/access/xlog_internal.h.html#LN172"><span class='Ref_to_Macro'>XLogFilePath</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN684"><span class='Ref_To_Local'>path</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN656"><span class='Ref_to_Parameter'>tli</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN664"><span class='Ref_To_Local'>sendSegNo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="xlogutils.c.html#LN663"><span class='Ref_To_Local'>sendFile</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN100"><span class='Ref_to_Proto'>BasicOpenFile</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN684"><span class='Ref_To_Local'>path</span></a><span class='Delimiter'>, </span>O_RDONLY <span class='Operator'>| </span><a href="../../../include/c.h.html#LN1032"><span class='Ref_to_Const'>PG_BINARY</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN663"><span class='Ref_To_Local'>sendFile</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span>errno <span class='Operator'>== </span>ENOENT<span class='Parentheses'>) 
+</span>                    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                            <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                             <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"requested WAL segment %s has already been removed"</span><span class='Delimiter'>, 
+</span>                                    <a href="xlogutils.c.html#LN684"><span class='Ref_To_Local'>path</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                <span class='Control'>else</span> 
+                    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                            <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                             <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not open file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                                    <a href="xlogutils.c.html#LN684"><span class='Ref_To_Local'>path</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <a href="xlogutils.c.html#LN666"><span class='Ref_To_Local'>sendOff</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <a href="xlogutils.c.html#LN665"><span class='Ref_To_Local'>sendTLI</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN656"><span class='Ref_to_Parameter'>tli</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if sendFile&LT;0||!XLByteIn... &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* Need to seek in the file? */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN666"><span class='Ref_To_Local'>sendOff</span></a> <span class='Operator'>!= </span><a href="xlogutils.c.html#LN674"><span class='Ref_To_Local'>startoff</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span>lseek<span class='Parentheses'>(</span><a href="xlogutils.c.html#LN663"><span class='Ref_To_Local'>sendFile</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span>off_t<span class='Parentheses'>) </span><a href="xlogutils.c.html#LN674"><span class='Ref_To_Local'>startoff</span></a><span class='Delimiter'>, </span>SEEK_SET<span class='Parentheses'>)</span> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <span class='Delimiter'>{ 
+</span><a name="LN717"></a>                <span class='Keyword'>char</span>        <span class='Declare_Local'>path</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span> 
+                <a href="../../../include/access/xlog_internal.h.html#LN172"><span class='Ref_to_Macro'>XLogFilePath</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN717"><span class='Ref_To_Local'>path</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN656"><span class='Ref_to_Parameter'>tli</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN664"><span class='Ref_To_Local'>sendSegNo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                  <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not seek in log segment %s to offset %u: %m"</span><span class='Delimiter'>, 
+</span>                         <a href="xlogutils.c.html#LN717"><span class='Ref_To_Local'>path</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN674"><span class='Ref_To_Local'>startoff</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <a href="xlogutils.c.html#LN666"><span class='Ref_To_Local'>sendOff</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN674"><span class='Ref_To_Local'>startoff</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* How many bytes are within this segment? */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN660"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>&GT; </span><span class='Parentheses'>(</span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a> <span class='Operator'>- </span><a href="xlogutils.c.html#LN674"><span class='Ref_To_Local'>startoff</span></a><span class='Parentheses'>))</span> 
+            <a href="xlogutils.c.html#LN675"><span class='Ref_To_Local'>segbytes</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a> <span class='Operator'>- </span><a href="xlogutils.c.html#LN674"><span class='Ref_To_Local'>startoff</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="xlogutils.c.html#LN675"><span class='Ref_To_Local'>segbytes</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN660"><span class='Ref_To_Local'>nbytes</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/pgstat.h.html#LN1206"><span class='Ref_to_Func'>pgstat_report_wait_start</span></a><span class='Parentheses'>(</span><a href="../../../include/pgstat.h.html#LN902"><span class='Ref_to_EnumConst'>WAIT_EVENT_WAL_READ</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xlogutils.c.html#LN676"><span class='Ref_To_Local'>readbytes</span></a> <span class='Operator'>= </span><a href="../../../interfaces/libpq/win32.h.html#LN12"><span class='Ref_to_Macro'>read</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN663"><span class='Ref_To_Local'>sendFile</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN658"><span class='Ref_To_Local'>p</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN675"><span class='Ref_To_Local'>segbytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/pgstat.h.html#LN1230"><span class='Ref_to_Func'>pgstat_report_wait_end</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN676"><span class='Ref_To_Local'>readbytes</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN740"></a>            <span class='Keyword'>char</span>        <span class='Declare_Local'>path</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span> 
+            <a href="../../../include/access/xlog_internal.h.html#LN172"><span class='Ref_to_Macro'>XLogFilePath</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN740"><span class='Ref_To_Local'>path</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN656"><span class='Ref_to_Parameter'>tli</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN664"><span class='Ref_To_Local'>sendSegNo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                     <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not read from log segment %s, offset %u, length %lu: %m"</span><span class='Delimiter'>, 
+</span>                            <a href="xlogutils.c.html#LN740"><span class='Ref_To_Local'>path</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN666"><span class='Ref_To_Local'>sendOff</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>unsigned long</span><span class='Parentheses'>) </span><a href="xlogutils.c.html#LN675"><span class='Ref_To_Local'>segbytes</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Update state for read */ 
+</span>        <a href="xlogutils.c.html#LN659"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>+= </span><a href="xlogutils.c.html#LN676"><span class='Ref_To_Local'>readbytes</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="xlogutils.c.html#LN666"><span class='Ref_To_Local'>sendOff</span></a> <span class='Operator'>+= </span><a href="xlogutils.c.html#LN676"><span class='Ref_To_Local'>readbytes</span></a><span class='Delimiter'>; 
+</span>        <a href="xlogutils.c.html#LN660"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>-= </span><a href="xlogutils.c.html#LN676"><span class='Ref_To_Local'>readbytes</span></a><span class='Delimiter'>; 
+</span>        <a href="xlogutils.c.html#LN658"><span class='Ref_To_Local'>p</span></a> <span class='Operator'>+= </span><a href="xlogutils.c.html#LN676"><span class='Ref_To_Local'>readbytes</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while nbytes&GT;0 &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end XLogRead &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Determine which timeline to read an xlog page from and set the 
+ * XLogReaderState's currTLI to that timeline ID. 
+ * 
+ * We care about timelines in xlogreader when we might be reading xlog 
+ * generated prior to a promotion, either if we're currently a standby in 
+ * recovery or if we're a promoted master reading xlogs generated by the old 
+ * master before our promotion. 
+ * 
+ * wantPage must be set to the start address of the page to read and 
+ * wantLength to the amount of the page that will be read, up to 
+ * XLOG_BLCKSZ. If the amount to be read isn't known, pass XLOG_BLCKSZ. 
+ * 
+ * We switch to an xlog segment from the new timeline eagerly when on a 
+ * historical timeline, as soon as we reach the start of the xlog segment 
+ * containing the timeline switch.  The server copied the segment to the new 
+ * timeline so all the data up to the switch point is the same, but there's no 
+ * guarantee the old segment will still exist. It may have been deleted or 
+ * renamed with a .partial suffix so we can't necessarily keep reading from 
+ * the old TLI even though tliSwitchPoint says it's OK. 
+ * 
+ * We can't just check the timeline when we read a page on a different segment 
+ * to the last page. We could've received a timeline switch from a cascading 
+ * upstream, so the current segment ends abruptly (possibly getting renamed to 
+ * .partial) and we have to switch to a new one.  Even in the middle of reading 
+ * a page we could have to dump the cached page and switch to a new TLI. 
+ * 
+ * Because of this, callers MAY NOT assume that currTLI is the timeline that 
+ * will be in a page's xlp_tli; the page may begin on an older timeline or we 
+ * might be reading from historical timeline data on a segment that's been 
+ * copied to a new timeline. 
+ * 
+ * The caller must also make sure it doesn't read past the current replay 
+ * position (using GetWalRcvWriteRecPtr) if executing in recovery, so it 
+ * doesn't fail to notice that the current timeline became historical. The 
+ * caller must also update ThisTimeLineID with the result of 
+ * GetWalRcvWriteRecPtr and must check RecoveryInProgress(). 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN798"></a><span class='Declare_Function'>XLogReadDetermineTimeline</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN68"><span class='Ref_to_Struct'>XLogReaderState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>wantPage</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Parameter'>wantLength</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN800"></a>    <span class='Keyword'>const </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Local'>lastReadPage</span> <span class='Operator'>= </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN150"><span class='Ref_to_Member'>readSegNo</span></a> <span class='Operator'>* </span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a> <span class='Operator'>+ </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN151"><span class='Ref_to_Member'>readOff</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantPage</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a> <span class='Operator'>&& </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantPage</span></a> <span class='Operator'>% </span>XLOG_BLCKSZ <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantLength</span></a> <span class='Operator'>&LT;= </span>XLOG_BLCKSZ<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN147"><span class='Ref_to_Member'>readLen</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN147"><span class='Ref_to_Member'>readLen</span></a> <span class='Operator'>&LT;= </span>XLOG_BLCKSZ<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the desired page is currently read in and valid, we have nothing to 
+     * do. 
+     * 
+     * The caller should've ensured that it didn't previously advance readOff 
+     * past the valid limit of this timeline, so it doesn't matter if the 
+     * current TLI has since become historical. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN800"><span class='Ref_To_Local'>lastReadPage</span></a> <span class='Operator'>== </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantPage</span></a> <span class='Operator'>&& 
+</span>        <a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN147"><span class='Ref_to_Member'>readLen</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>        <a href="xlogutils.c.html#LN800"><span class='Ref_To_Local'>lastReadPage</span></a> <span class='Operator'>+ </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN147"><span class='Ref_to_Member'>readLen</span></a> <span class='Operator'>&GT;= </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantPage</span></a> <span class='Operator'>+ </span><a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantLength</span></a><span class='Delimiter'>, </span>XLOG_BLCKSZ <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we're reading from the current timeline, it hasn't become historical 
+     * and the page we're reading is after the last page read, we can again 
+     * just carry on. (Seeking backwards requires a check to make sure the 
+     * older page isn't on a prior timeline). 
+     * 
+     * ThisTimeLineID might've become historical since we last looked, but the 
+     * caller is required not to read past the flush limit it saw at the time 
+     * it looked up the timeline. There's nothing we can do about it if 
+     * StartupXLOG() renames it to .partial concurrently. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN164"><span class='Ref_to_Member'>currTLI</span></a> <span class='Operator'>== </span><a href="xlog.c.html#LN178"><span class='Ref_to_Global_Var'>ThisTimeLineID</span></a> <span class='Operator'>&& </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantPage</span></a> <span class='Operator'>&GT;= </span><a href="xlogutils.c.html#LN800"><span class='Ref_To_Local'>lastReadPage</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN174"><span class='Ref_to_Member'>currTLIValidUntil</span></a> <span class='Operator'>== </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we're just reading pages from a previously validated historical 
+     * timeline and the timeline we're reading from is valid until the end of 
+     * the current segment we can just keep reading. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN174"><span class='Ref_to_Member'>currTLIValidUntil</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a> <span class='Operator'>&& 
+</span>        <a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN164"><span class='Ref_to_Member'>currTLI</span></a> <span class='Operator'>!= </span><a href="xlog.c.html#LN178"><span class='Ref_to_Global_Var'>ThisTimeLineID</span></a> <span class='Operator'>&& 
+</span>        <a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN164"><span class='Ref_to_Member'>currTLI</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>        <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantPage</span></a> <span class='Operator'>+ </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantLength</span></a><span class='Parentheses'>) </span><span class='Operator'>/ </span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a> <span class='Operator'>&LT; </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN174"><span class='Ref_to_Member'>currTLIValidUntil</span></a> <span class='Operator'>/ </span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we reach this point we're either looking up a page for random 
+     * access, the current timeline just became historical, or we're reading 
+     * from a new segment containing a timeline switch. In all cases we need 
+     * to determine the newest timeline on the segment. 
+     * 
+     * If it's the current timeline we can just keep reading from here unless 
+     * we detect a timeline switch that makes the current timeline historical. 
+     * If it's a historical timeline we can read all the segment on the newest 
+     * timeline because it contains all the old timelines' data too. So only 
+     * one switch check is required. 
+     */ 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * We need to re-read the timeline history in case it's been changed 
+         * by a promotion or replay from a cascaded replica. 
+         */ 
+</span><a name="LN864"></a>        <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>timelineHistory</span> <span class='Operator'>= </span><a href="../../../include/access/timeline.h.html#LN31"><span class='Ref_to_Proto'>readTimeLineHistory</span></a><span class='Parentheses'>(</span><a href="xlog.c.html#LN178"><span class='Ref_to_Global_Var'>ThisTimeLineID</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN866"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>endOfSegment</span> <span class='Operator'>= </span><span class='Parentheses'>(((</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantPage</span></a> <span class='Operator'>/ </span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a><span class='Parentheses'>)</span> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantPage</span></a> <span class='Operator'>/ </span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a> <span class='Operator'>== </span><a href="xlogutils.c.html#LN866"><span class='Ref_To_Local'>endOfSegment</span></a> <span class='Operator'>/ </span><a href="../../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Find the timeline of the last LSN on the segment containing 
+         * wantPage. 
+         */ 
+</span>        <a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN164"><span class='Ref_to_Member'>currTLI</span></a> <span class='Operator'>= </span><a href="../../../include/access/timeline.h.html#LN39"><span class='Ref_to_Proto'>tliOfPointInHistory</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN866"><span class='Ref_To_Local'>endOfSegment</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN864"><span class='Ref_To_Local'>timelineHistory</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN174"><span class='Ref_to_Member'>currTLIValidUntil</span></a> <span class='Operator'>= </span><a href="../../../include/access/timeline.h.html#LN40"><span class='Ref_to_Proto'>tliSwitchPoint</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN164"><span class='Ref_to_Member'>currTLI</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN864"><span class='Ref_To_Local'>timelineHistory</span></a><span class='Delimiter'>, 
+</span>                                                  <span class='Operator'>&</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN180"><span class='Ref_to_Member'>nextTLI</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN174"><span class='Ref_to_Member'>currTLIValidUntil</span></a> <span class='Operator'>== </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a> <span class='Operator'>|| 
+</span>               <a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantPage</span></a> <span class='Operator'>+ </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>wantLength</span></a> <span class='Operator'>&LT; </span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN174"><span class='Ref_to_Member'>currTLIValidUntil</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/nodes/pg_list.h.html#LN266"><span class='Ref_to_Proto'>list_free_deep</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN864"><span class='Ref_To_Local'>timelineHistory</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, </span><span class='String'>"switched to timeline %u valid until %X/%X"</span><span class='Delimiter'>, 
+</span>             <a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN164"><span class='Ref_to_Member'>currTLI</span></a><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN174"><span class='Ref_to_Member'>currTLIValidUntil</span></a> <span class='Operator'>&GT;&GT; </span><span class='Number'>32</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a><span class='Parentheses'>) (</span><a href="xlogutils.c.html#LN798"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN174"><span class='Ref_to_Member'>currTLIValidUntil</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end XLogReadDetermineTimeline &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * read_page callback for reading local xlog files 
+ * 
+ * Public because it would likely be very helpful for someone writing another 
+ * output method outside walsender, e.g. in a bgworker. 
+ * 
+ * TODO: The walsender has its own version of this, but it relies on the 
+ * walsender's latch being set whenever WAL is flushed. No such infrastructure 
+ * exists for normal backends, so we have to do a check/sleep/repeat style of 
+ * loop for now. 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN902"></a><span class='Declare_Function'>read_local_xlog_page</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN68"><span class='Ref_to_Struct'>XLogReaderState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>state</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>targetPagePtr</span><span class='Delimiter'>, 
+</span><a name="LN903"></a>                     <span class='Keyword'>int </span><span class='Declare_Parameter'>reqLen</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>targetRecPtr</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>cur_page</span><span class='Delimiter'>, 
+</span><a name="LN904"></a>                     <a href="../../../include/access/xlogdefs.h.html#LN44"><span class='Ref_to_Typedef'>TimeLineID</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>pageTLI</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN906"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>read_upto</span><span class='Delimiter'>, 
+</span><a name="LN907"></a>                <span class='Declare_Local'>loc</span><span class='Delimiter'>; 
+</span><a name="LN908"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>count</span><span class='Delimiter'>; 
+</span> 
+    <a href="xlogutils.c.html#LN907"><span class='Ref_To_Local'>loc</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>targetPagePtr</span></a> <span class='Operator'>+ </span><a href="xlogutils.c.html#LN903"><span class='Ref_to_Parameter'>reqLen</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Loop waiting for xlog to be available if necessary */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Determine the limit of xlog we can currently read to, and what the 
+         * most recent timeline is. 
+         * 
+         * RecoveryInProgress() will update ThisTimeLineID when it first 
+         * notices recovery finishes, so we only have to maintain it for the 
+         * local process until recovery ends. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xlog.h.html#LN242"><span class='Ref_to_Proto'>RecoveryInProgress</span></a><span class='Parentheses'>())</span> 
+            <a href="xlogutils.c.html#LN906"><span class='Ref_To_Local'>read_upto</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlog.h.html#LN275"><span class='Ref_to_Proto'>GetFlushRecPtr</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="xlogutils.c.html#LN906"><span class='Ref_To_Local'>read_upto</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlog.h.html#LN247"><span class='Ref_to_Proto'>GetXLogReplayRecPtr</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlog.c.html#LN178"><span class='Ref_to_Global_Var'>ThisTimeLineID</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Operator'>*</span><a href="xlogutils.c.html#LN904"><span class='Ref_to_Parameter'>pageTLI</span></a> <span class='Operator'>= </span><a href="xlog.c.html#LN178"><span class='Ref_to_Global_Var'>ThisTimeLineID</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Check which timeline to get the record from. 
+         * 
+         * We have to do it each time through the loop because if we're in 
+         * recovery as a cascading standby, the current timeline might've 
+         * become historical. We can't rely on RecoveryInProgress() because in 
+         * a standby configuration like 
+         * 
+         * A =&GT; B =&GT; C 
+         * 
+         * if we're a logical decoding session on C, and B gets promoted, our 
+         * timeline will change while we remain in recovery. 
+         * 
+         * We can't just keep reading from the old timeline as the last WAL 
+         * archive in the timeline will get renamed to .partial by 
+         * StartupXLOG(). 
+         * 
+         * If that happens after our caller updated ThisTimeLineID but before 
+         * we actually read the xlog page, we might still try to read from the 
+         * old (now renamed) segment and fail. There's not much we can do 
+         * about this, but it can only happen when we're a leaf of a cascading 
+         * standby whose master gets promoted while we're decoding, so a 
+         * one-off ERROR isn't too bad. 
+         */ 
+</span>        <a href="../../../include/access/xlogutils.h.html#LN54"><span class='Ref_to_Proto'>XLogReadDetermineTimeline</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>state</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>targetPagePtr</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN903"><span class='Ref_to_Parameter'>reqLen</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN164"><span class='Ref_to_Member'>currTLI</span></a> <span class='Operator'>== </span><a href="xlog.c.html#LN178"><span class='Ref_to_Global_Var'>ThisTimeLineID</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN907"><span class='Ref_To_Local'>loc</span></a> <span class='Operator'>&LT;= </span><a href="xlogutils.c.html#LN906"><span class='Ref_To_Local'>read_upto</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="../../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><span class='Number'>1000L</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * We're on a historical timeline, so limit reading to the switch 
+             * point where we moved to the next timeline. 
+             * 
+             * We don't need to GetFlushRecPtr or GetXLogReplayRecPtr. We know 
+             * about the new timeline, so we must've received past the end of 
+             * it. 
+             */ 
+</span>            <a href="xlogutils.c.html#LN906"><span class='Ref_To_Local'>read_upto</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN174"><span class='Ref_to_Member'>currTLIValidUntil</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Setting pageTLI to our wanted record's TLI is slightly wrong; 
+             * the page might begin on an older timeline if it contains a 
+             * timeline switch, since its xlog segment will have been copied 
+             * from the prior timeline. This is pretty harmless though, as 
+             * nothing cares so long as the timeline doesn't go backwards.  We 
+             * should read the page header instead; FIXME someday. 
+             */ 
+</span>            <span class='Operator'>*</span><a href="xlogutils.c.html#LN904"><span class='Ref_to_Parameter'>pageTLI</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>state</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/xlogreader.h.html#LN164"><span class='Ref_to_Member'>currTLI</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* No need to wait on a historical timeline */ 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while 1 &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>targetPagePtr</span></a> <span class='Operator'>+ </span>XLOG_BLCKSZ <span class='Operator'>&LT;= </span><a href="xlogutils.c.html#LN906"><span class='Ref_To_Local'>read_upto</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * more than one block available; read only that block, have caller 
+         * come back if they need more. 
+         */ 
+</span>        <a href="xlogutils.c.html#LN908"><span class='Ref_To_Local'>count</span></a> <span class='Operator'>= </span>XLOG_BLCKSZ<span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>targetPagePtr</span></a> <span class='Operator'>+ </span><a href="xlogutils.c.html#LN903"><span class='Ref_to_Parameter'>reqLen</span></a> <span class='Operator'>&GT; </span><a href="xlogutils.c.html#LN906"><span class='Ref_To_Local'>read_upto</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* not enough data there */ 
+</span>        <span class='Control'>return</span> <span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* enough bytes available to satisfy the request */ 
+</span>        <a href="xlogutils.c.html#LN908"><span class='Ref_To_Local'>count</span></a> <span class='Operator'>= </span><a href="xlogutils.c.html#LN906"><span class='Ref_To_Local'>read_upto</span></a> <span class='Operator'>- </span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>targetPagePtr</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Even though we just determined how much of the page can be validly read 
+     * as 'count', read the whole page anyway. It's guaranteed to be 
+     * zero-padded up to the page boundary if it's incomplete. 
+     */ 
+</span>    <a href="xlogutils.c.html#LN655"><span class='Ref_to_Func'>XLogRead</span></a><span class='Parentheses'>(</span><a href="xlogutils.c.html#LN903"><span class='Ref_to_Parameter'>cur_page</span></a><span class='Delimiter'>, </span><span class='Operator'>*</span><a href="xlogutils.c.html#LN904"><span class='Ref_to_Parameter'>pageTLI</span></a><span class='Delimiter'>, </span><a href="xlogutils.c.html#LN902"><span class='Ref_to_Parameter'>targetPagePtr</span></a><span class='Delimiter'>, </span>XLOG_BLCKSZ<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* number of valid bytes in the buffer */ 
+</span>    <span class='Control'>return</span> <a href="xlogutils.c.html#LN908"><span class='Ref_To_Local'>count</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end read_local_xlog_page &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

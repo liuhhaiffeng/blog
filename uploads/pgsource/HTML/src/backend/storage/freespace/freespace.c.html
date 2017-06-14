@@ -1,0 +1,916 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\storage\freespace\freespace.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\storage\freespace\freespace.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:49 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * freespace.c 
+ *    POSTGRES free space map for quickly finding free space in relations 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/storage/freespace/freespace.c 
+ * 
+ * 
+ * NOTES: 
+ * 
+ *  Free Space Map keeps track of the amount of free space on pages, and 
+ *  allows quickly searching for a page with enough free space. The FSM is 
+ *  stored in a dedicated relation fork of all heap relations, and those 
+ *  index access methods that need it (see also indexfsm.c). See README for 
+ *  more information. 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/htup_details.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlogutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/freespace.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/fsm_internals.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/smgr.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * We use just one byte to store the amount of free space on a page, so we 
+ * divide the amount of free space a page can have into 256 different 
+ * categories. The highest category, 255, represents a page with at least 
+ * MaxFSMRequestSize bytes of free space, and the second highest category 
+ * represents the range from 254 * FSM_CAT_STEP, inclusive, to 
+ * MaxFSMRequestSize, exclusive. 
+ * 
+ * MaxFSMRequestSize depends on the architecture and BLCKSZ, but assuming 
+ * default 8k BLCKSZ, and that MaxFSMRequestSize is 8164 bytes, the 
+ * categories look like this: 
+ * 
+ * 
+ * Range     Category 
+ * 0    - 31   0 
+ * 32   - 63   1 
+ * ...    ...  ... 
+ * 8096 - 8127 253 
+ * 8128 - 8163 254 
+ * 8164 - 8192 255 
+ * 
+ * The reason that MaxFSMRequestSize is special is that if MaxFSMRequestSize 
+ * isn't equal to a range boundary, a page with exactly MaxFSMRequestSize 
+ * bytes of free space wouldn't satisfy a request for MaxFSMRequestSize 
+ * bytes. If there isn't more than MaxFSMRequestSize bytes of free space on a 
+ * completely empty page, that would mean that we could never satisfy a 
+ * request of exactly MaxFSMRequestSize bytes. 
+ */ 
+</span><a name="LN62"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>FSM_CATEGORIES</span>  <span class='Number'>256</span> 
+<a name="LN63"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>FSM_CAT_STEP</span>    <span class='Parentheses'>(</span>BLCKSZ <span class='Operator'>/ </span><a href="freespace.c.html#LN62"><span class='Ref_to_Const'>FSM_CATEGORIES</span></a><span class='Parentheses'>) 
+</span><a name="LN64"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MaxFSMRequestSize</span>   <a href="../../../include/access/htup_details.h.html#LN560"><span class='Ref_to_Const'>MaxHeapTupleSize</span></a> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Depth of the on-disk tree. We need to be able to address 2^32-1 blocks, 
+ * and 1626 is the smallest number that satisfies X^3 &GT;= 2^32-1. Likewise, 
+ * 216 is the smallest number that satisfies X^4 &GT;= 2^32-1. In practice, 
+ * this means that 4096 bytes is the smallest BLCKSZ that we can get away 
+ * with a 3-level tree, and 512 is the smallest we support. 
+ */ 
+</span><a name="LN73"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>FSM_TREE_DEPTH</span>  <span class='Parentheses'>((</span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a> <span class='Operator'>&GT;= </span><span class='Number'>1626</span><span class='Parentheses'>) </span><span class='Operator'>? </span><span class='Number'>3</span> <span class='Operator'>: </span><span class='Number'>4</span><span class='Parentheses'>)</span> 
+ 
+<a name="LN75"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>FSM_ROOT_LEVEL</span>  <span class='Parentheses'>(</span><a href="freespace.c.html#LN73"><span class='Ref_to_Const'>FSM_TREE_DEPTH</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>) 
+</span><a name="LN76"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>FSM_BOTTOM_LEVEL</span> <span class='Number'>0</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The internal FSM routines work on a logical addressing scheme. Each 
+ * level of the tree can be thought of as a separately addressable file. 
+ */ 
+</span><span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN84"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>level</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* level */ 
+</span><a name="LN85"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>logpageno</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* page number within the level */ 
+</span><a name="LN86"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>FSMAddress</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Address of the root page. */ 
+</span><a name="LN89"></a><span class='Keyword'>static const </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Var'>FSM_ROOT_ADDRESS</span> <span class='Operator'>= </span><span class='Delimiter'>{</span><a href="freespace.c.html#LN75"><span class='Ref_to_Const'>FSM_ROOT_LEVEL</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>}; 
+</span> 
+<span class='Comment_Multi_Line'>/* functions to navigate the tree */ 
+</span><a name="LN92"></a><span class='Keyword'>static </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Prototype'>fsm_get_child</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>parent</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>slot</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN93"></a><span class='Keyword'>static </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Prototype'>fsm_get_parent</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>child</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN94"></a><span class='Keyword'>static </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Prototype'>fsm_get_location</span><span class='Parentheses'>(</span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapblk</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN95"></a><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Prototype'>fsm_get_heap_blk</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>slot</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN96"></a><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Prototype'>fsm_logical_to_physical</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN98"></a><span class='Keyword'>static </span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Prototype'>fsm_readbuf</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>extend</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN99"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>fsm_extend</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>fsm_nblocks</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* functions to convert amount of free space to a FSM category */ 
+</span><a name="LN102"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Prototype'>fsm_space_avail_to_cat</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>avail</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN103"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Prototype'>fsm_space_needed_to_cat</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>needed</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN104"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Prototype'>fsm_space_cat_to_avail</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>cat</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* workhorse functions for various operations */ 
+</span><a name="LN107"></a><span class='Keyword'>static int </span><span class='Declare_Prototype'>fsm_set_and_search</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>slot</span><span class='Delimiter'>, 
+</span><a name="LN108"></a>                   <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>newValue</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>minValue</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN109"></a><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Prototype'>fsm_search</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>min_cat</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN110"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Prototype'>fsm_vacuum_page</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>eof</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN111"></a><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Prototype'>fsm_get_lastblckno</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN112"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>fsm_update_recursive</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>new_cat</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/******** Public API ********/ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * GetPageWithFreeSpace - try to find a page in the given relation with 
+ *      at least the specified amount of free space. 
+ * 
+ * If successful, return the block number; if not, return InvalidBlockNumber. 
+ * 
+ * The caller must be prepared for the possibility that the returned page 
+ * will turn out to have too little space available by the time the caller 
+ * gets a lock on it.  In that case, the caller should report the actual 
+ * amount of free space available on that page and then try again (see 
+ * RecordAndGetPageWithFreeSpace).  If InvalidBlockNumber is returned, 
+ * extend the relation. 
+ */ 
+</span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN131"></a><span class='Declare_Function'>GetPageWithFreeSpace</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>spaceNeeded</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN133"></a>    <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>min_cat</span> <span class='Operator'>= </span><a href="freespace.c.html#LN103"><span class='Ref_to_Proto'>fsm_space_needed_to_cat</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN131"><span class='Ref_to_Parameter'>spaceNeeded</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="freespace.c.html#LN109"><span class='Ref_to_Proto'>fsm_search</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN131"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN133"><span class='Ref_To_Local'>min_cat</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RecordAndGetPageWithFreeSpace - update info about a page and try again. 
+ * 
+ * We provide this combo form to save some locking overhead, compared to 
+ * separate RecordPageWithFreeSpace + GetPageWithFreeSpace calls. There's 
+ * also some effort to return a page close to the old page; if there's a 
+ * page with enough free space on the same FSM page where the old one page 
+ * is located, it is preferred. 
+ */ 
+</span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN148"></a><span class='Declare_Function'>RecordAndGetPageWithFreeSpace</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>oldPage</span><span class='Delimiter'>, 
+</span><a name="LN149"></a>                              <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>oldSpaceAvail</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>spaceNeeded</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN151"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>old_cat</span> <span class='Operator'>= </span><a href="freespace.c.html#LN102"><span class='Ref_to_Proto'>fsm_space_avail_to_cat</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN149"><span class='Ref_to_Parameter'>oldSpaceAvail</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN152"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>search_cat</span> <span class='Operator'>= </span><a href="freespace.c.html#LN103"><span class='Ref_to_Proto'>fsm_space_needed_to_cat</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN149"><span class='Ref_to_Parameter'>spaceNeeded</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN153"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span><a name="LN154"></a>    <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN155"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>search_slot</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get the location of the FSM byte representing the heap block */ 
+</span>    <a href="freespace.c.html#LN153"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN94"><span class='Ref_to_Proto'>fsm_get_location</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN148"><span class='Ref_to_Parameter'>oldPage</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN154"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN155"><span class='Ref_To_Local'>search_slot</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN107"><span class='Ref_to_Proto'>fsm_set_and_search</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN148"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN153"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN154"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN151"><span class='Ref_To_Local'>old_cat</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN152"><span class='Ref_To_Local'>search_cat</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If fsm_set_and_search found a suitable new block, return that. 
+     * Otherwise, search as usual. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN155"><span class='Ref_To_Local'>search_slot</span></a> <span class='Operator'>!= -</span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="freespace.c.html#LN95"><span class='Ref_to_Proto'>fsm_get_heap_blk</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN153"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN155"><span class='Ref_To_Local'>search_slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <span class='Control'>return</span> <a href="freespace.c.html#LN109"><span class='Ref_to_Proto'>fsm_search</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN148"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN152"><span class='Ref_To_Local'>search_cat</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RecordAndGetPageWithFreeSpace &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * RecordPageWithFreeSpace - update info about a page. 
+ * 
+ * Note that if the new spaceAvail value is higher than the old value stored 
+ * in the FSM, the space might not become visible to searchers until the next 
+ * FreeSpaceMapVacuum call, which updates the upper level pages. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN180"></a><span class='Declare_Function'>RecordPageWithFreeSpace</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>spaceAvail</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN182"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>new_cat</span> <span class='Operator'>= </span><a href="freespace.c.html#LN102"><span class='Ref_to_Proto'>fsm_space_avail_to_cat</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN180"><span class='Ref_to_Parameter'>spaceAvail</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN183"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span><a name="LN184"></a>    <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get the location of the FSM byte representing the heap block */ 
+</span>    <a href="freespace.c.html#LN183"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN94"><span class='Ref_to_Proto'>fsm_get_location</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN180"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN184"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN107"><span class='Ref_to_Proto'>fsm_set_and_search</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN180"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN183"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN184"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN182"><span class='Ref_To_Local'>new_cat</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Update the upper levels of the free space map all the way up to the root 
+ * to make sure we don't lose track of new blocks we just inserted.  This is 
+ * intended to be used after adding many new blocks to the relation; we judge 
+ * it not worth updating the upper levels of the tree every time data for 
+ * a single page changes, but for a bulk-extend it's worth it. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN200"></a><span class='Declare_Function'>UpdateFreeSpaceMap</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>startBlkNum</span><span class='Delimiter'>, 
+</span><a name="LN201"></a>                   <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>endBlkNum</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>freespace</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN203"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>new_cat</span> <span class='Operator'>= </span><a href="freespace.c.html#LN102"><span class='Ref_to_Proto'>fsm_space_avail_to_cat</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN201"><span class='Ref_to_Parameter'>freespace</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN204"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span><a name="LN205"></a>    <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN206"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>blockNum</span><span class='Delimiter'>; 
+</span><a name="LN207"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>lastBlkOnPage</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN206"><span class='Ref_To_Local'>blockNum</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN200"><span class='Ref_to_Parameter'>startBlkNum</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN206"><span class='Ref_To_Local'>blockNum</span></a> <span class='Operator'>&LT;= </span><a href="freespace.c.html#LN201"><span class='Ref_to_Parameter'>endBlkNum</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Find FSM address for this block; update tree all the way to the 
+         * root. 
+         */ 
+</span>        <a href="freespace.c.html#LN204"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN94"><span class='Ref_to_Proto'>fsm_get_location</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN206"><span class='Ref_To_Local'>blockNum</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN205"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="freespace.c.html#LN112"><span class='Ref_to_Proto'>fsm_update_recursive</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN200"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN204"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN203"><span class='Ref_To_Local'>new_cat</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Get the last block number on this FSM page.  If that's greater than 
+         * or equal to our endBlkNum, we're done.  Otherwise, advance to the 
+         * first block on the next page. 
+         */ 
+</span>        <a href="freespace.c.html#LN207"><span class='Ref_To_Local'>lastBlkOnPage</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN111"><span class='Ref_to_Proto'>fsm_get_lastblckno</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN200"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN204"><span class='Ref_To_Local'>addr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN207"><span class='Ref_To_Local'>lastBlkOnPage</span></a> <span class='Operator'>&GT;= </span><a href="freespace.c.html#LN201"><span class='Ref_to_Parameter'>endBlkNum</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <a href="freespace.c.html#LN206"><span class='Ref_To_Local'>blockNum</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN207"><span class='Ref_To_Local'>lastBlkOnPage</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end UpdateFreeSpaceMap &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * XLogRecordPageWithFreeSpace - like RecordPageWithFreeSpace, for use in 
+ *      WAL replay 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN237"></a><span class='Declare_Function'>XLogRecordPageWithFreeSpace</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Delimiter'>, 
+</span><a name="LN238"></a>                            <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>spaceAvail</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN240"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>new_cat</span> <span class='Operator'>= </span><a href="freespace.c.html#LN102"><span class='Ref_to_Proto'>fsm_space_avail_to_cat</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN238"><span class='Ref_to_Parameter'>spaceAvail</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN241"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span><a name="LN242"></a>    <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN243"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>blkno</span><span class='Delimiter'>; 
+</span><a name="LN244"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span><a name="LN245"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get the location of the FSM byte representing the heap block */ 
+</span>    <a href="freespace.c.html#LN241"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN94"><span class='Ref_to_Proto'>fsm_get_location</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN237"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN242"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="freespace.c.html#LN243"><span class='Ref_To_Local'>blkno</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN96"><span class='Ref_to_Proto'>fsm_logical_to_physical</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN241"><span class='Ref_To_Local'>addr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If the page doesn't exist already, extend */ 
+</span>    <a href="freespace.c.html#LN244"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogutils.h.html#LN43"><span class='Ref_to_Proto'>XLogReadBufferExtended</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN237"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN243"><span class='Ref_To_Local'>blkno</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN44"><span class='Ref_to_EnumConst'>RBM_ZERO_ON_ERROR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN244"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN245"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN244"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN225"><span class='Ref_to_Macro'>PageIsNew</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN245"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+        <a href="../page/bufpage.c.html#LN39"><span class='Ref_to_Func'>PageInit</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN245"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span>BLCKSZ<span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="fsmpage.c.html#LN61"><span class='Ref_to_Func'>fsm_set_avail</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN245"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN242"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN240"><span class='Ref_To_Local'>new_cat</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/storage/bufmgr.h.html#LN211"><span class='Ref_to_Proto'>MarkBufferDirtyHint</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN244"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN175"><span class='Ref_to_Proto'>UnlockReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN244"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogRecordPageWithFreeSpace &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * GetRecordedFreePage - return the amount of free space on a particular page, 
+ *      according to the FSM. 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN269"></a><span class='Declare_Function'>GetRecordedFreeSpace</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN271"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span><a name="LN272"></a>    <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN273"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span><a name="LN274"></a>    <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>cat</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get the location of the FSM byte representing the heap block */ 
+</span>    <a href="freespace.c.html#LN271"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN94"><span class='Ref_to_Proto'>fsm_get_location</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN269"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN272"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN273"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN98"><span class='Ref_to_Proto'>fsm_readbuf</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN269"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN271"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN273"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="freespace.c.html#LN274"><span class='Ref_To_Local'>cat</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fsm_internals.h.html#LN65"><span class='Ref_to_Proto'>fsm_get_avail</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN273"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN272"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN273"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="freespace.c.html#LN104"><span class='Ref_to_Proto'>fsm_space_cat_to_avail</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN274"><span class='Ref_To_Local'>cat</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * FreeSpaceMapTruncateRel - adjust for truncation of a relation. 
+ * 
+ * The caller must hold AccessExclusiveLock on the relation, to ensure that 
+ * other backends receive the smgr invalidation event that this function sends 
+ * before they access the FSM again. 
+ * 
+ * nblocks is the new size of the heap. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN298"></a><span class='Declare_Function'>FreeSpaceMapTruncateRel</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>nblocks</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN300"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>new_nfsmblocks</span><span class='Delimiter'>; 
+</span><a name="LN301"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>first_removed_address</span><span class='Delimiter'>; 
+</span><a name="LN302"></a>    <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>first_removed_slot</span><span class='Delimiter'>; 
+</span><a name="LN303"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/rel.h.html#LN460"><span class='Ref_to_Macro'>RelationOpenSmgr</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN298"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If no FSM has been created yet for this relation, there's nothing to 
+     * truncate. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/smgr.h.html#LN84"><span class='Ref_to_Proto'>smgrexists</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN298"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get the location in the FSM of the first removed heap block */ 
+</span>    <a href="freespace.c.html#LN301"><span class='Ref_To_Local'>first_removed_address</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN94"><span class='Ref_to_Proto'>fsm_get_location</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN298"><span class='Ref_to_Parameter'>nblocks</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN302"><span class='Ref_To_Local'>first_removed_slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Zero out the tail of the last remaining FSM page. If the slot 
+     * representing the first removed heap block is at a page boundary, as the 
+     * first slot on the FSM page that first_removed_address points to, we can 
+     * just truncate that page altogether. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN302"><span class='Ref_To_Local'>first_removed_slot</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="freespace.c.html#LN303"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN98"><span class='Ref_to_Proto'>fsm_readbuf</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN298"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN301"><span class='Ref_To_Local'>first_removed_address</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN303"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>return</span><span class='Delimiter'>;</span>             <span class='Comment_Single_Line'>/* nothing to do; the FSM was already smaller */ 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN303"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* NO EREPORT(ERROR) from here till changes are logged */ 
+</span>        <a href="../../../include/miscadmin.h.html#LN132"><span class='Ref_to_Macro'>START_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/fsm_internals.h.html#LN68"><span class='Ref_to_Proto'>fsm_truncate_avail</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN303"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN302"><span class='Ref_To_Local'>first_removed_slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Truncation of a relation is WAL-logged at a higher-level, and we 
+         * will be called at WAL replay. But if checksums are enabled, we need 
+         * to still write a WAL record to protect against a torn page, if the 
+         * page is flushed to disk before the truncation WAL record. We cannot 
+         * use MarkBufferDirtyHint here, because that will not dirty the page 
+         * during recovery. 
+         */ 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN176"><span class='Ref_to_Proto'>MarkBufferDirty</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN303"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../access/transam/xlog.c.html#LN191"><span class='Ref_to_Global_Var'>InRecovery</span></a> <span class='Operator'>&& </span><a href="../../../include/utils/rel.h.html#LN505"><span class='Ref_to_Macro'>RelationNeedsWAL</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN298"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>) </span><span class='Operator'>&& </span><a href="../../../include/access/xlog.h.html#LN155"><span class='Ref_to_Macro'>XLogHintBitIsNeeded</span></a><span class='Parentheses'>())</span> 
+            <a href="../../../include/access/xloginsert.h.html#LN56"><span class='Ref_to_Proto'>log_newpage_buffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN303"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/miscadmin.h.html#LN134"><span class='Ref_to_Macro'>END_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/bufmgr.h.html#LN175"><span class='Ref_to_Proto'>UnlockReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN303"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="freespace.c.html#LN300"><span class='Ref_To_Local'>new_nfsmblocks</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN96"><span class='Ref_to_Proto'>fsm_logical_to_physical</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN301"><span class='Ref_To_Local'>first_removed_address</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if first_removed_slot&GT;0 &raquo; </span> 
+    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="freespace.c.html#LN300"><span class='Ref_To_Local'>new_nfsmblocks</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN96"><span class='Ref_to_Proto'>fsm_logical_to_physical</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN301"><span class='Ref_To_Local'>first_removed_address</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/smgr.h.html#LN104"><span class='Ref_to_Proto'>smgrnblocks</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN298"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT;= </span><a href="freespace.c.html#LN300"><span class='Ref_To_Local'>new_nfsmblocks</span></a><span class='Parentheses'>)</span> 
+            <span class='Control'>return</span><span class='Delimiter'>;</span>             <span class='Comment_Single_Line'>/* nothing to do; the FSM was already smaller */ 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Truncate the unused FSM pages, and send smgr inval message */ 
+</span>    <a href="../../../include/storage/smgr.h.html#LN105"><span class='Ref_to_Proto'>smgrtruncate</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN298"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN300"><span class='Ref_To_Local'>new_nfsmblocks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We might as well update the local smgr_fsm_nblocks setting. 
+     * smgrtruncate sent an smgr cache inval message, which will cause other 
+     * backends to invalidate their copy of smgr_fsm_nblocks, and this one too 
+     * at the next command boundary.  But this ensures it isn't outright wrong 
+     * until then. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN298"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Parentheses'>) 
+</span>        <a href="freespace.c.html#LN298"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN300"><span class='Ref_To_Local'>new_nfsmblocks</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end FreeSpaceMapTruncateRel &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * FreeSpaceMapVacuum - scan and fix any inconsistencies in the FSM 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN378"></a><span class='Declare_Function'>FreeSpaceMapVacuum</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN380"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>dummy</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Traverse the tree in depth-first order. The tree is stored physically 
+     * in depth-first order, so this should be pretty I/O efficient. 
+     */ 
+</span>    <a href="freespace.c.html#LN110"><span class='Ref_to_Proto'>fsm_vacuum_page</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN378"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN89"><span class='Ref_to_Global_Var'>FSM_ROOT_ADDRESS</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN380"><span class='Ref_To_Local'>dummy</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/******** Internal routines ********/ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Return category corresponding x bytes of free space 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> 
+<a name="LN395"></a><span class='Declare_Function'>fsm_space_avail_to_cat</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>avail</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN397"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>cat</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN395"><span class='Ref_to_Parameter'>avail</span></a> <span class='Operator'>&LT; </span>BLCKSZ<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN395"><span class='Ref_to_Parameter'>avail</span></a> <span class='Operator'>&GT;= </span><a href="freespace.c.html#LN64"><span class='Ref_to_Const'>MaxFSMRequestSize</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>255</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN397"><span class='Ref_To_Local'>cat</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN395"><span class='Ref_to_Parameter'>avail</span></a> <span class='Operator'>/ </span><a href="freespace.c.html#LN63"><span class='Ref_to_Const'>FSM_CAT_STEP</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The highest category, 255, is reserved for MaxFSMRequestSize bytes or 
+     * more. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN397"><span class='Ref_To_Local'>cat</span></a> <span class='Operator'>&GT; </span><span class='Number'>254</span><span class='Parentheses'>) 
+</span>        <a href="freespace.c.html#LN397"><span class='Ref_To_Local'>cat</span></a> <span class='Operator'>= </span><span class='Number'>254</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a><span class='Parentheses'>) </span><a href="freespace.c.html#LN397"><span class='Ref_To_Local'>cat</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end fsm_space_avail_to_cat &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Return the lower bound of the range of free space represented by given 
+ * category. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN421"></a><span class='Declare_Function'>fsm_space_cat_to_avail</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>cat</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* The highest category represents exactly MaxFSMRequestSize bytes. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN421"><span class='Ref_to_Parameter'>cat</span></a> <span class='Operator'>== </span><span class='Number'>255</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="freespace.c.html#LN64"><span class='Ref_to_Const'>MaxFSMRequestSize</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <span class='Control'>return</span> <a href="freespace.c.html#LN421"><span class='Ref_to_Parameter'>cat</span></a> <span class='Operator'>* </span><a href="freespace.c.html#LN63"><span class='Ref_to_Const'>FSM_CAT_STEP</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Which category does a page need to have, to accommodate x bytes of data? 
+ * While fsm_size_to_avail_cat() rounds down, this needs to round up. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> 
+<a name="LN435"></a><span class='Declare_Function'>fsm_space_needed_to_cat</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>needed</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN437"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>cat</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Can't ask for more space than the highest category represents */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN435"><span class='Ref_to_Parameter'>needed</span></a> <span class='Operator'>&GT; </span><a href="freespace.c.html#LN64"><span class='Ref_to_Const'>MaxFSMRequestSize</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"invalid FSM request size %zu"</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN435"><span class='Ref_to_Parameter'>needed</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN435"><span class='Ref_to_Parameter'>needed</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN437"><span class='Ref_To_Local'>cat</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="freespace.c.html#LN435"><span class='Ref_to_Parameter'>needed</span></a> <span class='Operator'>+ </span><a href="freespace.c.html#LN63"><span class='Ref_to_Const'>FSM_CAT_STEP</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>/ </span><a href="freespace.c.html#LN63"><span class='Ref_to_Const'>FSM_CAT_STEP</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN437"><span class='Ref_To_Local'>cat</span></a> <span class='Operator'>&GT; </span><span class='Number'>255</span><span class='Parentheses'>) 
+</span>        <a href="freespace.c.html#LN437"><span class='Ref_To_Local'>cat</span></a> <span class='Operator'>= </span><span class='Number'>255</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a><span class='Parentheses'>) </span><a href="freespace.c.html#LN437"><span class='Ref_To_Local'>cat</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Returns the physical block number of a FSM page 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN458"></a><span class='Declare_Function'>fsm_logical_to_physical</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN460"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>pages</span><span class='Delimiter'>; 
+</span><a name="LN461"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>leafno</span><span class='Delimiter'>; 
+</span><a name="LN462"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>l</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Calculate the logical page number of the first leaf page below the 
+     * given page. 
+     */ 
+</span>    <a href="freespace.c.html#LN461"><span class='Ref_To_Local'>leafno</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN458"><span class='Ref_to_Parameter'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN85"><span class='Ref_to_Member'>logpageno</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN462"><span class='Ref_To_Local'>l</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="freespace.c.html#LN462"><span class='Ref_To_Local'>l</span></a> <span class='Operator'>&LT; </span><a href="freespace.c.html#LN458"><span class='Ref_to_Parameter'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a><span class='Delimiter'>; </span><a href="freespace.c.html#LN462"><span class='Ref_To_Local'>l</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <a href="freespace.c.html#LN461"><span class='Ref_To_Local'>leafno</span></a> <span class='Operator'>*= </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Count upper level nodes required to address the leaf page */ 
+</span>    <a href="freespace.c.html#LN460"><span class='Ref_To_Local'>pages</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN462"><span class='Ref_To_Local'>l</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="freespace.c.html#LN462"><span class='Ref_To_Local'>l</span></a> <span class='Operator'>&LT; </span><a href="freespace.c.html#LN73"><span class='Ref_to_Const'>FSM_TREE_DEPTH</span></a><span class='Delimiter'>; </span><a href="freespace.c.html#LN462"><span class='Ref_To_Local'>l</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="freespace.c.html#LN460"><span class='Ref_To_Local'>pages</span></a> <span class='Operator'>+= </span><a href="freespace.c.html#LN461"><span class='Ref_To_Local'>leafno</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>        <a href="freespace.c.html#LN461"><span class='Ref_To_Local'>leafno</span></a> <span class='Operator'>/= </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the page we were asked for wasn't at the bottom level, subtract the 
+     * additional lower level pages we counted above. 
+     */ 
+</span>    <a href="freespace.c.html#LN460"><span class='Ref_To_Local'>pages</span></a> <span class='Operator'>-= </span><a href="freespace.c.html#LN458"><span class='Ref_to_Parameter'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Turn the page count into 0-based block number */ 
+</span>    <span class='Control'>return</span> <a href="freespace.c.html#LN460"><span class='Ref_To_Local'>pages</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end fsm_logical_to_physical &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Return the FSM location corresponding to given heap block. 
+ */ 
+</span><span class='Keyword'>static </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> 
+<a name="LN494"></a><span class='Declare_Function'>fsm_get_location</span><span class='Parentheses'>(</span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapblk</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN496"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN496"><span class='Ref_To_Local'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN76"><span class='Ref_to_Const'>FSM_BOTTOM_LEVEL</span></a><span class='Delimiter'>; 
+</span>    <a href="freespace.c.html#LN496"><span class='Ref_To_Local'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN85"><span class='Ref_to_Member'>logpageno</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN494"><span class='Ref_to_Parameter'>heapblk</span></a> <span class='Operator'>/ </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="freespace.c.html#LN494"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN494"><span class='Ref_to_Parameter'>heapblk</span></a> <span class='Operator'>% </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="freespace.c.html#LN496"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Return the heap block number corresponding to given location in the FSM. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN509"></a><span class='Declare_Function'>fsm_get_heap_blk</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN509"><span class='Ref_to_Parameter'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>== </span><a href="freespace.c.html#LN76"><span class='Ref_to_Const'>FSM_BOTTOM_LEVEL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Parentheses'>((</span><span class='Keyword'>unsigned int</span><span class='Parentheses'>) </span><a href="freespace.c.html#LN509"><span class='Ref_to_Parameter'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN85"><span class='Ref_to_Member'>logpageno</span></a><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a> <span class='Operator'>+ </span><a href="freespace.c.html#LN509"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Given a logical address of a child page, get the logical page number of 
+ * the parent, and the slot within the parent corresponding to the child. 
+ */ 
+</span><span class='Keyword'>static </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> 
+<a name="LN520"></a><span class='Declare_Function'>fsm_get_parent</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>child</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN522"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>parent</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN520"><span class='Ref_to_Parameter'>child</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>&LT; </span><a href="freespace.c.html#LN75"><span class='Ref_to_Const'>FSM_ROOT_LEVEL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN522"><span class='Ref_To_Local'>parent</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN520"><span class='Ref_to_Parameter'>child</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <a href="freespace.c.html#LN522"><span class='Ref_To_Local'>parent</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN85"><span class='Ref_to_Member'>logpageno</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN520"><span class='Ref_to_Parameter'>child</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN85"><span class='Ref_to_Member'>logpageno</span></a> <span class='Operator'>/ </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="freespace.c.html#LN520"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN520"><span class='Ref_to_Parameter'>child</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN85"><span class='Ref_to_Member'>logpageno</span></a> <span class='Operator'>% </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="freespace.c.html#LN522"><span class='Ref_To_Local'>parent</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Given a logical address of a parent page and a slot number, get the 
+ * logical address of the corresponding child page. 
+ */ 
+</span><span class='Keyword'>static </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> 
+<a name="LN538"></a><span class='Declare_Function'>fsm_get_child</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>parent</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN540"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>child</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="freespace.c.html#LN538"><span class='Ref_to_Parameter'>parent</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>&GT; </span><a href="freespace.c.html#LN76"><span class='Ref_to_Const'>FSM_BOTTOM_LEVEL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN540"><span class='Ref_To_Local'>child</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN538"><span class='Ref_to_Parameter'>parent</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <a href="freespace.c.html#LN540"><span class='Ref_To_Local'>child</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN85"><span class='Ref_to_Member'>logpageno</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN538"><span class='Ref_to_Parameter'>parent</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN85"><span class='Ref_to_Member'>logpageno</span></a> <span class='Operator'>* </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a> <span class='Operator'>+ </span><a href="freespace.c.html#LN538"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="freespace.c.html#LN540"><span class='Ref_To_Local'>child</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Read a FSM page. 
+ * 
+ * If the page doesn't exist, InvalidBuffer is returned, or if 'extend' is 
+ * true, the FSM file is extended. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> 
+<a name="LN557"></a><span class='Declare_Function'>fsm_readbuf</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>extend</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN559"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>blkno</span> <span class='Operator'>= </span><a href="freespace.c.html#LN96"><span class='Ref_to_Proto'>fsm_logical_to_physical</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>addr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN560"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/rel.h.html#LN460"><span class='Ref_to_Macro'>RelationOpenSmgr</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we haven't cached the size of the FSM yet, check it first.  Also 
+     * recheck if the requested block seems to be past end, since our cached 
+     * value might be stale.  (We send smgr inval messages on truncation, but 
+     * not on extension.) 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a> <span class='Operator'>== </span><a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a> <span class='Operator'>|| 
+</span>        <a href="freespace.c.html#LN559"><span class='Ref_To_Local'>blkno</span></a> <span class='Operator'>&GT;= </span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/smgr.h.html#LN84"><span class='Ref_to_Proto'>smgrexists</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Parentheses'>))</span> 
+            <a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a> <span class='Operator'>= </span><a href="../../../include/storage/smgr.h.html#LN104"><span class='Ref_to_Proto'>smgrnblocks</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, 
+</span>                                                         <a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Handle requests beyond EOF */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN559"><span class='Ref_To_Local'>blkno</span></a> <span class='Operator'>&GT;= </span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>extend</span></a><span class='Parentheses'>) 
+</span>            <a href="freespace.c.html#LN99"><span class='Ref_to_Proto'>fsm_extend</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN559"><span class='Ref_To_Local'>blkno</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <span class='Control'>return</span> <a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Use ZERO_ON_ERROR mode, and initialize the page if necessary. The FSM 
+     * information is not accurate anyway, so it's better to clear corrupt 
+     * pages than error out. Since the FSM changes are not WAL-logged, the 
+     * so-called torn page problem on crash can lead to pages with corrupt 
+     * headers, for example. 
+     */ 
+</span>    <a href="freespace.c.html#LN560"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN168"><span class='Ref_to_Proto'>ReadBufferExtended</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN557"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN559"><span class='Ref_To_Local'>blkno</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN44"><span class='Ref_to_EnumConst'>RBM_ZERO_ON_ERROR</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN225"><span class='Ref_to_Macro'>PageIsNew</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN560"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)))</span> 
+        <a href="../page/bufpage.c.html#LN39"><span class='Ref_to_Func'>PageInit</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN560"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span>BLCKSZ<span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="freespace.c.html#LN560"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end fsm_readbuf &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Ensure that the FSM fork is at least fsm_nblocks long, extending 
+ * it if necessary with empty pages. And by empty, I mean pages filled 
+ * with zeros, meaning there's no free space. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN608"></a><span class='Declare_Function'>fsm_extend</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>fsm_nblocks</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN610"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>fsm_nblocks_now</span><span class='Delimiter'>; 
+</span><a name="LN611"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>pg</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN611"><span class='Ref_To_Local'>pg</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span>BLCKSZ<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../page/bufpage.c.html#LN39"><span class='Ref_to_Func'>PageInit</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN611"><span class='Ref_To_Local'>pg</span></a><span class='Delimiter'>, </span>BLCKSZ<span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We use the relation extension lock to lock out other backends trying to 
+     * extend the FSM at the same time. It also locks out extension of the 
+     * main fork, unnecessarily, but extending the FSM happens seldom enough 
+     * that it doesn't seem worthwhile to have a separate lock tag type for 
+     * it. 
+     * 
+     * Note that another backend might have extended or created the relation 
+     * by the time we get the lock. 
+     */ 
+</span>    <a href="../../../include/storage/lmgr.h.html#LN53"><span class='Ref_to_Proto'>LockRelationForExtension</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN43"><span class='Ref_to_Const'>ExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Might have to re-open if a cache flush happened */ 
+</span>    <a href="../../../include/utils/rel.h.html#LN460"><span class='Ref_to_Macro'>RelationOpenSmgr</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create the FSM file first if it doesn't exist.  If smgr_fsm_nblocks is 
+     * positive then it must exist, no need for an smgrexists call. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>         <a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a> <span class='Operator'>== </span><a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Parentheses'>) </span><span class='Operator'>&& 
+</span>        <span class='Operator'>!</span><a href="../../../include/storage/smgr.h.html#LN84"><span class='Ref_to_Proto'>smgrexists</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/storage/smgr.h.html#LN90"><span class='Ref_to_Proto'>smgrcreate</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN610"><span class='Ref_To_Local'>fsm_nblocks_now</span></a> <span class='Operator'>= </span><a href="../../../include/storage/smgr.h.html#LN104"><span class='Ref_to_Proto'>smgrnblocks</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN610"><span class='Ref_To_Local'>fsm_nblocks_now</span></a> <span class='Operator'>&LT; </span><a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>fsm_nblocks</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/bufpage.h.html#LN436"><span class='Ref_to_Proto'>PageSetChecksumInplace</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN611"><span class='Ref_To_Local'>pg</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN610"><span class='Ref_To_Local'>fsm_nblocks_now</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/smgr.h.html#LN94"><span class='Ref_to_Proto'>smgrextend</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN610"><span class='Ref_To_Local'>fsm_nblocks_now</span></a><span class='Delimiter'>, 
+</span>                   <span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="freespace.c.html#LN611"><span class='Ref_To_Local'>pg</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="freespace.c.html#LN610"><span class='Ref_To_Local'>fsm_nblocks_now</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Update local cache with the up-to-date size */ 
+</span>    <a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN610"><span class='Ref_To_Local'>fsm_nblocks_now</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lmgr.h.html#LN54"><span class='Ref_to_Proto'>UnlockRelationForExtension</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN608"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN43"><span class='Ref_to_Const'>ExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN611"><span class='Ref_To_Local'>pg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end fsm_extend &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Set value in given FSM page and slot. 
+ * 
+ * If minValue &GT; 0, the updated page is also searched for a page with at 
+ * least minValue of free space. If one is found, its slot number is 
+ * returned, -1 otherwise. 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN667"></a><span class='Declare_Function'>fsm_set_and_search</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a> <span class='Declare_Parameter'>slot</span><span class='Delimiter'>, 
+</span><a name="LN668"></a>                   <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>newValue</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>minValue</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN670"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span><a name="LN671"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span><a name="LN672"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>newslot</span> <span class='Operator'>= -</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN670"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN98"><span class='Ref_to_Proto'>fsm_readbuf</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN667"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN667"><span class='Ref_to_Parameter'>addr</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN670"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN671"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN670"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="fsmpage.c.html#LN61"><span class='Ref_to_Func'>fsm_set_avail</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN671"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN667"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN668"><span class='Ref_to_Parameter'>newValue</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/storage/bufmgr.h.html#LN211"><span class='Ref_to_Proto'>MarkBufferDirtyHint</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN670"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN668"><span class='Ref_to_Parameter'>minValue</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Search while we still hold the lock */ 
+</span>        <a href="freespace.c.html#LN672"><span class='Ref_To_Local'>newslot</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fsm_internals.h.html#LN63"><span class='Ref_to_Proto'>fsm_search_avail</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN670"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN668"><span class='Ref_to_Parameter'>minValue</span></a><span class='Delimiter'>, 
+</span>                                   <a href="freespace.c.html#LN667"><span class='Ref_to_Parameter'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>== </span><a href="freespace.c.html#LN76"><span class='Ref_to_Const'>FSM_BOTTOM_LEVEL</span></a><span class='Delimiter'>, 
+</span>                                   <span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN175"><span class='Ref_to_Proto'>UnlockReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN670"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="freespace.c.html#LN672"><span class='Ref_To_Local'>newslot</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end fsm_set_and_search &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Search the tree for a heap page with at least min_cat of free space 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN699"></a><span class='Declare_Function'>fsm_search</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>min_cat</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN701"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>restarts</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN702"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>addr</span> <span class='Operator'>= </span><a href="freespace.c.html#LN89"><span class='Ref_to_Global_Var'>FSM_ROOT_ADDRESS</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN706"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN707"></a>        <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span><a name="LN708"></a>        <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>max_avail</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Read the FSM page. */ 
+</span>        <a href="freespace.c.html#LN707"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN98"><span class='Ref_to_Proto'>fsm_readbuf</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN699"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN702"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Search within the page */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN707"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN707"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN87"><span class='Ref_to_Const'>BUFFER_LOCK_SHARE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="freespace.c.html#LN706"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fsm_internals.h.html#LN63"><span class='Ref_to_Proto'>fsm_search_avail</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN707"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN699"><span class='Ref_to_Parameter'>min_cat</span></a><span class='Delimiter'>, 
+</span>                                    <span class='Parentheses'>(</span><a href="freespace.c.html#LN702"><span class='Ref_To_Local'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>== </span><a href="freespace.c.html#LN76"><span class='Ref_to_Const'>FSM_BOTTOM_LEVEL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                    <span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN706"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>== -</span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>                <a href="freespace.c.html#LN708"><span class='Ref_To_Local'>max_avail</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fsm_internals.h.html#LN66"><span class='Ref_to_Proto'>fsm_get_max_avail</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN707"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN175"><span class='Ref_to_Proto'>UnlockReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN707"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+            <a href="freespace.c.html#LN706"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= -</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN706"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>!= -</span><span class='Number'>1</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * Descend the tree, or return the found block if we're at the 
+             * bottom. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN702"><span class='Ref_To_Local'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>== </span><a href="freespace.c.html#LN76"><span class='Ref_to_Const'>FSM_BOTTOM_LEVEL</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="freespace.c.html#LN95"><span class='Ref_to_Proto'>fsm_get_heap_blk</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN702"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN706"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="freespace.c.html#LN702"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN92"><span class='Ref_to_Proto'>fsm_get_child</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN702"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN706"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN702"><span class='Ref_To_Local'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>== </span><a href="freespace.c.html#LN75"><span class='Ref_to_Const'>FSM_ROOT_LEVEL</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * At the root, failure means there's no page with enough free 
+             * space in the FSM. Give up. 
+             */ 
+</span>            <span class='Control'>return</span> <a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN748"></a>            <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>parentslot</span><span class='Delimiter'>; 
+</span><a name="LN749"></a>            <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>parent</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * At lower level, failure can happen if the value in the upper- 
+             * level node didn't reflect the value on the lower page. Update 
+             * the upper node, to avoid falling into the same trap again, and 
+             * start over. 
+             * 
+             * There's a race condition here, if another backend updates this 
+             * page right after we release it, and gets the lock on the parent 
+             * page before us. We'll then update the parent page with the now 
+             * stale information we had. It's OK, because it should happen 
+             * rarely, and will be fixed by the next vacuum. 
+             */ 
+</span>            <a href="freespace.c.html#LN749"><span class='Ref_To_Local'>parent</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN93"><span class='Ref_to_Proto'>fsm_get_parent</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN702"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN748"><span class='Ref_To_Local'>parentslot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="freespace.c.html#LN107"><span class='Ref_to_Proto'>fsm_set_and_search</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN699"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN749"><span class='Ref_To_Local'>parent</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN748"><span class='Ref_To_Local'>parentslot</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN708"><span class='Ref_To_Local'>max_avail</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * If the upper pages are badly out of date, we might need to loop 
+             * quite a few times, updating them as we go. Any inconsistencies 
+             * should eventually be corrected and the loop should end. Looping 
+             * indefinitely is nevertheless scary, so provide an emergency 
+             * valve. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN701"><span class='Ref_To_Local'>restarts</span></a><span class='Operator'>++ &GT; </span><span class='Number'>10000</span><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Start search all over from the root */ 
+</span>            <a href="freespace.c.html#LN702"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN89"><span class='Ref_to_Global_Var'>FSM_ROOT_ADDRESS</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end fsm_search &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Recursive guts of FreeSpaceMapVacuum 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> 
+<a name="LN787"></a><span class='Declare_Function'>fsm_vacuum_page</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>eof_p</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN789"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span><a name="LN790"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span><a name="LN791"></a>    <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>max_avail</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Read the page if it exists, or return EOF */ 
+</span>    <a href="freespace.c.html#LN789"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN98"><span class='Ref_to_Proto'>fsm_readbuf</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN787"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN787"><span class='Ref_to_Parameter'>addr</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN789"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="freespace.c.html#LN787"><span class='Ref_to_Parameter'>eof_p</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <span class='Operator'>*</span><a href="freespace.c.html#LN787"><span class='Ref_to_Parameter'>eof_p</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="freespace.c.html#LN790"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN789"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Recurse into children, and fix the information stored about them at 
+     * this level. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN787"><span class='Ref_to_Parameter'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>&GT; </span><a href="freespace.c.html#LN76"><span class='Ref_to_Const'>FSM_BOTTOM_LEVEL</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN811"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN812"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>eof</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN811"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="freespace.c.html#LN811"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>&LT; </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a><span class='Delimiter'>; </span><a href="freespace.c.html#LN811"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN816"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>child_avail</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* After we hit end-of-file, just clear the rest of the slots */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="freespace.c.html#LN812"><span class='Ref_To_Local'>eof</span></a><span class='Parentheses'>) 
+</span>                <a href="freespace.c.html#LN816"><span class='Ref_To_Local'>child_avail</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN110"><span class='Ref_to_Proto'>fsm_vacuum_page</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN787"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN92"><span class='Ref_to_Proto'>fsm_get_child</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN787"><span class='Ref_to_Parameter'>addr</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN811"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN812"><span class='Ref_To_Local'>eof</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="freespace.c.html#LN816"><span class='Ref_To_Local'>child_avail</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Update information about the child */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/fsm_internals.h.html#LN65"><span class='Ref_to_Proto'>fsm_get_avail</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN790"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN811"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="freespace.c.html#LN816"><span class='Ref_To_Local'>child_avail</span></a><span class='Parentheses'>)</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN789"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="fsmpage.c.html#LN61"><span class='Ref_to_Func'>fsm_set_avail</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN789"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN811"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN816"><span class='Ref_To_Local'>child_avail</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/storage/bufmgr.h.html#LN211"><span class='Ref_to_Proto'>MarkBufferDirtyHint</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN789"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN789"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for slot=0;slot&LT;SlotsPerF... &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if addr.level&GT;FSM_BOTTOM... &raquo; </span> 
+ 
+    <a href="freespace.c.html#LN791"><span class='Ref_To_Local'>max_avail</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fsm_internals.h.html#LN66"><span class='Ref_to_Proto'>fsm_get_max_avail</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN789"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Reset the next slot pointer. This encourages the use of low-numbered 
+     * pages, increasing the chances that a later vacuum can truncate the 
+     * relation. 
+     */ 
+</span>    <span class='Parentheses'>((</span><a href="../../../include/storage/fsm_internals.h.html#LN44"><span class='Ref_to_Typedef'>FSMPage</span></a><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN242"><span class='Ref_to_Macro'>PageGetContents</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN790"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span><span class='Operator'>-&GT;</span>fp_next_slot <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN789"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="freespace.c.html#LN791"><span class='Ref_To_Local'>max_avail</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end fsm_vacuum_page &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * This function will return the last block number stored on given 
+ * FSM page address. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN856"></a><span class='Declare_Function'>fsm_get_lastblckno</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN858"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Get the last slot number on the given address and convert that to block 
+     * number 
+     */ 
+</span>    <a href="freespace.c.html#LN858"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fsm_internals.h.html#LN60"><span class='Ref_to_Const'>SlotsPerFSMPage</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="freespace.c.html#LN95"><span class='Ref_to_Proto'>fsm_get_heap_blk</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN856"><span class='Ref_to_Parameter'>addr</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN858"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Recursively update the FSM tree from given address to 
+ * all the way up to root. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN873"></a><span class='Declare_Function'>fsm_update_recursive</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a> <span class='Declare_Parameter'>addr</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a> <span class='Declare_Parameter'>new_cat</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN875"></a>    <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>parentslot</span><span class='Delimiter'>; 
+</span><a name="LN876"></a>    <a href="freespace.c.html#LN82"><span class='Ref_to_Typedef'>FSMAddress</span></a>  <span class='Declare_Local'>parent</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="freespace.c.html#LN873"><span class='Ref_to_Parameter'>addr</span></a><span class='Operator'>.</span><a href="freespace.c.html#LN84"><span class='Ref_to_Member'>level</span></a> <span class='Operator'>== </span><a href="freespace.c.html#LN75"><span class='Ref_to_Const'>FSM_ROOT_LEVEL</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Get the parent page and our slot in the parent page, and update the 
+     * information in that. 
+     */ 
+</span>    <a href="freespace.c.html#LN876"><span class='Ref_To_Local'>parent</span></a> <span class='Operator'>= </span><a href="freespace.c.html#LN93"><span class='Ref_to_Proto'>fsm_get_parent</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN873"><span class='Ref_to_Parameter'>addr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="freespace.c.html#LN875"><span class='Ref_To_Local'>parentslot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="freespace.c.html#LN107"><span class='Ref_to_Proto'>fsm_set_and_search</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN873"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN876"><span class='Ref_To_Local'>parent</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN875"><span class='Ref_To_Local'>parentslot</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN873"><span class='Ref_to_Parameter'>new_cat</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="freespace.c.html#LN112"><span class='Ref_to_Proto'>fsm_update_recursive</span></a><span class='Parentheses'>(</span><a href="freespace.c.html#LN873"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN876"><span class='Ref_To_Local'>parent</span></a><span class='Delimiter'>, </span><a href="freespace.c.html#LN873"><span class='Ref_to_Parameter'>new_cat</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

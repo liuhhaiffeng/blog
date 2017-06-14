@@ -1,0 +1,794 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\utils\mmgr\slab.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\utils\mmgr\slab.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:58 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * slab.c 
+ *    SLAB allocator definitions. 
+ * 
+ * SLAB is a MemoryContext implementation designed for cases where large 
+ * numbers of equally-sized objects are allocated (and freed). 
+ * 
+ * 
+ * Portions Copyright (c) 2017, PostgreSQL Global Development Group 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/utils/mmgr/slab.c 
+ * 
+ * 
+ * NOTE: 
+ *  The constant allocation size allows significant simplification and various 
+ *  optimizations over more general purpose allocators. The blocks are carved 
+ *  into chunks of exactly the right size (plus alignment), not wasting any 
+ *  memory. 
+ * 
+ *  The information about free chunks is maintained both at the block level and 
+ *  global (context) level. This is possible as the chunk size (and thus also 
+ *  the number of chunks per block) is fixed. 
+ * 
+ *  On each block, free chunks are tracked in a simple linked list. Contents 
+ *  of free chunks is replaced with an index of the next free chunk, forming 
+ *  a very simple linked list. Each block also contains a counter of free 
+ *  chunks. Combined with the local block-level freelist, it makes it trivial 
+ *  to eventually free the whole block. 
+ * 
+ *  At the context level, we use 'freelist' to track blocks ordered by number 
+ *  of free chunks, starting with blocks having a single allocated chunk, and 
+ *  with completely full blocks on the tail. 
+ * 
+ *  This also allows various optimizations - for example when searching for 
+ *  free chunk, the allocator reuses space from the fullest blocks first, in 
+ *  the hope that some of the less full blocks will get completely empty (and 
+ *  returned back to the OS). 
+ * 
+ *  For each block, we maintain pointer to the first free chunk - this is quite 
+ *  cheap and allows us to skip all the preceding used chunks, eliminating 
+ *  a significant number of lookups in many common usage patters. In the worst 
+ *  case this performs as if the pointer was not maintained. 
+ * 
+ *  We cache the freelist index for the blocks with the fewest free chunks 
+ *  (minFreeChunks), so that we don't have to search the freelist on every 
+ *  SlabAlloc() call, which is quite expensive. 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"utils/memdebug.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"lib/ilist.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SlabContext is a specialized implementation of MemoryContext. 
+ */ 
+</span><a name="LN62"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>SlabContext</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN64"></a>    <a href="../../../include/nodes/memnodes.h.html#LN72"><span class='Ref_to_Struct'>MemoryContextData</span></a> <span class='Declare_Member'>header</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* Standard memory-context fields */ 
+</span>    <span class='Comment_Multi_Line'>/* Allocation parameters for this context: */ 
+</span><a name="LN66"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Member'>chunkSize</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* chunk size */ 
+</span><a name="LN67"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Member'>fullChunkSize</span><span class='Delimiter'>;</span>  <span class='Comment_Single_Line'>/* chunk size including header and alignment */ 
+</span><a name="LN68"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Member'>blockSize</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* block size */ 
+</span><a name="LN69"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>chunksPerBlock</span><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* number of chunks per block */ 
+</span><a name="LN70"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>minFreeChunks</span><span class='Delimiter'>;</span>  <span class='Comment_Single_Line'>/* min number of free chunks in any block */ 
+</span><a name="LN71"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>nblocks</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* number of blocks allocated */ 
+</span>    <span class='Comment_Multi_Line'>/* blocks with free space, grouped by number of free chunks: */ 
+</span><a name="LN73"></a>    <a href="../../../include/lib/ilist.h.html#LN134"><span class='Ref_to_Struct'>dlist_head</span></a>  <span class='Declare_Member'>freelist</span><span class='Delimiter'>[</span>FLEXIBLE_ARRAY_MEMBER<span class='Delimiter'>]; 
+</span><a name="LN74"></a>} <span class='Declare_Typedef'>SlabContext</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * SlabBlock 
+ *      Structure of a single block in SLAB allocator. 
+ * 
+ * node: doubly-linked list of blocks in global freelist 
+ * nfree: number of free chunks in this block 
+ * firstFreeChunk: index of the first free chunk 
+ */ 
+</span><a name="LN84"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>SlabBlock</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN86"></a>    <a href="../../../include/lib/ilist.h.html#LN120"><span class='Ref_to_Struct'>dlist_node</span></a>  <span class='Declare_Member'>node</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* doubly-linked list */ 
+</span><a name="LN87"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>nfree</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* number of free chunks */ 
+</span><a name="LN88"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>firstFreeChunk</span><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* index of the first free chunk in the block */ 
+</span><a name="LN89"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>SlabBlock</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * SlabChunk 
+ *      The prefix of each piece of memory in an SlabBlock 
+ */ 
+</span><a name="LN95"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>SlabChunk</span> 
+<span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* block owning this chunk */ 
+</span><a name="LN98"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Member'>block</span><span class='Delimiter'>; 
+</span><a name="LN99"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Member'>slab</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* owning context */ 
+</span>    <span class='Comment_Multi_Line'>/* there must not be any padding to reach a MAXALIGN boundary here! */ 
+</span><a name="LN101"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>SlabChunk</span><span class='Delimiter'>; 
+</span> 
+ 
+<a name="LN104"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SlabPointerGetChunk</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>ptr</span><span class='Parentheses'>)</span>    <span class='Operator'>\ 
+</span>    <span class='Parentheses'>((</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a> <span class='Operator'>*</span><span class='Parentheses'>)(((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>)(</span><a href="slab.c.html#LN104"><span class='Ref_to_Parameter'>ptr</span></a><span class='Parentheses'>))</span> <span class='Operator'>- </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>)))</span> 
+<a name="LN106"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SlabChunkGetPointer</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>chk</span><span class='Parentheses'>)</span>    <span class='Operator'>\ 
+</span>    <span class='Parentheses'>((</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>)(((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>)(</span><a href="slab.c.html#LN106"><span class='Ref_to_Parameter'>chk</span></a><span class='Parentheses'>))</span> <span class='Operator'>+ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>)))</span> 
+<a name="LN108"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SlabBlockGetChunk</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>slab</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>block</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>idx</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <span class='Parentheses'>((</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a> <span class='Operator'>*</span><span class='Parentheses'>)</span> <span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) (</span><a href="slab.c.html#LN108"><span class='Ref_to_Parameter'>block</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a><span class='Parentheses'>)</span>    <span class='Operator'>\ 
+</span>                    <span class='Operator'>+ </span><span class='Parentheses'>(</span><a href="slab.c.html#LN108"><span class='Ref_to_Parameter'>idx</span></a> <span class='Operator'>* </span><a href="slab.c.html#LN108"><span class='Ref_to_Parameter'>slab</span></a><span class='Operator'>-&GT;</span>fullChunkSize<span class='Parentheses'>)))</span> 
+<a name="LN111"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SlabBlockStart</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>block</span><span class='Parentheses'>)</span>   <span class='Operator'>\ 
+</span>    <span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN111"><span class='Ref_to_Parameter'>block</span></a> <span class='Operator'>+ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a><span class='Parentheses'>))</span> 
+<a name="LN113"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SlabChunkIndex</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>slab</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>block</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>chunk</span><span class='Parentheses'>)</span>  <span class='Operator'>\ 
+</span>    <span class='Parentheses'>(((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN113"><span class='Ref_to_Parameter'>chunk</span></a> <span class='Operator'>- </span><a href="slab.c.html#LN111"><span class='Ref_to_Macro'>SlabBlockStart</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN113"><span class='Ref_to_Parameter'>block</span></a><span class='Parentheses'>))</span> <span class='Operator'>/ </span><a href="slab.c.html#LN113"><span class='Ref_to_Parameter'>slab</span></a><span class='Operator'>-&GT;</span>fullChunkSize<span class='Parentheses'>)</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * These functions implement the MemoryContext API for Slab contexts. 
+ */ 
+</span><a name="LN119"></a><span class='Keyword'>static void </span><span class='Operator'>*</span><span class='Declare_Prototype'>SlabAlloc</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN120"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SlabFree</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>pointer</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN121"></a><span class='Keyword'>static void </span><span class='Operator'>*</span><span class='Declare_Prototype'>SlabRealloc</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>pointer</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN122"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SlabInit</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN123"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SlabReset</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN124"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SlabDelete</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN125"></a><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Prototype'>SlabGetChunkSpace</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>pointer</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN126"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>SlabIsEmpty</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN127"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SlabStats</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>level</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>print</span><span class='Delimiter'>, 
+</span><a name="LN128"></a>          <a href="../../../include/nodes/memnodes.h.html#LN28"><span class='Ref_to_Struct'>MemoryContextCounters</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>totals</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#ifdef</span> <a href="../../../include/pg_config_manual.h.html#LN275"><span class='Ref_to_Const'>MEMORY_CONTEXT_CHECKING</span></a> 
+<a name="LN130"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SlabCheck</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * This is the virtual function table for Slab contexts. 
+ */ 
+</span><a name="LN136"></a><span class='Keyword'>static </span><a href="../../../include/nodes/memnodes.h.html#LN53"><span class='Ref_to_Struct'>MemoryContextMethods</span></a> <span class='Declare_Var'>SlabMethods</span> <span class='Operator'>= </span><span class='Delimiter'>{ 
+</span>    <a href="slab.c.html#LN119"><span class='Ref_to_Proto'>SlabAlloc</span></a><span class='Delimiter'>, 
+</span>    <a href="slab.c.html#LN120"><span class='Ref_to_Proto'>SlabFree</span></a><span class='Delimiter'>, 
+</span>    <a href="slab.c.html#LN121"><span class='Ref_to_Proto'>SlabRealloc</span></a><span class='Delimiter'>, 
+</span>    <a href="slab.c.html#LN122"><span class='Ref_to_Proto'>SlabInit</span></a><span class='Delimiter'>, 
+</span>    <a href="slab.c.html#LN123"><span class='Ref_to_Proto'>SlabReset</span></a><span class='Delimiter'>, 
+</span>    <a href="slab.c.html#LN124"><span class='Ref_to_Proto'>SlabDelete</span></a><span class='Delimiter'>, 
+</span>    <a href="slab.c.html#LN125"><span class='Ref_to_Proto'>SlabGetChunkSpace</span></a><span class='Delimiter'>, 
+</span>    <a href="slab.c.html#LN126"><span class='Ref_to_Proto'>SlabIsEmpty</span></a><span class='Delimiter'>, 
+</span>    <a href="slab.c.html#LN127"><span class='Ref_to_Proto'>SlabStats</span></a> 
+<span class='Directive'>#ifdef</span> <a href="../../../include/pg_config_manual.h.html#LN275"><span class='Ref_to_Const'>MEMORY_CONTEXT_CHECKING</span></a> 
+    <span class='Delimiter'>,</span><a href="slab.c.html#LN130"><span class='Ref_to_Proto'>SlabCheck</span></a> 
+<span class='Directive'>#endif</span> 
+<span class='Delimiter'>}; 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------- 
+ * Debug macros 
+ * ---------- 
+ */ 
+</span><span class='Directive'>#ifdef</span> HAVE_ALLOCINFO 
+<a name="LN156"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SlabFreeInfo</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>_cxt</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>_chunk</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>            <a href="../../../../contrib/seg/segscan.l.html#LN10"><span class='Ref_to_Macro'>fprintf</span></a><span class='Parentheses'>(</span>stderr<span class='Delimiter'>, </span><span class='String'>"SlabFree: %s: %p, %zu\n"</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>                <span class='Parentheses'>(</span><a href="slab.c.html#LN156"><span class='Ref_to_Parameter'>_cxt</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>header<span class='Operator'>.</span>name<span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="slab.c.html#LN156"><span class='Ref_to_Parameter'>_chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="slab.c.html#LN156"><span class='Ref_to_Parameter'>_chunk</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>header<span class='Operator'>.</span>size<span class='Parentheses'>)</span> 
+<a name="LN159"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SlabAllocInfo</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>_cxt</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>_chunk</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>            <a href="../../../../contrib/seg/segscan.l.html#LN10"><span class='Ref_to_Macro'>fprintf</span></a><span class='Parentheses'>(</span>stderr<span class='Delimiter'>, </span><span class='String'>"SlabAlloc: %s: %p, %zu\n"</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>                <span class='Parentheses'>(</span><a href="slab.c.html#LN159"><span class='Ref_to_Parameter'>_cxt</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>header<span class='Operator'>.</span>name<span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="slab.c.html#LN159"><span class='Ref_to_Parameter'>_chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="slab.c.html#LN159"><span class='Ref_to_Parameter'>_chunk</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>header<span class='Operator'>.</span>size<span class='Parentheses'>)</span> 
+<span class='Directive'>#else</span> 
+<a name="LN163"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SlabFreeInfo</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>_cxt</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>_chunk</span><span class='Parentheses'>) 
+</span><a name="LN164"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SlabAllocInfo</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>_cxt</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>_chunk</span><span class='Parentheses'>) 
+</span><span class='Directive'>#endif</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SlabContextCreate 
+ *      Create a new Slab context. 
+ * 
+ * parent: parent context, or NULL if top-level context 
+ * name: name of context (for debugging --- string will be copied) 
+ * blockSize: allocation block size 
+ * chunkSize: allocation chunk size 
+ * 
+ * The chunkSize may not exceed: 
+ *      MAXALIGN_DOWN(SIZE_MAX) - MAXALIGN(sizeof(SlabBlock)) - SLAB_CHUNKHDRSZ 
+ * 
+ */ 
+</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> 
+<a name="LN182"></a><span class='Declare_Function'>SlabContextCreate</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>parent</span><span class='Delimiter'>, 
+</span><a name="LN183"></a>                  <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>name</span><span class='Delimiter'>, 
+</span><a name="LN184"></a>                  <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>blockSize</span><span class='Delimiter'>, 
+</span><a name="LN185"></a>                  <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>chunkSize</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN187"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>chunksPerBlock</span><span class='Delimiter'>; 
+</span><a name="LN188"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>fullChunkSize</span><span class='Delimiter'>; 
+</span><a name="LN189"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>freelistSize</span><span class='Delimiter'>; 
+</span><a name="LN190"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/c.h.html#LN751"><span class='Ref_to_Macro'>StaticAssertStmt</span></a><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN190"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>)</span> <span class='Operator'>+</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a><span class='Parentheses'>)</span> <span class='Operator'>== 
+</span>                     <a href="../../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>))</span><span class='Delimiter'>, 
+</span>                     <span class='String'>"padding calculation in SlabChunk is wrong"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Make sure the linked list node fits inside a freed chunk */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN185"><span class='Ref_to_Parameter'>chunkSize</span></a> <span class='Operator'>&LT; </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>))</span> 
+        <a href="slab.c.html#LN185"><span class='Ref_to_Parameter'>chunkSize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* chunk, including SLAB header (both addresses nicely aligned) */ 
+</span>    <a href="slab.c.html#LN188"><span class='Ref_To_Local'>fullChunkSize</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><a href="../../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN185"><span class='Ref_to_Parameter'>chunkSize</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Make sure the block can store at least one chunk. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN184"><span class='Ref_to_Parameter'>blockSize</span></a> <span class='Operator'>- </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="slab.c.html#LN188"><span class='Ref_To_Local'>fullChunkSize</span></a><span class='Parentheses'>)</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"block size %zu for slab is too small for %zu chunks"</span><span class='Delimiter'>, 
+</span>             <a href="slab.c.html#LN184"><span class='Ref_to_Parameter'>blockSize</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN185"><span class='Ref_to_Parameter'>chunkSize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Compute maximum number of chunks per block */ 
+</span>    <a href="slab.c.html#LN187"><span class='Ref_To_Local'>chunksPerBlock</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="slab.c.html#LN184"><span class='Ref_to_Parameter'>blockSize</span></a> <span class='Operator'>- </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a><span class='Parentheses'>))</span> <span class='Operator'>/ </span><a href="slab.c.html#LN188"><span class='Ref_To_Local'>fullChunkSize</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* The freelist starts with 0, ends with chunksPerBlock. */ 
+</span>    <a href="slab.c.html#LN189"><span class='Ref_To_Local'>freelistSize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/lib/ilist.h.html#LN134"><span class='Ref_to_Struct'>dlist_head</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Parentheses'>(</span><a href="slab.c.html#LN187"><span class='Ref_To_Local'>chunksPerBlock</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* if we can't fit at least one chunk into the block, we're hosed */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN187"><span class='Ref_To_Local'>chunksPerBlock</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* make sure the chunks actually fit on the block   */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>((</span><a href="slab.c.html#LN188"><span class='Ref_To_Local'>fullChunkSize</span></a> <span class='Operator'>* </span><a href="slab.c.html#LN187"><span class='Ref_To_Local'>chunksPerBlock</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT;= </span><a href="slab.c.html#LN184"><span class='Ref_to_Parameter'>blockSize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Do the type-independent part of context creation */ 
+</span>    <a href="slab.c.html#LN190"><span class='Ref_To_Local'>slab</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/memutils.h.html#LN134"><span class='Ref_to_Proto'>MemoryContextCreate</span></a><span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN275"><span class='Ref_to_EnumConst'>T_SlabContext</span></a><span class='Delimiter'>, 
+</span>                            <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span>freelist<span class='Parentheses'>) </span><span class='Operator'>+</span><a href="slab.c.html#LN189"><span class='Ref_To_Local'>freelistSize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                            <span class='Operator'>&</span><a href="slab.c.html#LN136"><span class='Ref_to_Global_Var'>SlabMethods</span></a><span class='Delimiter'>, 
+</span>                            <a href="slab.c.html#LN182"><span class='Ref_to_Parameter'>parent</span></a><span class='Delimiter'>, 
+</span>                            <a href="slab.c.html#LN183"><span class='Ref_to_Parameter'>name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="slab.c.html#LN190"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN68"><span class='Ref_to_Member'>blockSize</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN184"><span class='Ref_to_Parameter'>blockSize</span></a><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN190"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN185"><span class='Ref_to_Parameter'>chunkSize</span></a><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN190"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN67"><span class='Ref_to_Member'>fullChunkSize</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN188"><span class='Ref_To_Local'>fullChunkSize</span></a><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN190"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN187"><span class='Ref_To_Local'>chunksPerBlock</span></a><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN190"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN71"><span class='Ref_to_Member'>nblocks</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN190"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a><span class='Parentheses'>) </span><a href="slab.c.html#LN190"><span class='Ref_To_Local'>slab</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SlabContextCreate &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SlabInit 
+ *      Context-type-specific initialization routine. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN243"></a><span class='Declare_Function'>SlabInit</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN245"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN246"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN575"><span class='Ref_to_Macro'>castNode</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN243"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN246"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* initialize the freelist slots */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN245"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="slab.c.html#LN245"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><span class='Parentheses'>(</span><a href="slab.c.html#LN246"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; </span><a href="slab.c.html#LN245"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span> 
+        <a href="../../../include/lib/ilist.h.html#LN276"><span class='Ref_to_Func'>dlist_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="slab.c.html#LN246"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN245"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * SlabReset 
+ *      Frees all memory which is allocated in the given set. 
+ * 
+ * The code simply frees all the blocks in the context - we don't keep any 
+ * keeper blocks or anything like that. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN263"></a><span class='Declare_Function'>SlabReset</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN265"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN266"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN575"><span class='Ref_to_Macro'>castNode</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN263"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN266"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="../../../include/pg_config_manual.h.html#LN275"><span class='Ref_to_Const'>MEMORY_CONTEXT_CHECKING</span></a> 
+    <span class='Comment_Multi_Line'>/* Check for corruption and leaks before freeing */ 
+</span>    <a href="slab.c.html#LN130"><span class='Ref_to_Proto'>SlabCheck</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN263"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Comment_Multi_Line'>/* walk over freelists and free the blocks */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN265"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="slab.c.html#LN265"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="slab.c.html#LN266"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>; </span><a href="slab.c.html#LN265"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN278"></a>        <a href="../../../include/lib/ilist.h.html#LN177"><span class='Ref_to_Struct'>dlist_mutable_iter</span></a> <span class='Declare_Local'>miter</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/lib/ilist.h.html#LN523"><span class='Ref_to_Macro'>dlist_foreach_modify</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN278"><span class='Ref_To_Local'>miter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="slab.c.html#LN266"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN265"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN282"></a>            <a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>block</span> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN476"><span class='Ref_to_Macro'>dlist_container</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN278"><span class='Ref_To_Local'>miter</span></a><span class='Operator'>.</span><a href="../../../include/lib/ilist.h.html#LN179"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/lib/ilist.h.html#LN356"><span class='Ref_to_Func'>dlist_delete</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN278"><span class='Ref_To_Local'>miter</span></a><span class='Operator'>.</span><a href="../../../include/lib/ilist.h.html#LN179"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="../../../include/pg_config_manual.h.html#LN266"><span class='Ref_to_Const'>CLOBBER_FREED_MEMORY</span></a> 
+            <a href="../../../include/utils/memdebug.h.html#LN37"><span class='Ref_to_Func'>wipe_mem</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN282"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN266"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN68"><span class='Ref_to_Member'>blockSize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+            <a href="../../../include/snowball/header.h.html#LN64"><span class='Ref_to_Macro'>free</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN282"><span class='Ref_To_Local'>block</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="slab.c.html#LN266"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN71"><span class='Ref_to_Member'>nblocks</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="slab.c.html#LN266"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN266"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN71"><span class='Ref_to_Member'>nblocks</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SlabReset &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SlabDelete 
+ *      Frees all memory which is allocated in the given slab, in preparation 
+ *      for deletion of the slab. We simply call SlabReset(). 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN305"></a><span class='Declare_Function'>SlabDelete</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* just reset the context */ 
+</span>    <a href="slab.c.html#LN123"><span class='Ref_to_Proto'>SlabReset</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN305"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * SlabAlloc 
+ *      Returns pointer to allocated memory of given size or NULL if 
+ *      request could not be completed; memory is added to the slab. 
+ */ 
+</span><span class='Keyword'>static void </span><span class='Operator'>* 
+</span><a name="LN317"></a><span class='Declare_Function'>SlabAlloc</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN319"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN575"><span class='Ref_to_Macro'>castNode</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN317"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN320"></a>    <a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>block</span><span class='Delimiter'>; 
+</span><a name="LN321"></a>    <a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>chunk</span><span class='Delimiter'>; 
+</span><a name="LN322"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>idx</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>((</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>) </span><span class='Operator'>&& 
+</span>           <span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>&LT; </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* make sure we only allow correct request size */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN317"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>!= </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unexpected alloc chunk size %zu (expected %zu)"</span><span class='Delimiter'>, 
+</span>             <a href="slab.c.html#LN317"><span class='Ref_to_Parameter'>size</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If there are no free chunks in any existing block, create a new block 
+     * and put it to the last freelist bucket. 
+     * 
+     * slab-&GT;minFreeChunks == 0 means there are no blocks with free chunks, 
+     * thanks to how minFreeChunks is updated at the end of SlabAlloc(). 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/snowball/header.h.html#LN49"><span class='Ref_to_Macro'>malloc</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN68"><span class='Ref_to_Member'>blockSize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>; 
+</span>        <a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Put all the chunks on a freelist. Walk the chunks and point each 
+         * one to the next one. 
+         */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>&LT; </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>; </span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN108"><span class='Ref_to_Macro'>SlabBlockGetChunk</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Operator'>*</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN106"><span class='Ref_to_Macro'>SlabChunkGetPointer</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><span class='Parentheses'>(</span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * And add it to the last freelist with all chunks empty. 
+         * 
+         * We know there are no blocks in the freelist, otherwise we wouldn't 
+         * need a new block. 
+         */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/lib/ilist.h.html#LN287"><span class='Ref_to_Func'>dlist_is_empty</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>]</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/lib/ilist.h.html#LN298"><span class='Ref_to_Func'>dlist_push_head</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>], </span><span class='Operator'>&</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN86"><span class='Ref_to_Member'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>; 
+</span>        <a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN71"><span class='Ref_to_Member'>nblocks</span></a> <span class='Operator'>+= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if slab-&GT;minFreeChunks==... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* grab the block from the freelist (even the new block is there) */ 
+</span>    <a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN486"><span class='Ref_to_Macro'>dlist_head_element</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, 
+</span>                               <span class='Operator'>&</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* make sure we actually got a valid block, with matching nfree */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>== </span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* we know index of the first free chunk in the block */ 
+</span>    <a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* make sure the chunk index is valid, and that it's marked as empty */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>((</span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>) </span><span class='Operator'>&& </span><span class='Parentheses'>(</span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>&LT; </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* compute the chunk location block start (after the block header) */ 
+</span>    <a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN108"><span class='Ref_to_Macro'>SlabBlockGetChunk</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Update the block nfree count, and also the minFreeChunks as we've 
+     * decreased nfree for a block with the minimum number of free chunks 
+     * (because that's how we chose the block). 
+     */ 
+</span>    <a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Remove the chunk from the freelist head. The index of the next free 
+     * chunk is stored in the chunk itself. 
+     */ 
+</span>    <a href="../../../include/utils/memdebug.h.html#LN25"><span class='Ref_to_Macro'>VALGRIND_MAKE_MEM_DEFINED</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN106"><span class='Ref_to_Macro'>SlabChunkGetPointer</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a> <span class='Operator'>= *</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN106"><span class='Ref_to_Macro'>SlabChunkGetPointer</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a> <span class='Operator'>&LT;= </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>((</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>            <a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a> <span class='Operator'>&LT; </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>           <span class='Parentheses'>(</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>            <a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a> <span class='Operator'>== </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* move the whole block to the right place in the freelist */ 
+</span>    <a href="../../../include/lib/ilist.h.html#LN356"><span class='Ref_to_Func'>dlist_delete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN86"><span class='Ref_to_Member'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/lib/ilist.h.html#LN298"><span class='Ref_to_Func'>dlist_push_head</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Delimiter'>], </span><span class='Operator'>&</span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN86"><span class='Ref_to_Member'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * And finally update minFreeChunks, i.e. the index to the block with the 
+     * lowest number of free chunks. We only need to do that when the block 
+     * got full (otherwise we know the current block is the right one). We'll 
+     * simply walk the freelist until we find a non-empty entry. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>&LT;= </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>; </span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/lib/ilist.h.html#LN287"><span class='Ref_to_Func'>dlist_is_empty</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a><span class='Delimiter'>]</span><span class='Parentheses'>))</span> 
+                <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* found a non-empty freelist */ 
+</span>            <a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN322"><span class='Ref_To_Local'>idx</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>== </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>) 
+</span>        <a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Prepare to initialize the chunk header. */ 
+</span>    <a href="../../../include/utils/memdebug.h.html#LN27"><span class='Ref_to_Macro'>VALGRIND_MAKE_MEM_UNDEFINED</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN98"><span class='Ref_to_Member'>block</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN320"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN99"><span class='Ref_to_Member'>slab</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="../../../include/pg_config_manual.h.html#LN275"><span class='Ref_to_Const'>MEMORY_CONTEXT_CHECKING</span></a> 
+    <span class='Comment_Multi_Line'>/* slab mark to catch clobber of "unused" space */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a> <span class='Operator'>&LT; </span><span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN67"><span class='Ref_to_Member'>fullChunkSize</span></a> <span class='Operator'>- </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>)))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/utils/memdebug.h.html#LN49"><span class='Ref_to_Func'>set_sentinel</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN106"><span class='Ref_to_Macro'>SlabChunkGetPointer</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="slab.c.html#LN317"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/memdebug.h.html#LN26"><span class='Ref_to_Macro'>VALGRIND_MAKE_MEM_NOACCESS</span></a><span class='Parentheses'>(((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span> <span class='Operator'>+ 
+</span>                                   <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>)</span> <span class='Operator'>+ </span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a><span class='Delimiter'>, 
+</span>                                   <a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN67"><span class='Ref_to_Member'>fullChunkSize</span></a> <span class='Operator'>- 
+</span>                                   <span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a> <span class='Operator'>+ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+<span class='Directive'>#ifdef</span> RANDOMIZE_ALLOCATED_MEMORY 
+    <span class='Comment_Multi_Line'>/* fill the allocated space with junk */ 
+</span>    <a href="memdebug.c.html#LN73"><span class='Ref_to_Func'>randomize_mem</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN106"><span class='Ref_to_Macro'>SlabChunkGetPointer</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="slab.c.html#LN317"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <a href="slab.c.html#LN159"><span class='Ref_to_Macro'>SlabAllocInfo</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN319"><span class='Ref_To_Local'>slab</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="slab.c.html#LN106"><span class='Ref_to_Macro'>SlabChunkGetPointer</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN321"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SlabAlloc &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SlabFree 
+ *      Frees allocated memory; memory is removed from the slab. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN473"></a><span class='Declare_Function'>SlabFree</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>pointer</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN475"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>idx</span><span class='Delimiter'>; 
+</span><a name="LN476"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN575"><span class='Ref_to_Macro'>castNode</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN473"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN477"></a>    <a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>chunk</span> <span class='Operator'>= </span><a href="slab.c.html#LN104"><span class='Ref_to_Macro'>SlabPointerGetChunk</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN473"><span class='Ref_to_Parameter'>pointer</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN478"></a>    <a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>block</span> <span class='Operator'>= </span><a href="slab.c.html#LN477"><span class='Ref_To_Local'>chunk</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN98"><span class='Ref_to_Member'>block</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="slab.c.html#LN156"><span class='Ref_to_Macro'>SlabFreeInfo</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN477"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="../../../include/pg_config_manual.h.html#LN275"><span class='Ref_to_Const'>MEMORY_CONTEXT_CHECKING</span></a> 
+    <span class='Comment_Multi_Line'>/* Test for someone scribbling on unused space in chunk */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a> <span class='Operator'>&LT; </span><span class='Parentheses'>(</span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN67"><span class='Ref_to_Member'>fullChunkSize</span></a> <span class='Operator'>- </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>)))</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/utils/memdebug.h.html#LN59"><span class='Ref_to_Func'>sentinel_ok</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN473"><span class='Ref_to_Parameter'>pointer</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a><span class='Parentheses'>))</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><span class='String'>"detected write past chunk end in %s %p"</span><span class='Delimiter'>, 
+</span>                 <a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN64"><span class='Ref_to_Member'>header</span></a><span class='Operator'>.</span><a href="../../../include/nodes/memnodes.h.html#LN83"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN477"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Comment_Multi_Line'>/* compute index of the chunk with respect to block start */ 
+</span>    <a href="slab.c.html#LN475"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN113"><span class='Ref_to_Macro'>SlabChunkIndex</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN477"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* add chunk to freelist, and update block nfree count */ 
+</span>    <span class='Operator'>*</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN473"><span class='Ref_to_Parameter'>pointer</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN475"><span class='Ref_To_Local'>idx</span></a><span class='Delimiter'>; 
+</span>    <a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>&LT;= </span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="../../../include/pg_config_manual.h.html#LN266"><span class='Ref_to_Const'>CLOBBER_FREED_MEMORY</span></a> 
+    <span class='Comment_Multi_Line'>/* XXX don't wipe the int32 index, used for block-level freelist */ 
+</span>    <a href="../../../include/utils/memdebug.h.html#LN37"><span class='Ref_to_Func'>wipe_mem</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN473"><span class='Ref_to_Parameter'>pointer</span></a> <span class='Operator'>+ </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a> <span class='Operator'>- </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Comment_Multi_Line'>/* remove the block from a freelist */ 
+</span>    <a href="../../../include/lib/ilist.h.html#LN356"><span class='Ref_to_Func'>dlist_delete</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN86"><span class='Ref_to_Member'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * See if we need to update the minFreeChunks field for the slab - we only 
+     * need to do that if there the block had that number of free chunks 
+     * before we freed one. In that case, we check if there still are blocks 
+     * in the original freelist and we either keep the current value (if there 
+     * still are blocks) or increment it by one (the new block is still the 
+     * one with minimum free chunks). 
+     * 
+     * The one exception is when the block will get completely free - in that 
+     * case we will free it, se we can't use it for minFreeChunks. It however 
+     * means there are no more blocks with free chunks. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>== </span><span class='Parentheses'>(</span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Have we removed the last chunk from the freelist? */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/lib/ilist.h.html#LN287"><span class='Ref_to_Func'>dlist_is_empty</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a><span class='Delimiter'>]</span><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* but if we made the block entirely free, we'll free it */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>== </span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>) 
+</span>                <a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN70"><span class='Ref_to_Member'>minFreeChunks</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* If the block is now completely empty, free it. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>== </span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/snowball/header.h.html#LN64"><span class='Ref_to_Macro'>free</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN71"><span class='Ref_to_Member'>nblocks</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <a href="../../../include/lib/ilist.h.html#LN298"><span class='Ref_to_Func'>dlist_push_head</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Delimiter'>], </span><span class='Operator'>&</span><a href="slab.c.html#LN478"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN86"><span class='Ref_to_Member'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN476"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN71"><span class='Ref_to_Member'>nblocks</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SlabFree &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SlabRealloc 
+ *      Change the allocated size of a chunk. 
+ * 
+ * As Slab is designed for allocating equally-sized chunks of memory, it can't 
+ * do an actual chunk size change.  We try to be gentle and allow calls with 
+ * exactly the same size, as in that case we can simply return the same 
+ * chunk.  When the size differs, we throw an error. 
+ * 
+ * We could also allow requests with size &LT; chunkSize.  That however seems 
+ * rather pointless - Slab is meant for chunks of constant size, and moreover 
+ * realloc is usually used to enlarge the chunk. 
+ */ 
+</span><span class='Keyword'>static void </span><span class='Operator'>* 
+</span><a name="LN561"></a><span class='Declare_Function'>SlabRealloc</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>pointer</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Declare_Parameter'>size</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN563"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN575"><span class='Ref_to_Macro'>castNode</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN561"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN563"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* can't do actual realloc with slab, but let's try to be gentle */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN561"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>== </span><a href="slab.c.html#LN563"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="slab.c.html#LN561"><span class='Ref_to_Parameter'>pointer</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"slab allocator does not support realloc()"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>;</span>                <span class='Comment_Single_Line'>/* keep compiler quiet */ 
+</span><span class='Delimiter'>} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * SlabGetChunkSpace 
+ *      Given a currently-allocated chunk, determine the total space 
+ *      it occupies (including all memory-allocation overhead). 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN581"></a><span class='Declare_Function'>SlabGetChunkSpace</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>pointer</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN583"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN575"><span class='Ref_to_Macro'>castNode</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN581"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN583"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="slab.c.html#LN583"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN67"><span class='Ref_to_Member'>fullChunkSize</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * SlabIsEmpty 
+ *      Is an Slab empty of any allocated space? 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN595"></a><span class='Declare_Function'>SlabIsEmpty</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN597"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN575"><span class='Ref_to_Macro'>castNode</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN595"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN597"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN597"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN71"><span class='Ref_to_Member'>nblocks</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * SlabStats 
+ *      Compute stats about memory consumption of an Slab. 
+ * 
+ * level: recursion level (0 at top level); used for print indentation. 
+ * print: true to print stats to stderr. 
+ * totals: if not NULL, add stats about this Slab into *totals. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN613"></a><span class='Declare_Function'>SlabStats</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>level</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>print</span><span class='Delimiter'>, 
+</span><a name="LN614"></a>          <a href="../../../include/nodes/memnodes.h.html#LN28"><span class='Ref_to_Struct'>MemoryContextCounters</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>totals</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN616"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN575"><span class='Ref_to_Macro'>castNode</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN613"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN617"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>nblocks</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN618"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>freechunks</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN619"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>totalspace</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN620"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>freespace</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN621"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN616"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN621"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="slab.c.html#LN621"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="slab.c.html#LN616"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>; </span><a href="slab.c.html#LN621"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN627"></a>        <a href="../../../include/lib/ilist.h.html#LN158"><span class='Ref_to_Struct'>dlist_iter</span></a>  <span class='Declare_Local'>iter</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/lib/ilist.h.html#LN506"><span class='Ref_to_Macro'>dlist_foreach</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN627"><span class='Ref_To_Local'>iter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="slab.c.html#LN616"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN621"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN631"></a>            <a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>block</span> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN476"><span class='Ref_to_Macro'>dlist_container</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN627"><span class='Ref_To_Local'>iter</span></a><span class='Operator'>.</span><a href="../../../include/lib/ilist.h.html#LN160"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="slab.c.html#LN617"><span class='Ref_To_Local'>nblocks</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <a href="slab.c.html#LN619"><span class='Ref_To_Local'>totalspace</span></a> <span class='Operator'>+= </span><a href="slab.c.html#LN616"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN68"><span class='Ref_to_Member'>blockSize</span></a><span class='Delimiter'>; 
+</span>            <a href="slab.c.html#LN620"><span class='Ref_To_Local'>freespace</span></a> <span class='Operator'>+= </span><a href="slab.c.html#LN616"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN67"><span class='Ref_to_Member'>fullChunkSize</span></a> <span class='Operator'>* </span><a href="slab.c.html#LN631"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Delimiter'>; 
+</span>            <a href="slab.c.html#LN618"><span class='Ref_To_Local'>freechunks</span></a> <span class='Operator'>+= </span><a href="slab.c.html#LN631"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN613"><span class='Ref_to_Parameter'>print</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN621"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="slab.c.html#LN621"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="slab.c.html#LN613"><span class='Ref_to_Parameter'>level</span></a><span class='Delimiter'>; </span><a href="slab.c.html#LN621"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>            <a href="../../../../contrib/seg/segscan.l.html#LN10"><span class='Ref_to_Macro'>fprintf</span></a><span class='Parentheses'>(</span>stderr<span class='Delimiter'>, </span><span class='String'>"  "</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../../contrib/seg/segscan.l.html#LN10"><span class='Ref_to_Macro'>fprintf</span></a><span class='Parentheses'>(</span>stderr<span class='Delimiter'>, 
+</span>                <span class='String'>"Slab: %s: %zu total in %zd blocks; %zu free (%zd chunks); %zu used\n"</span><span class='Delimiter'>, 
+</span>                <a href="slab.c.html#LN616"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN64"><span class='Ref_to_Member'>header</span></a><span class='Operator'>.</span><a href="../../../include/nodes/memnodes.h.html#LN83"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN619"><span class='Ref_To_Local'>totalspace</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN617"><span class='Ref_To_Local'>nblocks</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN620"><span class='Ref_To_Local'>freespace</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN618"><span class='Ref_To_Local'>freechunks</span></a><span class='Delimiter'>, 
+</span>                <a href="slab.c.html#LN619"><span class='Ref_To_Local'>totalspace</span></a> <span class='Operator'>- </span><a href="slab.c.html#LN620"><span class='Ref_To_Local'>freespace</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN614"><span class='Ref_to_Parameter'>totals</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="slab.c.html#LN614"><span class='Ref_to_Parameter'>totals</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/memnodes.h.html#LN30"><span class='Ref_to_Member'>nblocks</span></a> <span class='Operator'>+= </span><a href="slab.c.html#LN617"><span class='Ref_To_Local'>nblocks</span></a><span class='Delimiter'>; 
+</span>        <a href="slab.c.html#LN614"><span class='Ref_to_Parameter'>totals</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/memnodes.h.html#LN31"><span class='Ref_to_Member'>freechunks</span></a> <span class='Operator'>+= </span><a href="slab.c.html#LN618"><span class='Ref_To_Local'>freechunks</span></a><span class='Delimiter'>; 
+</span>        <a href="slab.c.html#LN614"><span class='Ref_to_Parameter'>totals</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/memnodes.h.html#LN32"><span class='Ref_to_Member'>totalspace</span></a> <span class='Operator'>+= </span><a href="slab.c.html#LN619"><span class='Ref_To_Local'>totalspace</span></a><span class='Delimiter'>; 
+</span>        <a href="slab.c.html#LN614"><span class='Ref_to_Parameter'>totals</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/memnodes.h.html#LN33"><span class='Ref_to_Member'>freespace</span></a> <span class='Operator'>+= </span><a href="slab.c.html#LN620"><span class='Ref_To_Local'>freespace</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end SlabStats &raquo; </span> 
+ 
+ 
+<span class='Directive'>#ifdef</span> <a href="../../../include/pg_config_manual.h.html#LN275"><span class='Ref_to_Const'>MEMORY_CONTEXT_CHECKING</span></a> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SlabCheck 
+ *      Walk through chunks and check consistency of memory. 
+ * 
+ * NOTE: report errors as WARNING, *not* ERROR or FATAL.  Otherwise you'll 
+ * find yourself in an infinite loop when trouble occurs, because this 
+ * routine will be entered again when elog cleanup tries to release memory! 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN671"></a><span class='Declare_Function'>SlabCheck</span><span class='Parentheses'>(</span><a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Parameter'>context</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN673"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN674"></a>    <a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slab</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN575"><span class='Ref_to_Macro'>castNode</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN62"><span class='Ref_to_Struct'>SlabContext</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN671"><span class='Ref_to_Parameter'>context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN675"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>name</span> <span class='Operator'>= </span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN64"><span class='Ref_to_Member'>header</span></a><span class='Operator'>.</span><a href="../../../include/nodes/memnodes.h.html#LN83"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>; 
+</span><a name="LN676"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>freechunks</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* bitmap of free chunks on a block */ 
+</span>    <a href="slab.c.html#LN676"><span class='Ref_To_Local'>freechunks</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>bool</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* walk all the freelists */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN673"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="slab.c.html#LN673"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>; </span><a href="slab.c.html#LN673"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN687"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>j</span><span class='Delimiter'>, 
+</span><a name="LN688"></a>                    <span class='Declare_Local'>nfree</span><span class='Delimiter'>; 
+</span><a name="LN689"></a>        <a href="../../../include/lib/ilist.h.html#LN158"><span class='Ref_to_Struct'>dlist_iter</span></a>  <span class='Declare_Local'>iter</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* walk all blocks on this freelist */ 
+</span>        <a href="../../../include/lib/ilist.h.html#LN506"><span class='Ref_to_Macro'>dlist_foreach</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN689"><span class='Ref_To_Local'>iter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN73"><span class='Ref_to_Member'>freelist</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN673"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN694"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>idx</span><span class='Delimiter'>; 
+</span><a name="LN695"></a>            <a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>block</span> <span class='Operator'>= </span><a href="../../../include/lib/ilist.h.html#LN476"><span class='Ref_to_Macro'>dlist_container</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN84"><span class='Ref_to_Struct'>SlabBlock</span></a><span class='Delimiter'>, </span><a href="../../replication/repl_gram.y.html#LN52"><span class='Ref_to_Global_Var'>node</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN689"><span class='Ref_To_Local'>iter</span></a><span class='Operator'>.</span><a href="../../../include/lib/ilist.h.html#LN160"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Make sure the number of free chunks (in the block header) 
+             * matches position in the freelist. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a> <span class='Operator'>!= </span><a href="slab.c.html#LN673"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><span class='String'>"problem in slab %s: number of free chunks %d in block %p does not match freelist %d"</span><span class='Delimiter'>, 
+</span>                     <a href="slab.c.html#LN675"><span class='Ref_To_Local'>name</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN673"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* reset the bitmap of free chunks for this block */ 
+</span>            memset<span class='Parentheses'>(</span><a href="slab.c.html#LN676"><span class='Ref_To_Local'>freechunks</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>bool</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <a href="slab.c.html#LN694"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN88"><span class='Ref_to_Member'>firstFreeChunk</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Now walk through the chunks, count the free ones and also 
+             * perform some additional checks for the used ones. As the chunk 
+             * freelist is stored within the chunks themselves, we have to 
+             * walk through the chunks and construct our own bitmap. 
+             */ 
+</span> 
+            <a href="slab.c.html#LN688"><span class='Ref_To_Local'>nfree</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN694"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>&LT; </span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN719"></a>                <a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>chunk</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* count the chunk as free, add it to the bitmap */ 
+</span>                <a href="slab.c.html#LN688"><span class='Ref_To_Local'>nfree</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                <a href="slab.c.html#LN676"><span class='Ref_To_Local'>freechunks</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN694"><span class='Ref_To_Local'>idx</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* read index of the next free chunk */ 
+</span>                <a href="slab.c.html#LN719"><span class='Ref_To_Local'>chunk</span></a> <span class='Operator'>= </span><a href="slab.c.html#LN108"><span class='Ref_to_Macro'>SlabBlockGetChunk</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN694"><span class='Ref_To_Local'>idx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/utils/memdebug.h.html#LN25"><span class='Ref_to_Macro'>VALGRIND_MAKE_MEM_DEFINED</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN106"><span class='Ref_to_Macro'>SlabChunkGetPointer</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN719"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>                <a href="slab.c.html#LN694"><span class='Ref_To_Local'>idx</span></a> <span class='Operator'>= *</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="slab.c.html#LN106"><span class='Ref_to_Macro'>SlabChunkGetPointer</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN719"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN687"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="slab.c.html#LN687"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>&LT; </span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN69"><span class='Ref_to_Member'>chunksPerBlock</span></a><span class='Delimiter'>; </span><a href="slab.c.html#LN687"><span class='Ref_To_Local'>j</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* non-zero bit in the bitmap means chunk the chunk is used */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="slab.c.html#LN676"><span class='Ref_To_Local'>freechunks</span></a><span class='Delimiter'>[</span><a href="slab.c.html#LN687"><span class='Ref_To_Local'>j</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span><a name="LN736"></a>                    <a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>chunk</span> <span class='Operator'>= </span><a href="slab.c.html#LN108"><span class='Ref_to_Macro'>SlabBlockGetChunk</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN687"><span class='Ref_To_Local'>j</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                    <span class='Comment_Multi_Line'>/* chunks have both block and slab pointers, so check both */ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN736"><span class='Ref_To_Local'>chunk</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN98"><span class='Ref_to_Member'>block</span></a> <span class='Operator'>!= </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Parentheses'>) 
+</span>                        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><span class='String'>"problem in slab %s: bogus block link in block %p, chunk %p"</span><span class='Delimiter'>, 
+</span>                             <a href="slab.c.html#LN675"><span class='Ref_To_Local'>name</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN736"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN736"><span class='Ref_To_Local'>chunk</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN99"><span class='Ref_to_Member'>slab</span></a> <span class='Operator'>!= </span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Parentheses'>) 
+</span>                        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><span class='String'>"problem in slab %s: bogus slab link in block %p, chunk %p"</span><span class='Delimiter'>, 
+</span>                             <a href="slab.c.html#LN675"><span class='Ref_To_Local'>name</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN736"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                    <span class='Comment_Multi_Line'>/* there might be sentinel (thanks to alignment) */ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a> <span class='Operator'>&LT; </span><span class='Parentheses'>(</span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN67"><span class='Ref_to_Member'>fullChunkSize</span></a> <span class='Operator'>- </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="slab.c.html#LN95"><span class='Ref_to_Struct'>SlabChunk</span></a><span class='Parentheses'>)))</span> 
+                        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/utils/memdebug.h.html#LN59"><span class='Ref_to_Func'>sentinel_ok</span></a><span class='Parentheses'>(</span><a href="slab.c.html#LN736"><span class='Ref_To_Local'>chunk</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN674"><span class='Ref_To_Local'>slab</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN66"><span class='Ref_to_Member'>chunkSize</span></a><span class='Parentheses'>))</span> 
+                            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><span class='String'>"problem in slab %s: detected write past chunk end in block %p, chunk %p"</span><span class='Delimiter'>, 
+</span>                                 <a href="slab.c.html#LN675"><span class='Ref_To_Local'>name</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN736"><span class='Ref_To_Local'>chunk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for j=0;j&LT;slab-&GT;chunksPer... &raquo; </span> 
+ 
+            <span class='Comment_Multi_Line'>/* 
+             * Make sure we got the expected number of free chunks (as tracked 
+             * in the block header). 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="slab.c.html#LN688"><span class='Ref_To_Local'>nfree</span></a> <span class='Operator'>!= </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Parentheses'>) 
+</span>                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><span class='String'>"problem in slab %s: number of free chunks %d in block %p does not match bitmap %d"</span><span class='Delimiter'>, 
+</span>                     <a href="slab.c.html#LN675"><span class='Ref_To_Local'>name</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Operator'>-&GT;</span><a href="slab.c.html#LN87"><span class='Ref_to_Member'>nfree</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN695"><span class='Ref_To_Local'>block</span></a><span class='Delimiter'>, </span><a href="slab.c.html#LN688"><span class='Ref_To_Local'>nfree</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;=slab-&GT;chunksPe... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end SlabCheck &raquo; </span> 
+ 
+<span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* MEMORY_CONTEXT_CHECKING */ 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

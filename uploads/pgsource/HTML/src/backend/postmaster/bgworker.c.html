@@ -1,0 +1,1262 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\postmaster\bgworker.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\postmaster\bgworker.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:45 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*-------------------------------------------------------------------- 
+ * bgworker.c 
+ *      POSTGRES pluggable background workers implementation 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/postmaster/bgworker.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"libpq/pqsignal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/parallel.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"port/atomics.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/bgworker_internals.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/postmaster.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/logicallauncher.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/logicalworker.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/dsm.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/latch.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/pg_shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/pmsignal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/procsignal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"tcop/tcopprot.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/ascii.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/ps_status.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/timeout.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The postmaster's list of registered background workers, in private memory. 
+ */ 
+</span><a name="LN42"></a><a href="../../include/lib/ilist.h.html#LN202"><span class='Ref_to_Struct'>slist_head</span></a>  <span class='Declare_Var'>BackgroundWorkerList</span> <span class='Operator'>= </span><a href="../../include/lib/ilist.h.html#LN248"><span class='Ref_to_Macro'>SLIST_STATIC_INIT</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN42"><span class='Ref_to_Global_Var'>BackgroundWorkerList</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * BackgroundWorkerSlots exist in shared memory and can be accessed (via 
+ * the BackgroundWorkerArray) by both the postmaster and by regular backends. 
+ * However, the postmaster cannot take locks, even spinlocks, because this 
+ * might allow it to crash or become wedged if shared memory gets corrupted. 
+ * Such an outcome is intolerable.  Therefore, we need a lockless protocol 
+ * for coordinating access to this data. 
+ * 
+ * The 'in_use' flag is used to hand off responsibility for the slot between 
+ * the postmaster and the rest of the system.  When 'in_use' is false, 
+ * the postmaster will ignore the slot entirely, except for the 'in_use' flag 
+ * itself, which it may read.  In this state, regular backends may modify the 
+ * slot.  Once a backend sets 'in_use' to true, the slot becomes the 
+ * responsibility of the postmaster.  Regular backends may no longer modify it, 
+ * but the postmaster may examine it.  Thus, a backend initializing a slot 
+ * must fully initialize the slot - and insert a write memory barrier - before 
+ * marking it as in use. 
+ * 
+ * As an exception, however, even when the slot is in use, regular backends 
+ * may set the 'terminate' flag for a slot, telling the postmaster not 
+ * to restart it.  Once the background worker is no longer running, the slot 
+ * will be released for reuse. 
+ * 
+ * In addition to coordinating with the postmaster, backends modifying this 
+ * data structure must coordinate with each other.  Since they can take locks, 
+ * this is straightforward: any backend wishing to manipulate a slot must 
+ * take BackgroundWorkerLock in exclusive mode.  Backends wishing to read 
+ * data that might get concurrently modified by other backends should take 
+ * this lock in shared mode.  No matter what, backends reading this data 
+ * structure must be able to tolerate concurrent modifications by the 
+ * postmaster. 
+ */ 
+</span><a name="LN76"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>BackgroundWorkerSlot</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN78"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>in_use</span><span class='Delimiter'>; 
+</span><a name="LN79"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>terminate</span><span class='Delimiter'>; 
+</span><a name="LN80"></a>    <a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Member'>pid</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* InvalidPid = not started yet; 0 = dead */ 
+</span><a name="LN81"></a>    <a href="../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Member'>generation</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* incremented when slot is recycled */ 
+</span><a name="LN82"></a>    <a href="../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Declare_Member'>worker</span><span class='Delimiter'>; 
+</span><a name="LN83"></a>} <span class='Declare_Typedef'>BackgroundWorkerSlot</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * In order to limit the total number of parallel workers (according to 
+ * max_parallel_workers GUC), we maintain the number of active parallel 
+ * workers.  Since the postmaster cannot take locks, two variables are used for 
+ * this purpose: the number of registered parallel workers (modified by the 
+ * backends, protected by BackgroundWorkerLock) and the number of terminated 
+ * parallel workers (modified only by the postmaster, lockless).  The active 
+ * number of parallel workers is the number of registered workers minus the 
+ * terminated ones.  These counters can of course overflow, but it's not 
+ * important here since the subtraction will still give the right number. 
+ */ 
+</span><a name="LN96"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>BackgroundWorkerArray</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN98"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>total_slots</span><span class='Delimiter'>; 
+</span><a name="LN99"></a>    <a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>parallel_register_count</span><span class='Delimiter'>; 
+</span><a name="LN100"></a>    <a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>parallel_terminate_count</span><span class='Delimiter'>; 
+</span><a name="LN101"></a>    <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Declare_Member'>slot</span><span class='Delimiter'>[</span>FLEXIBLE_ARRAY_MEMBER<span class='Delimiter'>]; 
+</span><a name="LN102"></a>} <span class='Declare_Typedef'>BackgroundWorkerArray</span><span class='Delimiter'>; 
+</span> 
+<a name="LN104"></a><span class='Control'>struct</span> <span class='Declare_Struct'>BackgroundWorkerHandle</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN106"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>slot</span><span class='Delimiter'>; 
+</span><a name="LN107"></a>    <a href="../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Member'>generation</span><span class='Delimiter'>; 
+}; 
+</span> 
+<a name="LN110"></a><span class='Keyword'>static </span><a href="bgworker.c.html#LN96"><span class='Ref_to_Struct'>BackgroundWorkerArray</span></a> <span class='Operator'>*</span><span class='Declare_Var'>BackgroundWorkerData</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * List of internal background worker entry points.  We need this for 
+ * reasons explained in LookupBackgroundWorkerFunction(), below. 
+ */ 
+</span><span class='Keyword'>static const </span><span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN118"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Member'>fn_name</span><span class='Delimiter'>; 
+</span><a name="LN119"></a>    <a href="../../include/postmaster/bgworker.h.html#LN70"><span class='Ref_to_Typedef'>bgworker_main_type</span></a> <span class='Declare_Member'>fn_addr</span><span class='Delimiter'>; 
+</span><a name="LN120"></a>}   <span class='Declare_Var'>InternalBGWorkers</span><span class='Delimiter'>[] </span><span class='Operator'>= 
+</span> 
+<span class='Delimiter'>{ 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='String'>"ParallelWorkerMain"</span><span class='Delimiter'>, </span><a href="../../include/access/parallel.h.html#LN67"><span class='Ref_to_Proto'>ParallelWorkerMain</span></a> 
+    <span class='Delimiter'>}, 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='String'>"ApplyLauncherMain"</span><span class='Delimiter'>, </span><a href="../../include/replication/logicallauncher.h.html#LN18"><span class='Ref_to_Proto'>ApplyLauncherMain</span></a> 
+    <span class='Delimiter'>}, 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='String'>"ApplyWorkerMain"</span><span class='Delimiter'>, </span><a href="../../include/replication/logicalworker.h.html#LN14"><span class='Ref_to_Proto'>ApplyWorkerMain</span></a> 
+    <span class='Delimiter'>} 
+}; 
+</span> 
+<span class='Comment_Multi_Line'>/* Private functions. */ 
+</span><a name="LN135"></a><span class='Keyword'>static </span><a href="../../include/postmaster/bgworker.h.html#LN70"><span class='Ref_to_Typedef'>bgworker_main_type</span></a> <span class='Declare_Prototype'>LookupBackgroundWorkerFunction</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>libraryname</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>funcname</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Calculate shared memory needed. 
+ */ 
+</span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN142"></a><span class='Declare_Function'>BackgroundWorkerShmemSize</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN144"></a>    <a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>size</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Array of workers is variably sized. */ 
+</span>    <a href="bgworker.c.html#LN144"><span class='Ref_To_Local'>size</span></a> <span class='Operator'>= </span><a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN96"><span class='Ref_to_Struct'>BackgroundWorkerArray</span></a><span class='Delimiter'>, </span>slot<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN144"><span class='Ref_To_Local'>size</span></a> <span class='Operator'>= </span><a href="../../include/storage/shmem.h.html#LN44"><span class='Ref_to_Proto'>add_size</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN144"><span class='Ref_To_Local'>size</span></a><span class='Delimiter'>, </span><a href="../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Delimiter'>, 
+</span>                                   <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="bgworker.c.html#LN144"><span class='Ref_To_Local'>size</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize shared memory. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN158"></a><span class='Declare_Function'>BackgroundWorkerShmemInit</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN160"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+    <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a> <span class='Operator'>= </span><a href="../../include/storage/shmem.h.html#LN43"><span class='Ref_to_Proto'>ShmemInitStruct</span></a><span class='Parentheses'>(</span><span class='String'>"Background Worker Data"</span><span class='Delimiter'>, 
+</span>                                           <a href="../../include/postmaster/bgworker_internals.h.html#LN46"><span class='Ref_to_Proto'>BackgroundWorkerShmemSize</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                                           <span class='Operator'>&</span><a href="bgworker.c.html#LN160"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN167"></a>        <a href="../../include/lib/ilist.h.html#LN223"><span class='Ref_to_Struct'>slist_iter</span></a>  <span class='Declare_Local'>siter</span><span class='Delimiter'>; 
+</span><a name="LN168"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN98"><span class='Ref_to_Member'>total_slots</span></a> <span class='Operator'>= </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN99"><span class='Ref_to_Member'>parallel_register_count</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN100"><span class='Ref_to_Member'>parallel_terminate_count</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Copy contents of worker list into shared memory.  Record the shared 
+         * memory slot assigned to each worker.  This ensures a 1-to-1 
+         * correspondence between the postmaster's private list and the array 
+         * in shared memory. 
+         */ 
+</span>        <a href="../../include/lib/ilist.h.html#LN699"><span class='Ref_to_Macro'>slist_foreach</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN167"><span class='Ref_To_Local'>siter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN42"><span class='Ref_to_Global_Var'>BackgroundWorkerList</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN182"></a>            <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN168"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]; 
+</span><a name="LN183"></a>            <a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rw</span><span class='Delimiter'>; 
+</span> 
+            <a href="bgworker.c.html#LN183"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>= </span><a href="../../include/lib/ilist.h.html#LN673"><span class='Ref_to_Macro'>slist_container</span></a><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a><span class='Delimiter'>, </span>rw_lnode<span class='Delimiter'>, </span><a href="bgworker.c.html#LN167"><span class='Ref_To_Local'>siter</span></a><span class='Operator'>.</span><a href="../../include/lib/ilist.h.html#LN225"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN168"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>&LT; </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN182"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN78"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN182"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN79"><span class='Ref_to_Member'>terminate</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN182"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN80"><span class='Ref_to_Member'>pid</span></a> <span class='Operator'>= </span><a href="../../include/miscadmin.h.html#LN32"><span class='Ref_to_Const'>InvalidPid</span></a><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN182"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN81"><span class='Ref_to_Member'>generation</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN183"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN39"><span class='Ref_to_Member'>rw_shmem_slot</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN168"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN183"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* might be reinit after crash */ 
+</span>            memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="bgworker.c.html#LN182"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN183"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Operator'>++</span><a href="bgworker.c.html#LN168"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Mark any remaining slots as not in use. 
+         */ 
+</span>        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN168"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>&LT; </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN202"></a>            <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN168"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]; 
+</span> 
+            <a href="bgworker.c.html#LN202"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN78"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <span class='Operator'>++</span><a href="bgworker.c.html#LN168"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !IsUnderPostmaster &raquo; </span> 
+    <span class='Control'>else</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN160"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end BackgroundWorkerShmemInit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Search the postmaster's backend-private list of RegisteredBgWorker objects 
+ * for the one that maps to the given slot number. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>* 
+</span><a name="LN217"></a><span class='Declare_Function'>FindRegisteredWorkerBySlotNumber</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>slotno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN219"></a>    <a href="../../include/lib/ilist.h.html#LN223"><span class='Ref_to_Struct'>slist_iter</span></a>  <span class='Declare_Local'>siter</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/lib/ilist.h.html#LN699"><span class='Ref_to_Macro'>slist_foreach</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN219"><span class='Ref_To_Local'>siter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN42"><span class='Ref_to_Global_Var'>BackgroundWorkerList</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN223"></a>        <a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rw</span><span class='Delimiter'>; 
+</span> 
+        <a href="bgworker.c.html#LN223"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>= </span><a href="../../include/lib/ilist.h.html#LN673"><span class='Ref_to_Macro'>slist_container</span></a><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a><span class='Delimiter'>, </span>rw_lnode<span class='Delimiter'>, </span><a href="bgworker.c.html#LN219"><span class='Ref_To_Local'>siter</span></a><span class='Operator'>.</span><a href="../../include/lib/ilist.h.html#LN225"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN223"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN39"><span class='Ref_to_Member'>rw_shmem_slot</span></a> <span class='Operator'>== </span><a href="bgworker.c.html#LN217"><span class='Ref_to_Parameter'>slotno</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <a href="bgworker.c.html#LN223"><span class='Ref_To_Local'>rw</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Notice changes to shared memory made by other backends.  This code 
+ * runs in the postmaster, so we must be very careful not to assume that 
+ * shared memory contents are sane.  Otherwise, a rogue backend could take 
+ * out the postmaster. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN240"></a><span class='Declare_Function'>BackgroundWorkerStateChange</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN242"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The total number of slots stored in shared memory should match our 
+     * notion of max_worker_processes.  If it does not, something is very 
+     * wrong.  Further down, we always refer to this value as 
+     * max_worker_processes, in case shared memory gets corrupted while we're 
+     * looping. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a> <span class='Operator'>!= </span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN98"><span class='Ref_to_Member'>total_slots</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>             <span class='String'>"inconsistent background worker state (max_worker_processes=%d, total_slots=%d"</span><span class='Delimiter'>, 
+</span>             <a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Delimiter'>, 
+</span>             <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN98"><span class='Ref_to_Member'>total_slots</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Iterate through slots, looking for newly-registered workers or workers 
+     * who must die. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN242"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="bgworker.c.html#LN242"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>&LT; </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="bgworker.c.html#LN242"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN266"></a>        <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN242"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]; 
+</span><a name="LN267"></a>        <a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rw</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN78"><span class='Ref_to_Member'>in_use</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Make sure we don't see the in_use flag before the updated slot 
+         * contents. 
+         */ 
+</span>        <a href="../../include/port/atomics.h.html#LN160"><span class='Ref_to_Macro'>pg_read_barrier</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* See whether we already know about this worker. */ 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN216"><span class='Ref_to_Func'>FindRegisteredWorkerBySlotNumber</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN242"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * In general, the worker data can't change after it's initially 
+             * registered.  However, someone can set the terminate flag. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN79"><span class='Ref_to_Member'>terminate</span></a> <span class='Operator'>&& !</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN40"><span class='Ref_to_Member'>rw_terminate</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN40"><span class='Ref_to_Member'>rw_terminate</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN36"><span class='Ref_to_Member'>rw_pid</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                    <a href="../../include/port.h.html#LN210"><span class='Ref_to_Macro'>kill</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN36"><span class='Ref_to_Member'>rw_pid</span></a><span class='Delimiter'>, </span>SIGTERM<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>else</span> 
+                <span class='Delimiter'>{ 
+</span>                    <span class='Comment_Multi_Line'>/* Report never-started, now-terminated worker as dead. */ 
+</span>                    <a href="../../include/postmaster/bgworker_internals.h.html#LN50"><span class='Ref_to_Proto'>ReportBackgroundWorkerPID</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If the worker is marked for termination, we don't need to add it to 
+         * the registered workers list; we can just free the slot. However, if 
+         * bgw_notify_pid is set, the process that registered the worker may 
+         * need to know that we've processed the terminate request, so be sure 
+         * to signal it. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN79"><span class='Ref_to_Member'>terminate</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN309"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>notify_pid</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * We need a memory barrier here to make sure that the load of 
+             * bgw_notify_pid and the update of parallel_terminate_count 
+             * complete before the store to in_use. 
+             */ 
+</span>            <a href="bgworker.c.html#LN309"><span class='Ref_To_Local'>notify_pid</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN66"><span class='Ref_to_Const'>BGWORKER_CLASS_PARALLEL</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+                <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN100"><span class='Ref_to_Member'>parallel_terminate_count</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <a href="../../include/port/atomics.h.html#LN147"><span class='Ref_to_Macro'>pg_memory_barrier</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN80"><span class='Ref_to_Member'>pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN78"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN309"><span class='Ref_To_Local'>notify_pid</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <a href="../../include/port.h.html#LN210"><span class='Ref_to_Macro'>kill</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN309"><span class='Ref_To_Local'>notify_pid</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN201"><span class='Ref_to_Const'>SIGUSR1</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if slot-&GT;terminate &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* 
+         * Copy the registration data into the registered workers list. 
+         */ 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>= </span><a href="../../include/snowball/header.h.html#LN49"><span class='Ref_to_Macro'>malloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OUT_OF_MEMORY<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"out of memory"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Copy strings in a paranoid way.  If shared memory is corrupted, the 
+         * source data might not even be NUL-terminated. 
+         */ 
+</span>        <a href="../../include/utils/ascii.h.html#LN13"><span class='Ref_to_Proto'>ascii_safe_strlcpy</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Delimiter'>, 
+</span>                           <a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Delimiter'>, </span><a href="../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/ascii.h.html#LN13"><span class='Ref_to_Proto'>ascii_safe_strlcpy</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN93"><span class='Ref_to_Member'>bgw_library_name</span></a><span class='Delimiter'>, 
+</span>                           <a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN93"><span class='Ref_to_Member'>bgw_library_name</span></a><span class='Delimiter'>, </span><a href="../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/ascii.h.html#LN13"><span class='Ref_to_Proto'>ascii_safe_strlcpy</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN94"><span class='Ref_to_Member'>bgw_function_name</span></a><span class='Delimiter'>, 
+</span>                           <a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN94"><span class='Ref_to_Member'>bgw_function_name</span></a><span class='Delimiter'>, </span><a href="../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Copy various fixed-size fields. 
+         * 
+         * flags, start_time, and restart_time are examined by the postmaster, 
+         * but nothing too bad will happen if they are corrupted.  The 
+         * remaining fields will only be examined by the child process.  It 
+         * might crash, but we won't. 
+         */ 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN91"><span class='Ref_to_Member'>bgw_start_time</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN91"><span class='Ref_to_Member'>bgw_start_time</span></a><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN95"><span class='Ref_to_Member'>bgw_main_arg</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN95"><span class='Ref_to_Member'>bgw_main_arg</span></a><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN96"><span class='Ref_to_Member'>bgw_extra</span></a><span class='Delimiter'>, </span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN96"><span class='Ref_to_Member'>bgw_extra</span></a><span class='Delimiter'>, </span><a href="../../include/postmaster/bgworker.h.html#LN85"><span class='Ref_to_Const'>BGW_EXTRALEN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Copy the PID to be notified about state changes, but only if the 
+         * postmaster knows about a backend with that PID.  It isn't an error 
+         * if the postmaster doesn't know about the PID, because the backend 
+         * that requested the worker could have died (or been killed) just 
+         * after doing so.  Nonetheless, at least until we get some experience 
+         * with how this plays out in the wild, log a message at a relative 
+         * high debug level. 
+         */ 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN266"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/postmaster/postmaster.h.html#LN54"><span class='Ref_to_Proto'>PostmasterMarkPIDForWorkerNotify</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><span class='String'>"worker notification PID %lu is not valid"</span><span class='Delimiter'>, 
+</span>                 <span class='Parentheses'>(</span><span class='Keyword'>long</span><span class='Parentheses'>) </span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Initialize postmaster bookkeeping. */ 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN35"><span class='Ref_to_Member'>rw_backend</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN36"><span class='Ref_to_Member'>rw_pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN37"><span class='Ref_to_Member'>rw_child_slot</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN38"><span class='Ref_to_Member'>rw_crashed_at</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN39"><span class='Ref_to_Member'>rw_shmem_slot</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN242"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN40"><span class='Ref_to_Member'>rw_terminate</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Log it! */ 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"registering background worker \"%s\""</span><span class='Delimiter'>, 
+</span>                        <a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/lib/ilist.h.html#LN572"><span class='Ref_to_Func'>slist_push_head</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="bgworker.c.html#LN42"><span class='Ref_to_Global_Var'>BackgroundWorkerList</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN267"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN41"><span class='Ref_to_Member'>rw_lnode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for slotno=0;slotno&LT;max_w... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end BackgroundWorkerStateChange &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Forget about a background worker that's no longer needed. 
+ * 
+ * The worker must be identified by passing an slist_mutable_iter that 
+ * points to it.  This convention allows deletion of workers during 
+ * searches of the worker list, and saves having to search the list again. 
+ * 
+ * This function must be invoked only in the postmaster. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN409"></a><span class='Declare_Function'>ForgetBackgroundWorker</span><span class='Parentheses'>(</span><a href="../../include/lib/ilist.h.html#LN238"><span class='Ref_to_Struct'>slist_mutable_iter</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cur</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN411"></a>    <a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rw</span><span class='Delimiter'>; 
+</span><a name="LN412"></a>    <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span> 
+    <a href="bgworker.c.html#LN411"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>= </span><a href="../../include/lib/ilist.h.html#LN673"><span class='Ref_to_Macro'>slist_container</span></a><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a><span class='Delimiter'>, </span>rw_lnode<span class='Delimiter'>, </span><a href="bgworker.c.html#LN409"><span class='Ref_to_Parameter'>cur</span></a><span class='Operator'>-&GT;</span><a href="../../include/lib/ilist.h.html#LN240"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN411"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN39"><span class='Ref_to_Member'>rw_shmem_slot</span></a> <span class='Operator'>&LT; </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN412"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN411"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN39"><span class='Ref_to_Member'>rw_shmem_slot</span></a><span class='Delimiter'>]; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="bgworker.c.html#LN411"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN66"><span class='Ref_to_Const'>BGWORKER_CLASS_PARALLEL</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN100"><span class='Ref_to_Member'>parallel_terminate_count</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <a href="bgworker.c.html#LN412"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN78"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"unregistering background worker \"%s\""</span><span class='Delimiter'>, 
+</span>                    <a href="bgworker.c.html#LN411"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/lib/ilist.h.html#LN650"><span class='Ref_to_Func'>slist_delete_current</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN409"><span class='Ref_to_Parameter'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/snowball/header.h.html#LN64"><span class='Ref_to_Macro'>free</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN411"><span class='Ref_To_Local'>rw</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ForgetBackgroundWorker &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Report the PID of a newly-launched background worker in shared memory. 
+ * 
+ * This function should only be called from the postmaster. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN437"></a><span class='Declare_Function'>ReportBackgroundWorkerPID</span><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>rw</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN439"></a>    <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN437"><span class='Ref_to_Parameter'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN39"><span class='Ref_to_Member'>rw_shmem_slot</span></a> <span class='Operator'>&LT; </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN439"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN437"><span class='Ref_to_Parameter'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN39"><span class='Ref_to_Member'>rw_shmem_slot</span></a><span class='Delimiter'>]; 
+</span>    <a href="bgworker.c.html#LN439"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN80"><span class='Ref_to_Member'>pid</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN437"><span class='Ref_to_Parameter'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN36"><span class='Ref_to_Member'>rw_pid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN437"><span class='Ref_to_Parameter'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../include/port.h.html#LN210"><span class='Ref_to_Macro'>kill</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN437"><span class='Ref_to_Parameter'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN201"><span class='Ref_to_Const'>SIGUSR1</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Report that the PID of a background worker is now zero because a 
+ * previously-running background worker has exited. 
+ * 
+ * This function should only be called from the postmaster. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN456"></a><span class='Declare_Function'>ReportBackgroundWorkerExit</span><span class='Parentheses'>(</span><a href="../../include/lib/ilist.h.html#LN238"><span class='Ref_to_Struct'>slist_mutable_iter</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>cur</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN458"></a>    <a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rw</span><span class='Delimiter'>; 
+</span><a name="LN459"></a>    <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN460"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>notify_pid</span><span class='Delimiter'>; 
+</span> 
+    <a href="bgworker.c.html#LN458"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>= </span><a href="../../include/lib/ilist.h.html#LN673"><span class='Ref_to_Macro'>slist_container</span></a><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a><span class='Delimiter'>, </span>rw_lnode<span class='Delimiter'>, </span><a href="bgworker.c.html#LN456"><span class='Ref_to_Parameter'>cur</span></a><span class='Operator'>-&GT;</span><a href="../../include/lib/ilist.h.html#LN240"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN458"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN39"><span class='Ref_to_Member'>rw_shmem_slot</span></a> <span class='Operator'>&LT; </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN459"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN458"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN39"><span class='Ref_to_Member'>rw_shmem_slot</span></a><span class='Delimiter'>]; 
+</span>    <a href="bgworker.c.html#LN459"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN80"><span class='Ref_to_Member'>pid</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN458"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN36"><span class='Ref_to_Member'>rw_pid</span></a><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN460"><span class='Ref_To_Local'>notify_pid</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN458"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If this worker is slated for deregistration, do that before notifying 
+     * the process which started it.  Otherwise, if that process tries to 
+     * reuse the slot immediately, it might not be available yet.  In theory 
+     * that could happen anyway if the process checks slot-&GT;pid at just the 
+     * wrong moment, but this makes the window narrower. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN458"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN40"><span class='Ref_to_Member'>rw_terminate</span></a> <span class='Operator'>|| 
+</span>        <a href="bgworker.c.html#LN458"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>== </span><a href="../../include/postmaster/bgworker.h.html#LN83"><span class='Ref_to_Const'>BGW_NEVER_RESTART</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/postmaster/bgworker_internals.h.html#LN49"><span class='Ref_to_Proto'>ForgetBackgroundWorker</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN456"><span class='Ref_to_Parameter'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN460"><span class='Ref_To_Local'>notify_pid</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../include/port.h.html#LN210"><span class='Ref_to_Macro'>kill</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN460"><span class='Ref_To_Local'>notify_pid</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN201"><span class='Ref_to_Const'>SIGUSR1</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ReportBackgroundWorkerExit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Cancel SIGUSR1 notifications for a PID belonging to an exiting backend. 
+ * 
+ * This function should only be called from the postmaster. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN490"></a><span class='Declare_Function'>BackgroundWorkerStopNotifications</span><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a> <span class='Declare_Parameter'>pid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN492"></a>    <a href="../../include/lib/ilist.h.html#LN223"><span class='Ref_to_Struct'>slist_iter</span></a>  <span class='Declare_Local'>siter</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/lib/ilist.h.html#LN699"><span class='Ref_to_Macro'>slist_foreach</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN492"><span class='Ref_To_Local'>siter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN42"><span class='Ref_to_Global_Var'>BackgroundWorkerList</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN496"></a>        <a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rw</span><span class='Delimiter'>; 
+</span> 
+        <a href="bgworker.c.html#LN496"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>= </span><a href="../../include/lib/ilist.h.html#LN673"><span class='Ref_to_Macro'>slist_container</span></a><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a><span class='Delimiter'>, </span>rw_lnode<span class='Delimiter'>, </span><a href="bgworker.c.html#LN492"><span class='Ref_To_Local'>siter</span></a><span class='Operator'>.</span><a href="../../include/lib/ilist.h.html#LN225"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN496"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>== </span><a href="bgworker.c.html#LN490"><span class='Ref_to_Parameter'>pid</span></a><span class='Parentheses'>) 
+</span>            <a href="bgworker.c.html#LN496"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Reset background worker crash state. 
+ * 
+ * We assume that, after a crash-and-restart cycle, background workers without 
+ * the never-restart flag should be restarted immediately, instead of waiting 
+ * for bgw_restart_time to elapse. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN512"></a><span class='Declare_Function'>ResetBackgroundWorkerCrashTimes</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN514"></a>    <a href="../../include/lib/ilist.h.html#LN238"><span class='Ref_to_Struct'>slist_mutable_iter</span></a> <span class='Declare_Local'>iter</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/lib/ilist.h.html#LN715"><span class='Ref_to_Macro'>slist_foreach_modify</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN514"><span class='Ref_To_Local'>iter</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN42"><span class='Ref_to_Global_Var'>BackgroundWorkerList</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN518"></a>        <a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rw</span><span class='Delimiter'>; 
+</span> 
+        <a href="bgworker.c.html#LN518"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>= </span><a href="../../include/lib/ilist.h.html#LN673"><span class='Ref_to_Macro'>slist_container</span></a><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a><span class='Delimiter'>, </span>rw_lnode<span class='Delimiter'>, </span><a href="bgworker.c.html#LN514"><span class='Ref_To_Local'>iter</span></a><span class='Operator'>.</span><a href="../../include/lib/ilist.h.html#LN240"><span class='Ref_to_Member'>cur</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN518"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>== </span><a href="../../include/postmaster/bgworker.h.html#LN83"><span class='Ref_to_Const'>BGW_NEVER_RESTART</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * Workers marked BGW_NVER_RESTART shouldn't get relaunched after 
+             * the crash, so forget about them.  (If we wait until after the 
+             * crash to forget about them, and they are parallel workers, 
+             * parallel_terminate_count will get incremented after we've 
+             * already zeroed parallel_register_count, which would be bad.) 
+             */ 
+</span>            <a href="../../include/postmaster/bgworker_internals.h.html#LN49"><span class='Ref_to_Proto'>ForgetBackgroundWorker</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="bgworker.c.html#LN514"><span class='Ref_To_Local'>iter</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * The accounting which we do via parallel_register_count and 
+             * parallel_terminate_count would get messed up if a worker marked 
+             * parallel could survive a crash and restart cycle. All such 
+             * workers should be marked BGW_NEVER_RESTART, and thus control 
+             * should never reach this branch. 
+             */ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>((</span><a href="bgworker.c.html#LN518"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a><span class='Operator'>.</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN66"><span class='Ref_to_Const'>BGWORKER_CLASS_PARALLEL</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Allow this worker to be restarted immediately after we finish 
+             * resetting. 
+             */ 
+</span>            <a href="bgworker.c.html#LN518"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN38"><span class='Ref_to_Member'>rw_crashed_at</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end ResetBackgroundWorkerCrashTimes &raquo; </span> 
+ 
+<span class='Directive'>#ifdef</span> EXEC_BACKEND 
+<span class='Comment_Multi_Line'>/* 
+ * In EXEC_BACKEND mode, workers use this to retrieve their details from 
+ * shared memory. 
+ */ 
+</span><a href="../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Operator'>* 
+</span><a name="LN559"></a><span class='Declare_Function'>BackgroundWorkerEntry</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>slotno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN561"></a>    <span class='Keyword'>static </span><a href="../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Declare_Local'>myEntry</span><span class='Delimiter'>; 
+</span><a name="LN562"></a>    <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN559"><span class='Ref_to_Parameter'>slotno</span></a> <span class='Operator'>&LT; </span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN98"><span class='Ref_to_Member'>total_slots</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN562"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN559"><span class='Ref_to_Parameter'>slotno</span></a><span class='Delimiter'>]; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN562"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN78"><span class='Ref_to_Member'>in_use</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* must copy this in case we don't intend to retain shmem access */ 
+</span>    memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="bgworker.c.html#LN561"><span class='Ref_To_Local'>myEntry</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN562"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof </span><a href="bgworker.c.html#LN561"><span class='Ref_To_Local'>myEntry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Operator'>&</span><a href="bgworker.c.html#LN561"><span class='Ref_To_Local'>myEntry</span></a><span class='Delimiter'>; 
+} 
+</span><span class='Directive'>#endif</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Complain about the BackgroundWorker definition using error level elevel. 
+ * Return true if it looks ok, false if not (unless elevel &GT;= ERROR, in 
+ * which case we won't return at all in the not-OK case). 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN580"></a><span class='Declare_Function'>SanityCheckBackgroundWorker</span><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>worker</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>elevel</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* sanity check for flags */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN58"><span class='Ref_to_Const'>BGWORKER_BACKEND_DATABASE_CONNECTION</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN51"><span class='Ref_to_Const'>BGWORKER_SHMEM_ACCESS</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>elevel</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INVALID_PARAMETER_VALUE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"background worker \"%s\": must attach to shared memory in order to request a database connection"</span><span class='Delimiter'>, 
+</span>                            <a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN91"><span class='Ref_to_Member'>bgw_start_time</span></a> <span class='Operator'>== </span><a href="../../include/postmaster/bgworker.h.html#LN77"><span class='Ref_to_EnumConst'>BgWorkerStart_PostmasterStart</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>elevel</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INVALID_PARAMETER_VALUE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"background worker \"%s\": cannot request database access if starting at postmaster start"</span><span class='Delimiter'>, 
+</span>                            <a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* XXX other checks? */ 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if worker-&GT;bgw_flags&BGW... &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>         <a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>!= </span><a href="../../include/postmaster/bgworker.h.html#LN83"><span class='Ref_to_Const'>BGW_NEVER_RESTART</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>        <span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>&GT; </span><a href="../../include/datatype/timestamp.h.html#LN90"><span class='Ref_to_Const'>USECS_PER_DAY</span></a> <span class='Operator'>/ </span><span class='Number'>1000</span><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>elevel</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INVALID_PARAMETER_VALUE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"background worker \"%s\": invalid restart interval"</span><span class='Delimiter'>, 
+</span>                        <a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Parallel workers may not be configured for restart, because the 
+     * parallel_register_count/parallel_terminate_count accounting can't 
+     * handle parallel workers lasting through a crash-and-restart cycle. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>!= </span><a href="../../include/postmaster/bgworker.h.html#LN83"><span class='Ref_to_Const'>BGW_NEVER_RESTART</span></a> <span class='Operator'>&& 
+</span>        <span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN66"><span class='Ref_to_Const'>BGWORKER_CLASS_PARALLEL</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>elevel</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INVALID_PARAMETER_VALUE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"background worker \"%s\": parallel workers may not be configured for restart"</span><span class='Delimiter'>, 
+</span>                        <a href="bgworker.c.html#LN580"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SanityCheckBackgroundWorker &raquo; </span> 
+ 
+<span class='Keyword'>static void 
+</span><a name="LN636"></a><span class='Declare_Function'>bgworker_quickdie</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN28"><span class='Ref_to_Macro'>sigaddset</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN22"><span class='Ref_to_Global_Var'>BlockSig</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN188"><span class='Ref_to_Const'>SIGQUIT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* prevent nested calls */ 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN18"><span class='Ref_to_Macro'>PG_SETMASK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN22"><span class='Ref_to_Global_Var'>BlockSig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We DO NOT want to run proc_exit() callbacks -- we're here because 
+     * shared memory may be corrupted, so we don't want to try to clean up our 
+     * transaction.  Just nail the windows shut and get out of town.  Now that 
+     * there's an atexit callback to prevent third-party code from breaking 
+     * things by calling exit() directly, we have to reset the callbacks 
+     * explicitly to make this work as intended. 
+     */ 
+</span>    <a href="../../include/storage/ipc.h.html#LN72"><span class='Ref_to_Proto'>on_exit_reset</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Note we do exit(2) not exit(0).  This is to force the postmaster into a 
+     * system reset cycle if some idiot DBA sends a manual SIGQUIT to a random 
+     * backend.  This is necessary precisely because we don't clean up our 
+     * shared memory state.  (The "dead man switch" mechanism in pmsignal.c 
+     * should ensure the postmaster sees this as a crash, too, but no harm in 
+     * being doubly sure.) 
+     */ 
+</span>    <a href="../../test/isolation/specscanner.l.html#LN91"><span class='Ref_to_Proto'>exit</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end bgworker_quickdie &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Standard SIGTERM handler for background workers 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN666"></a><span class='Declare_Function'>bgworker_die</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN18"><span class='Ref_to_Macro'>PG_SETMASK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN22"><span class='Ref_to_Global_Var'>BlockSig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_ADMIN_SHUTDOWN<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"terminating background worker \"%s\" due to administrator command"</span><span class='Delimiter'>, 
+</span>                    <a href="postmaster.c.html#LN188"><span class='Ref_to_Global_Var'>MyBgworkerEntry</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Standard SIGUSR1 handler for unconnected workers 
+ * 
+ * Here, we want to make sure an unconnected worker will at least heed 
+ * latch activity. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN683"></a><span class='Declare_Function'>bgworker_sigusr1_handler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN685"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/latch.h.html#LN173"><span class='Ref_to_Proto'>latch_sigusr1_handler</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="bgworker.c.html#LN685"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Start a new background worker 
+ * 
+ * This is the main entry point for background worker, to be called from 
+ * postmaster. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN699"></a><span class='Declare_Function'>StartBackgroundWorker</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN701"></a>    <a href="../../include/c.h.html#LN1087"><span class='Ref_to_Const'>sigjmp_buf</span></a>  <span class='Declare_Local'>local_sigjmp_buf</span><span class='Delimiter'>; 
+</span><a name="LN702"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>buf</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN703"></a>    <a href="../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>worker</span> <span class='Operator'>= </span><a href="postmaster.c.html#LN188"><span class='Ref_to_Global_Var'>MyBgworkerEntry</span></a><span class='Delimiter'>; 
+</span><a name="LN704"></a>    <a href="../../include/postmaster/bgworker.h.html#LN70"><span class='Ref_to_Typedef'>bgworker_main_type</span></a> <span class='Declare_Local'>entrypt</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN703"><span class='Ref_To_Local'>worker</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, </span><span class='String'>"unable to find bgworker entry"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../utils/init/globals.c.html#LN102"><span class='Ref_to_Global_Var'>IsBackgroundWorker</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Identify myself via ps */ 
+</span>    <a href="../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN702"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>, </span><span class='String'>"bgworker: %s"</span><span class='Delimiter'>, </span><a href="bgworker.c.html#LN703"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/ps_status.h.html#LN18"><span class='Ref_to_Proto'>init_ps_display</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN702"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><span class='String'>""</span><span class='Delimiter'>, </span><span class='String'>""</span><span class='Delimiter'>, </span><span class='String'>""</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we're not supposed to have shared memory access, then detach from 
+     * shared memory.  If we didn't request shared memory access, the 
+     * postmaster won't force a cluster-wide restart if we exit unexpectedly, 
+     * so we'd better make sure that we don't mess anything up that would 
+     * require that sort of cleanup. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="bgworker.c.html#LN703"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN51"><span class='Ref_to_Const'>BGWORKER_SHMEM_ACCESS</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../include/storage/dsm.h.html#LN29"><span class='Ref_to_Proto'>dsm_detach_all</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/pg_shmem.h.html#LN69"><span class='Ref_to_Proto'>PGSharedMemoryDetach</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../include/miscadmin.h.html#LN375"><span class='Ref_to_Macro'>SetProcessingMode</span></a><span class='Parentheses'>(</span><a href="../../include/miscadmin.h.html#LN363"><span class='Ref_to_EnumConst'>InitProcessing</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Apply PostAuthDelay */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../tcop/postgres.c.html#LN98"><span class='Ref_to_Global_Var'>PostAuthDelay</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><a href="../tcop/postgres.c.html#LN98"><span class='Ref_to_Global_Var'>PostAuthDelay</span></a> <span class='Operator'>* </span><span class='Number'>1000000L</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Set up signal handlers. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN703"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN58"><span class='Ref_to_Const'>BGWORKER_BACKEND_DATABASE_CONNECTION</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * SIGINT is used to signal canceling the current action 
+         */ 
+</span>        <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGINT<span class='Delimiter'>, </span><a href="../../include/tcop/tcopprot.h.html#LN69"><span class='Ref_to_Proto'>StatementCancelHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN201"><span class='Ref_to_Const'>SIGUSR1</span></a><span class='Delimiter'>, </span><a href="../../include/storage/procsignal.h.html#LN58"><span class='Ref_to_Proto'>procsignal_sigusr1_handler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGFPE<span class='Delimiter'>, </span><a href="../tcop/postgres.c.html#LN2667"><span class='Ref_to_Func'>FloatExceptionHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* XXX Any other handlers needed here? */ 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGINT<span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN201"><span class='Ref_to_Const'>SIGUSR1</span></a><span class='Delimiter'>, </span><a href="bgworker.c.html#LN682"><span class='Ref_to_Func'>bgworker_sigusr1_handler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGFPE<span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGTERM<span class='Delimiter'>, </span><a href="bgworker.c.html#LN665"><span class='Ref_to_Func'>bgworker_die</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN187"><span class='Ref_to_Const'>SIGHUP</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN188"><span class='Ref_to_Const'>SIGQUIT</span></a><span class='Delimiter'>, </span><a href="bgworker.c.html#LN635"><span class='Ref_to_Func'>bgworker_quickdie</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/timeout.h.html#LN69"><span class='Ref_to_Proto'>InitializeTimeouts</span></a><span class='Parentheses'>()</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* establishes SIGALRM handler */ 
+</span> 
+    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN192"><span class='Ref_to_Const'>SIGPIPE</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN202"><span class='Ref_to_Const'>SIGUSR2</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN197"><span class='Ref_to_Const'>SIGCHLD</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If an exception is encountered, processing resumes here. 
+     * 
+     * See notes in postgres.c about the design of this coding. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1088"><span class='Ref_to_Macro'>sigsetjmp</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN701"><span class='Ref_To_Local'>local_sigjmp_buf</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Since not using PG_TRY, must reset error stack by hand */ 
+</span>        <a href="../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Prevent interrupts while cleaning up */ 
+</span>        <a href="../../include/miscadmin.h.html#LN116"><span class='Ref_to_Macro'>HOLD_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Report the error to the server log */ 
+</span>        <a href="../../include/utils/elog.h.html#LN362"><span class='Ref_to_Proto'>EmitErrorReport</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Do we need more cleanup here?  For shmem-connected bgworkers, we 
+         * will call InitProcess below, which will install ProcKill as exit 
+         * callback.  That will take care of releasing locks, etc. 
+         */ 
+</span> 
+        <span class='Comment_Multi_Line'>/* and go away */ 
+</span>        <a href="../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if sigsetjmp(local_sigjm... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* We can now handle ereport(ERROR) */ 
+</span>    <a href="../utils/error/elog.c.html#LN89"><span class='Ref_to_Global_Var'>PG_exception_stack</span></a> <span class='Operator'>= &</span><a href="bgworker.c.html#LN701"><span class='Ref_To_Local'>local_sigjmp_buf</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the background worker request shared memory access, set that up now; 
+     * else, detach all shared memory segments. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN703"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN51"><span class='Ref_to_Const'>BGWORKER_SHMEM_ACCESS</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Early initialization.  Some of this could be useful even for 
+         * background workers that aren't using shared memory, but they can 
+         * call the individual startup routines for those subsystems if 
+         * needed. 
+         */ 
+</span>        <a href="../../include/miscadmin.h.html#LN424"><span class='Ref_to_Proto'>BaseInit</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Create a per-backend PGPROC struct in shared memory, except in the 
+         * EXEC_BACKEND case where this was done in SubPostmasterMain. We must 
+         * do this before we can use LWLocks (and in the EXEC_BACKEND case we 
+         * already had to do some stuff with LWLocks). 
+         */ 
+</span><span class='Directive'>#ifndef</span> EXEC_BACKEND 
+        <a href="../storage/lmgr/proc.c.html#LN285"><span class='Ref_to_Func'>InitProcess</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if worker-&GT;bgw_flags&BGW... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Look up the entry point function, loading its library if necessary. 
+     */ 
+</span>    <a href="bgworker.c.html#LN704"><span class='Ref_To_Local'>entrypt</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN135"><span class='Ref_to_Proto'>LookupBackgroundWorkerFunction</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN703"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN93"><span class='Ref_to_Member'>bgw_library_name</span></a><span class='Delimiter'>, 
+</span>                                             <a href="bgworker.c.html#LN703"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN94"><span class='Ref_to_Member'>bgw_function_name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Note that in normal processes, we would call InitPostgres here.  For a 
+     * worker, however, we don't know what database to connect to, yet; so we 
+     * need to wait until the user code does it via 
+     * BackgroundWorkerInitializeConnection(). 
+     */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Now invoke the user-defined worker code 
+     */ 
+</span>    <a href="bgworker.c.html#LN704"><span class='Ref_To_Local'>entrypt</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN703"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN95"><span class='Ref_to_Member'>bgw_main_arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* ... and if it returns, we're done */ 
+</span>    <a href="../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end StartBackgroundWorker &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Register a new static background worker. 
+ * 
+ * This can only be called directly from postmaster or in the _PG_init 
+ * function of a module library that's loaded by shared_preload_libraries; 
+ * otherwise it will have no effect. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN848"></a><span class='Declare_Function'>RegisterBackgroundWorker</span><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>worker</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN850"></a>    <a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rw</span><span class='Delimiter'>; 
+</span><a name="LN851"></a>    <span class='Keyword'>static int</span>  <span class='Declare_Local'>numworkers</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, 
+</span>         <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"registering background worker \"%s\""</span><span class='Delimiter'>, </span><a href="bgworker.c.html#LN848"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../utils/init/miscinit.c.html#LN1416"><span class='Ref_to_Global_Var'>process_shared_preload_libraries_in_progress</span></a> <span class='Operator'>&& 
+</span>        strcmp<span class='Parentheses'>(</span><a href="bgworker.c.html#LN848"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN93"><span class='Ref_to_Member'>bgw_library_name</span></a><span class='Delimiter'>, </span><span class='String'>"postgres"</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>) 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"background worker \"%s\": must be registered in shared_preload_libraries"</span><span class='Delimiter'>, 
+</span>                            <a href="bgworker.c.html#LN848"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="bgworker.c.html#LN579"><span class='Ref_to_Func'>SanityCheckBackgroundWorker</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN848"><span class='Ref_to_Parameter'>worker</span></a><span class='Delimiter'>, </span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN848"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"background worker \"%s\": only dynamic background workers can request notification"</span><span class='Delimiter'>, 
+</span>                        <a href="bgworker.c.html#LN848"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Enforce maximum number of workers.  Note this is overly restrictive: we 
+     * could allow more non-shmem-connected workers, because these don't count 
+     * towards the MAX_BACKENDS limit elsewhere.  For now, it doesn't seem 
+     * important to relax this restriction. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>++</span><a href="bgworker.c.html#LN851"><span class='Ref_To_Local'>numworkers</span></a> <span class='Operator'>&GT; </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_CONFIGURATION_LIMIT_EXCEEDED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"too many background workers"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../include/utils/elog.h.html#LN150"><span class='Ref_to_Func'>errdetail_plural</span></a><span class='Parentheses'>(</span><span class='String'>"Up to %d background worker can be registered with the current settings."</span><span class='Delimiter'>, 
+</span>                                  <span class='String'>"Up to %d background workers can be registered with the current settings."</span><span class='Delimiter'>, 
+</span>                                  <a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Delimiter'>, 
+</span>                                  <a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Consider increasing the configuration parameter \"max_worker_processes\"."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Copy the registration data into the registered workers list. 
+     */ 
+</span>    <a href="bgworker.c.html#LN850"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>= </span><a href="../../include/snowball/header.h.html#LN49"><span class='Ref_to_Macro'>malloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker_internals.h.html#LN32"><span class='Ref_to_Struct'>RegisteredBgWorker</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN850"><span class='Ref_To_Local'>rw</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OUT_OF_MEMORY<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"out of memory"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="bgworker.c.html#LN850"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN34"><span class='Ref_to_Member'>rw_worker</span></a> <span class='Operator'>= *</span><a href="bgworker.c.html#LN848"><span class='Ref_to_Parameter'>worker</span></a><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN850"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN35"><span class='Ref_to_Member'>rw_backend</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN850"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN36"><span class='Ref_to_Member'>rw_pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN850"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN37"><span class='Ref_to_Member'>rw_child_slot</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN850"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN38"><span class='Ref_to_Member'>rw_crashed_at</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN850"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN40"><span class='Ref_to_Member'>rw_terminate</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/lib/ilist.h.html#LN572"><span class='Ref_to_Func'>slist_push_head</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="bgworker.c.html#LN42"><span class='Ref_to_Global_Var'>BackgroundWorkerList</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN850"><span class='Ref_To_Local'>rw</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker_internals.h.html#LN41"><span class='Ref_to_Member'>rw_lnode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RegisterBackgroundWorker &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Register a new background worker from a regular backend. 
+ * 
+ * Returns true on success and false on failure.  Failure typically indicates 
+ * that no background worker slots are currently available. 
+ * 
+ * If handle != NULL, we'll set *handle to a pointer that can subsequently 
+ * be used as an argument to GetBackgroundWorkerPid().  The caller can 
+ * free this pointer using pfree(), if desired. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN932"></a><span class='Declare_Function'>RegisterDynamicBackgroundWorker</span><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>worker</span><span class='Delimiter'>, 
+</span><a name="LN933"></a>                                <a href="bgworker.c.html#LN104"><span class='Ref_to_Struct'>BackgroundWorkerHandle</span></a> <span class='Operator'>**</span><span class='Declare_Parameter'>handle</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN935"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span><a name="LN936"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>success</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN937"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>parallel</span><span class='Delimiter'>; 
+</span><a name="LN938"></a>    <a href="../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>generation</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We can't register dynamic background workers from the postmaster. If 
+     * this is a standalone backend, we're the only process and can't start 
+     * any more.  In a multi-process environment, it might be theoretically 
+     * possible, but we don't currently support it due to locking 
+     * considerations; see comments on the BackgroundWorkerSlot data 
+     * structure. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="bgworker.c.html#LN579"><span class='Ref_to_Func'>SanityCheckBackgroundWorker</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN932"><span class='Ref_to_Parameter'>worker</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="bgworker.c.html#LN937"><span class='Ref_To_Local'>parallel</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN932"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>& </span><a href="../../include/postmaster/bgworker.h.html#LN66"><span class='Ref_to_Const'>BGWORKER_CLASS_PARALLEL</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>BackgroundWorkerLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If this is a parallel worker, check whether there are already too many 
+     * parallel workers; if so, don't register another one.  Our view of 
+     * parallel_terminate_count may be slightly stale, but that doesn't really 
+     * matter: we would have gotten the same result if we'd arrived here 
+     * slightly earlier anyway.  There's no help for it, either, since the 
+     * postmaster must not take locks; a memory barrier wouldn't guarantee 
+     * anything useful. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN937"><span class='Ref_To_Local'>parallel</span></a> <span class='Operator'>&& </span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN99"><span class='Ref_to_Member'>parallel_register_count</span></a> <span class='Operator'>- 
+</span>                     <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN100"><span class='Ref_to_Member'>parallel_terminate_count</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT;= 
+</span>        <a href="../utils/init/globals.c.html#LN125"><span class='Ref_to_Global_Var'>max_parallel_workers</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN99"><span class='Ref_to_Member'>parallel_register_count</span></a> <span class='Operator'>- 
+</span>               <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN100"><span class='Ref_to_Member'>parallel_terminate_count</span></a> <span class='Operator'>&LT;= 
+</span>               <a href="../../include/postmaster/bgworker_internals.h.html#LN23"><span class='Ref_to_Const'>MAX_PARALLEL_WORKER_LIMIT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>BackgroundWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Look for an unused slot.  If we find one, grab it. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN935"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="bgworker.c.html#LN935"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>&LT; </span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN98"><span class='Ref_to_Member'>total_slots</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="bgworker.c.html#LN935"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN983"></a>        <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN935"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="bgworker.c.html#LN983"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN78"><span class='Ref_to_Member'>in_use</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="bgworker.c.html#LN983"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN82"><span class='Ref_to_Member'>worker</span></a><span class='Delimiter'>, </span><a href="bgworker.c.html#LN932"><span class='Ref_to_Parameter'>worker</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN983"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN80"><span class='Ref_to_Member'>pid</span></a> <span class='Operator'>= </span><a href="../../include/miscadmin.h.html#LN32"><span class='Ref_to_Const'>InvalidPid</span></a><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* indicates not started yet */ 
+</span>            <a href="bgworker.c.html#LN983"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN81"><span class='Ref_to_Member'>generation</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN983"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN79"><span class='Ref_to_Member'>terminate</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN938"><span class='Ref_To_Local'>generation</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN983"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN81"><span class='Ref_to_Member'>generation</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN937"><span class='Ref_To_Local'>parallel</span></a><span class='Parentheses'>) 
+</span>                <a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN99"><span class='Ref_to_Member'>parallel_register_count</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Make sure postmaster doesn't see the slot as in use before it 
+             * sees the new contents. 
+             */ 
+</span>            <a href="../../include/port/atomics.h.html#LN161"><span class='Ref_to_Macro'>pg_write_barrier</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <a href="bgworker.c.html#LN983"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN78"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="bgworker.c.html#LN936"><span class='Ref_To_Local'>success</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !slot-&GT;in_use &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for slotno=0;slotno&LT;Backg... &raquo; </span> 
+ 
+    <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>BackgroundWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If we found a slot, tell the postmaster to notice the change. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN936"><span class='Ref_To_Local'>success</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/storage/pmsignal.h.html#LN45"><span class='Ref_to_Proto'>SendPostmasterSignal</span></a><span class='Parentheses'>(</span><a href="../../include/storage/pmsignal.h.html#LN30"><span class='Ref_to_EnumConst'>PMSIGNAL_BACKGROUND_WORKER_CHANGE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we found a slot and the user has provided a handle, initialize it. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN936"><span class='Ref_To_Local'>success</span></a> <span class='Operator'>&& </span><a href="bgworker.c.html#LN933"><span class='Ref_to_Parameter'>handle</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="bgworker.c.html#LN933"><span class='Ref_to_Parameter'>handle</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN104"><span class='Ref_to_Struct'>BackgroundWorkerHandle</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="bgworker.c.html#LN933"><span class='Ref_to_Parameter'>handle</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN106"><span class='Ref_to_Member'>slot</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN935"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>; 
+</span>        <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="bgworker.c.html#LN933"><span class='Ref_to_Parameter'>handle</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN107"><span class='Ref_to_Member'>generation</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN938"><span class='Ref_To_Local'>generation</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="bgworker.c.html#LN936"><span class='Ref_To_Local'>success</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RegisterDynamicBackgroundWorker &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Get the PID of a dynamically-registered background worker. 
+ * 
+ * If the worker is determined to be running, the return value will be 
+ * BGWH_STARTED and *pidp will get the PID of the worker process. 
+ * Otherwise, the return value will be BGWH_NOT_YET_STARTED if the worker 
+ * hasn't been started yet, and BGWH_STOPPED if the worker was previously 
+ * running but is no longer. 
+ * 
+ * In the latter case, the worker may be stopped temporarily (if it is 
+ * configured for automatic restart and exited non-zero) or gone for 
+ * good (if it exited with code 0 or if it is configured not to restart). 
+ */ 
+</span><a href="../../include/postmaster/bgworker.h.html#LN100"><span class='Ref_to_Enum'>BgwHandleStatus</span></a> 
+<a name="LN1040"></a><span class='Declare_Function'>GetBackgroundWorkerPid</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN104"><span class='Ref_to_Struct'>BackgroundWorkerHandle</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>handle</span><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>pidp</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1042"></a>    <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN1043"></a>    <a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Local'>pid</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN1040"><span class='Ref_to_Parameter'>handle</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN106"><span class='Ref_to_Member'>slot</span></a> <span class='Operator'>&LT; </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN1042"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN1040"><span class='Ref_to_Parameter'>handle</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN106"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We could probably arrange to synchronize access to data using memory 
+     * barriers only, but for now, let's just keep it simple and grab the 
+     * lock.  It seems unlikely that there will be enough traffic here to 
+     * result in meaningful contention. 
+     */ 
+</span>    <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>BackgroundWorkerLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The generation number can't be concurrently changed while we hold the 
+     * lock.  The pid, which is updated by the postmaster, can change at any 
+     * time, but we assume such changes are atomic.  So the value we read 
+     * won't be garbage, but it might be out of date by the time the caller 
+     * examines it (but that's unavoidable anyway). 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1040"><span class='Ref_to_Parameter'>handle</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN107"><span class='Ref_to_Member'>generation</span></a> <span class='Operator'>!= </span><a href="bgworker.c.html#LN1042"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN81"><span class='Ref_to_Member'>generation</span></a><span class='Parentheses'>) 
+</span>        <a href="bgworker.c.html#LN1043"><span class='Ref_To_Local'>pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="bgworker.c.html#LN1043"><span class='Ref_To_Local'>pid</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN1042"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN80"><span class='Ref_to_Member'>pid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* All done. */ 
+</span>    <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>BackgroundWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1043"><span class='Ref_To_Local'>pid</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="../../include/postmaster/bgworker.h.html#LN104"><span class='Ref_to_EnumConst'>BGWH_STOPPED</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1043"><span class='Ref_To_Local'>pid</span></a> <span class='Operator'>== </span><a href="../../include/miscadmin.h.html#LN32"><span class='Ref_to_Const'>InvalidPid</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="../../include/postmaster/bgworker.h.html#LN103"><span class='Ref_to_EnumConst'>BGWH_NOT_YET_STARTED</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="bgworker.c.html#LN1040"><span class='Ref_to_Parameter'>pidp</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN1043"><span class='Ref_To_Local'>pid</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="../../include/postmaster/bgworker.h.html#LN102"><span class='Ref_to_EnumConst'>BGWH_STARTED</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end GetBackgroundWorkerPid &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Wait for a background worker to start up. 
+ * 
+ * This is like GetBackgroundWorkerPid(), except that if the worker has not 
+ * yet started, we wait for it to do so; thus, BGWH_NOT_YET_STARTED is never 
+ * returned.  However, if the postmaster has died, we give up and return 
+ * BGWH_POSTMASTER_DIED, since it that case we know that startup will not 
+ * take place. 
+ */ 
+</span><a href="../../include/postmaster/bgworker.h.html#LN100"><span class='Ref_to_Enum'>BgwHandleStatus</span></a> 
+<a name="LN1089"></a><span class='Declare_Function'>WaitForBackgroundWorkerStartup</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN104"><span class='Ref_to_Struct'>BackgroundWorkerHandle</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>handle</span><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>pidp</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1091"></a>    <a href="../../include/postmaster/bgworker.h.html#LN100"><span class='Ref_to_Enum'>BgwHandleStatus</span></a> <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN1092"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN1096"></a>        <a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Local'>pid</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="bgworker.c.html#LN1091"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../include/postmaster/bgworker.h.html#LN119"><span class='Ref_to_Proto'>GetBackgroundWorkerPid</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN1089"><span class='Ref_to_Parameter'>handle</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN1096"><span class='Ref_To_Local'>pid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1091"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>== </span><a href="../../include/postmaster/bgworker.h.html#LN102"><span class='Ref_to_EnumConst'>BGWH_STARTED</span></a><span class='Parentheses'>) 
+</span>            <span class='Operator'>*</span><a href="bgworker.c.html#LN1089"><span class='Ref_to_Parameter'>pidp</span></a> <span class='Operator'>= </span><a href="bgworker.c.html#LN1096"><span class='Ref_To_Local'>pid</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1091"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>!= </span><a href="../../include/postmaster/bgworker.h.html#LN103"><span class='Ref_to_EnumConst'>BGWH_NOT_YET_STARTED</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <a href="bgworker.c.html#LN1092"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                       <a href="../../include/pgstat.h.html#LN801"><span class='Ref_to_EnumConst'>WAIT_EVENT_BGWORKER_STARTUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1092"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="bgworker.c.html#LN1091"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../include/postmaster/bgworker.h.html#LN105"><span class='Ref_to_EnumConst'>BGWH_POSTMASTER_DIED</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="bgworker.c.html#LN1091"><span class='Ref_To_Local'>status</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end WaitForBackgroundWorkerStartup &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Wait for a background worker to stop. 
+ * 
+ * If the worker hasn't yet started, or is running, we wait for it to stop 
+ * and then return BGWH_STOPPED.  However, if the postmaster has died, we give 
+ * up and return BGWH_POSTMASTER_DIED, because it's the postmaster that 
+ * notifies us when a worker's state changes. 
+ */ 
+</span><a href="../../include/postmaster/bgworker.h.html#LN100"><span class='Ref_to_Enum'>BgwHandleStatus</span></a> 
+<a name="LN1131"></a><span class='Declare_Function'>WaitForBackgroundWorkerShutdown</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN104"><span class='Ref_to_Struct'>BackgroundWorkerHandle</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>handle</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1133"></a>    <a href="../../include/postmaster/bgworker.h.html#LN100"><span class='Ref_to_Enum'>BgwHandleStatus</span></a> <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN1134"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN1138"></a>        <a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Local'>pid</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="bgworker.c.html#LN1133"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../include/postmaster/bgworker.h.html#LN119"><span class='Ref_to_Proto'>GetBackgroundWorkerPid</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN1131"><span class='Ref_to_Parameter'>handle</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="bgworker.c.html#LN1138"><span class='Ref_To_Local'>pid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1133"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>== </span><a href="../../include/postmaster/bgworker.h.html#LN104"><span class='Ref_to_EnumConst'>BGWH_STOPPED</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <a href="bgworker.c.html#LN1134"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                       <a href="../../include/pgstat.h.html#LN800"><span class='Ref_to_EnumConst'>WAIT_EVENT_BGWORKER_SHUTDOWN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1134"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="bgworker.c.html#LN1133"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../include/postmaster/bgworker.h.html#LN105"><span class='Ref_to_EnumConst'>BGWH_POSTMASTER_DIED</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="bgworker.c.html#LN1133"><span class='Ref_To_Local'>status</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end WaitForBackgroundWorkerShutdown &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Instruct the postmaster to terminate a background worker. 
+ * 
+ * Note that it's safe to do this without regard to whether the worker is 
+ * still running, or even if the worker may already have existed and been 
+ * unregistered. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN1170"></a><span class='Declare_Function'>TerminateBackgroundWorker</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN104"><span class='Ref_to_Struct'>BackgroundWorkerHandle</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>handle</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1172"></a>    <a href="bgworker.c.html#LN76"><span class='Ref_to_Struct'>BackgroundWorkerSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN1173"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>signal_postmaster</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="bgworker.c.html#LN1170"><span class='Ref_to_Parameter'>handle</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN106"><span class='Ref_to_Member'>slot</span></a> <span class='Operator'>&LT; </span><a href="../utils/init/globals.c.html#LN124"><span class='Ref_to_Global_Var'>max_worker_processes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="bgworker.c.html#LN1172"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= &</span><a href="bgworker.c.html#LN110"><span class='Ref_to_Global_Var'>BackgroundWorkerData</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN101"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN1170"><span class='Ref_to_Parameter'>handle</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN106"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Set terminate flag in shared memory, unless slot has been reused. */ 
+</span>    <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>BackgroundWorkerLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1170"><span class='Ref_to_Parameter'>handle</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN107"><span class='Ref_to_Member'>generation</span></a> <span class='Operator'>== </span><a href="bgworker.c.html#LN1172"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN81"><span class='Ref_to_Member'>generation</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="bgworker.c.html#LN1172"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>-&GT;</span><a href="bgworker.c.html#LN79"><span class='Ref_to_Member'>terminate</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <a href="bgworker.c.html#LN1173"><span class='Ref_To_Local'>signal_postmaster</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>BackgroundWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Make sure the postmaster notices the change to shared memory. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1173"><span class='Ref_To_Local'>signal_postmaster</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/storage/pmsignal.h.html#LN45"><span class='Ref_to_Proto'>SendPostmasterSignal</span></a><span class='Parentheses'>(</span><a href="../../include/storage/pmsignal.h.html#LN30"><span class='Ref_to_EnumConst'>PMSIGNAL_BACKGROUND_WORKER_CHANGE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TerminateBackgroundWorker &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Look up (and possibly load) a bgworker entry point function. 
+ * 
+ * For functions contained in the core code, we use library name "postgres" 
+ * and consult the InternalBGWorkers array.  External functions are 
+ * looked up, and loaded if necessary, using load_external_function(). 
+ * 
+ * The point of this is to pass function names as strings across process 
+ * boundaries.  We can't pass actual function addresses because of the 
+ * possibility that the function has been loaded at a different address 
+ * in a different process.  This is obviously a hazard for functions in 
+ * loadable libraries, but it can happen even for functions in the core code 
+ * on platforms using EXEC_BACKEND (e.g., Windows). 
+ * 
+ * At some point it might be worthwhile to get rid of InternalBGWorkers[] 
+ * in favor of applying load_external_function() for core functions too; 
+ * but that raises portability issues that are not worth addressing now. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/postmaster/bgworker.h.html#LN70"><span class='Ref_to_Typedef'>bgworker_main_type</span></a> 
+<a name="LN1211"></a><span class='Declare_Function'>LookupBackgroundWorkerFunction</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>libraryname</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>funcname</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * If the function is to be loaded from postgres itself, search the 
+     * InternalBGWorkers array. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="bgworker.c.html#LN1211"><span class='Ref_to_Parameter'>libraryname</span></a><span class='Delimiter'>, </span><span class='String'>"postgres"</span><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN1219"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="bgworker.c.html#LN1219"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="bgworker.c.html#LN1219"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="../../include/c.h.html#LN561"><span class='Ref_to_Macro'>lengthof</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN120"><span class='Ref_to_Global_Var'>InternalBGWorkers</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; </span><a href="bgworker.c.html#LN1219"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="bgworker.c.html#LN120"><span class='Ref_to_Global_Var'>InternalBGWorkers</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN1219"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="bgworker.c.html#LN118"><span class='Ref_to_Member'>fn_name</span></a><span class='Delimiter'>, </span><a href="bgworker.c.html#LN1211"><span class='Ref_to_Parameter'>funcname</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+                <span class='Control'>return</span> <a href="bgworker.c.html#LN120"><span class='Ref_to_Global_Var'>InternalBGWorkers</span></a><span class='Delimiter'>[</span><a href="bgworker.c.html#LN1219"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="bgworker.c.html#LN119"><span class='Ref_to_Member'>fn_addr</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* We can only reach this by programming error. */ 
+</span>        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"internal function \"%s\" not found"</span><span class='Delimiter'>, </span><a href="bgworker.c.html#LN1211"><span class='Ref_to_Parameter'>funcname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Otherwise load from external library. */ 
+</span>    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../include/postmaster/bgworker.h.html#LN70"><span class='Ref_to_Typedef'>bgworker_main_type</span></a><span class='Parentheses'>) 
+</span>        <a href="../utils/fmgr/dfmgr.c.html#LN92"><span class='Ref_to_Func'>load_external_function</span></a><span class='Parentheses'>(</span><a href="bgworker.c.html#LN1211"><span class='Ref_to_Parameter'>libraryname</span></a><span class='Delimiter'>, </span><a href="bgworker.c.html#LN1211"><span class='Ref_to_Parameter'>funcname</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end LookupBackgroundWorkerFunction &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

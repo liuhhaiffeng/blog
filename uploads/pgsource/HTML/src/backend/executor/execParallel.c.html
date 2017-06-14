@@ -1,0 +1,920 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\executor\execParallel.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\executor\execParallel.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:39 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * execParallel.c 
+ *    Support routines for parallel execution. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * This file contains routines that are intended to support setting up, 
+ * using, and tearing down a ParallelContext from within the PostgreSQL 
+ * executor.  The ParallelContext machinery will handle starting the 
+ * workers and ensuring that their state generally matches that of the 
+ * leader; see src/backend/access/transam/README.parallel for details. 
+ * However, we must save and restore relevant executor state, such as 
+ * any ParamListInfo associated with the query, buffer usage info, and 
+ * the actual plan to be passed down to the worker. 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/executor/execParallel.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"executor/execParallel.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/executor.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeBitmapHeapscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeCustom.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeForeignscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeSeqscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeIndexscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeIndexonlyscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/tqueue.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"nodes/nodeFuncs.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"optimizer/planmain.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"optimizer/planner.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/spin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"tcop/tcopprot.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/dsa.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/snapmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Magic numbers for parallel executor communication.  We use constants 
+ * greater than any 32-bit integer here so that values &LT; 2^32 can be used 
+ * by individual parallel nodes to store their own state. 
+ */ 
+</span><a name="LN49"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PARALLEL_KEY_PLANNEDSTMT</span>        <a href="../../include/c.h.html#LN307"><span class='Ref_to_Macro'>UINT64CONST</span></a><span class='Parentheses'>(</span><span class='Number'>0xE000000000000001</span><span class='Parentheses'>) 
+</span><a name="LN50"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PARALLEL_KEY_PARAMS</span>             <a href="../../include/c.h.html#LN307"><span class='Ref_to_Macro'>UINT64CONST</span></a><span class='Parentheses'>(</span><span class='Number'>0xE000000000000002</span><span class='Parentheses'>) 
+</span><a name="LN51"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PARALLEL_KEY_BUFFER_USAGE</span>       <a href="../../include/c.h.html#LN307"><span class='Ref_to_Macro'>UINT64CONST</span></a><span class='Parentheses'>(</span><span class='Number'>0xE000000000000003</span><span class='Parentheses'>) 
+</span><a name="LN52"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PARALLEL_KEY_TUPLE_QUEUE</span>        <a href="../../include/c.h.html#LN307"><span class='Ref_to_Macro'>UINT64CONST</span></a><span class='Parentheses'>(</span><span class='Number'>0xE000000000000004</span><span class='Parentheses'>) 
+</span><a name="LN53"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PARALLEL_KEY_INSTRUMENTATION</span>    <a href="../../include/c.h.html#LN307"><span class='Ref_to_Macro'>UINT64CONST</span></a><span class='Parentheses'>(</span><span class='Number'>0xE000000000000005</span><span class='Parentheses'>) 
+</span><a name="LN54"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PARALLEL_KEY_DSA</span>                <a href="../../include/c.h.html#LN307"><span class='Ref_to_Macro'>UINT64CONST</span></a><span class='Parentheses'>(</span><span class='Number'>0xE000000000000006</span><span class='Parentheses'>) 
+</span><a name="LN55"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PARALLEL_KEY_QUERY_TEXT</span>     <a href="../../include/c.h.html#LN307"><span class='Ref_to_Macro'>UINT64CONST</span></a><span class='Parentheses'>(</span><span class='Number'>0xE000000000000007</span><span class='Parentheses'>) 
+</span> 
+<a name="LN57"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PARALLEL_TUPLE_QUEUE_SIZE</span>       <span class='Number'>65536</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * DSM structure for accumulating per-PlanState instrumentation. 
+ * 
+ * instrument_options: Same meaning here as in instrument.c. 
+ * 
+ * instrument_offset: Offset, relative to the start of this structure, 
+ * of the first Instrumentation object.  This will depend on the length of 
+ * the plan_node_id array. 
+ * 
+ * num_workers: Number of workers. 
+ * 
+ * num_plan_nodes: Number of plan nodes. 
+ * 
+ * plan_node_id: Array of plan nodes for which we are gathering instrumentation 
+ * from parallel workers.  The length of this array is given by num_plan_nodes. 
+ */ 
+</span><a name="LN75"></a><span class='Control'>struct</span> <span class='Declare_Struct'>SharedExecutorInstrumentation</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN77"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>instrument_options</span><span class='Delimiter'>; 
+</span><a name="LN78"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>instrument_offset</span><span class='Delimiter'>; 
+</span><a name="LN79"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>num_workers</span><span class='Delimiter'>; 
+</span><a name="LN80"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>num_plan_nodes</span><span class='Delimiter'>; 
+</span><a name="LN81"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>plan_node_id</span><span class='Delimiter'>[</span>FLEXIBLE_ARRAY_MEMBER<span class='Delimiter'>]; 
+</span>    <span class='Comment_Multi_Line'>/* array of num_plan_nodes * num_workers Instrumentation objects follows */ 
+</span><span class='Delimiter'>}; 
+</span><a name="LN84"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>GetInstrumentationArray</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>sei</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <span class='Parentheses'>(</span><a href="../../include/c.h.html#LN778"><span class='Ref_to_Macro'>AssertVariableIsOfTypeMacro</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN84"><span class='Ref_to_Parameter'>sei</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN75"><span class='Ref_to_Struct'>SharedExecutorInstrumentation</span></a> <span class='Operator'>*</span><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Operator'>\ 
+</span>     <span class='Parentheses'>(</span><a href="../../include/executor/instrument.h.html#LN43"><span class='Ref_to_Struct'>Instrumentation</span></a> <span class='Operator'>*</span><span class='Parentheses'>)</span> <span class='Parentheses'>(((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN84"><span class='Ref_to_Parameter'>sei</span></a><span class='Parentheses'>)</span> <span class='Operator'>+ </span><a href="execParallel.c.html#LN84"><span class='Ref_to_Parameter'>sei</span></a><span class='Operator'>-&GT;</span>instrument_offset<span class='Parentheses'>))</span> 
+ 
+<span class='Comment_Multi_Line'>/* Context object for ExecParallelEstimate. */ 
+</span><a name="LN89"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>ExecParallelEstimateContext</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN91"></a>    <a href="../../include/access/parallel.h.html#LN31"><span class='Ref_to_Struct'>ParallelContext</span></a> <span class='Operator'>*</span><span class='Declare_Member'>pcxt</span><span class='Delimiter'>; 
+</span><a name="LN92"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>nnodes</span><span class='Delimiter'>; 
+</span><a name="LN93"></a>} <span class='Declare_Typedef'>ExecParallelEstimateContext</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Context object for ExecParallelInitializeDSM. */ 
+</span><a name="LN96"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>ExecParallelInitializeDSMContext</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN98"></a>    <a href="../../include/access/parallel.h.html#LN31"><span class='Ref_to_Struct'>ParallelContext</span></a> <span class='Operator'>*</span><span class='Declare_Member'>pcxt</span><span class='Delimiter'>; 
+</span><a name="LN99"></a>    <a href="execParallel.c.html#LN75"><span class='Ref_to_Struct'>SharedExecutorInstrumentation</span></a> <span class='Operator'>*</span><span class='Declare_Member'>instrumentation</span><span class='Delimiter'>; 
+</span><a name="LN100"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>nnodes</span><span class='Delimiter'>; 
+</span><a name="LN101"></a>} <span class='Declare_Typedef'>ExecParallelInitializeDSMContext</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Helper functions that run in the parallel leader. */ 
+</span><a name="LN104"></a><span class='Keyword'>static char </span><span class='Operator'>*</span><span class='Declare_Prototype'>ExecSerializePlan</span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN117"><span class='Ref_to_Struct'>Plan</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>plan</span><span class='Delimiter'>, </span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN105"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>ExecParallelEstimate</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Delimiter'>, 
+</span><a name="LN106"></a>                     <a href="execParallel.c.html#LN89"><span class='Ref_to_Struct'>ExecParallelEstimateContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>e</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN107"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>ExecParallelInitializeDSM</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Delimiter'>, 
+</span><a name="LN108"></a>                          <a href="execParallel.c.html#LN96"><span class='Ref_to_Struct'>ExecParallelInitializeDSMContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>d</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN109"></a><span class='Keyword'>static </span><a href="../storage/ipc/shm_mq.c.html#LN126"><span class='Ref_to_Struct'>shm_mq_handle</span></a> <span class='Operator'>**</span><span class='Declare_Prototype'>ExecParallelSetupTupleQueues</span><span class='Parentheses'>(</span><a href="../../include/access/parallel.h.html#LN31"><span class='Ref_to_Struct'>ParallelContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>pcxt</span><span class='Delimiter'>, 
+</span><a name="LN110"></a>                             <span class='Keyword'>bool </span><span class='Declare_Parameter'>reinitialize</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN111"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>ExecParallelRetrieveInstrumentation</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>planstate</span><span class='Delimiter'>, 
+</span><a name="LN112"></a>                             <a href="execParallel.c.html#LN75"><span class='Ref_to_Struct'>SharedExecutorInstrumentation</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>instrumentation</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Helper function that runs in the parallel worker. */ 
+</span><a name="LN115"></a><span class='Keyword'>static </span><a href="../../include/tcop/dest.h.html#LN112"><span class='Ref_to_Typedef'>DestReceiver</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>ExecParallelGetReceiver</span><span class='Parentheses'>(</span><a href="../storage/ipc/dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Delimiter'>, </span><a href="../storage/ipc/shm_toc.c.html#LN25"><span class='Ref_to_Struct'>shm_toc</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>toc</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Create a serialized representation of the plan to be sent to each worker. 
+ */ 
+</span><span class='Keyword'>static char </span><span class='Operator'>* 
+</span><a name="LN121"></a><span class='Declare_Function'>ExecSerializePlan</span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN117"><span class='Ref_to_Struct'>Plan</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>plan</span><span class='Delimiter'>, </span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN123"></a>    <a href="../../include/nodes/plannodes.h.html#LN40"><span class='Ref_to_Struct'>PlannedStmt</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pstmt</span><span class='Delimiter'>; 
+</span><a name="LN124"></a>    <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>lc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We can't scribble on the original plan, so make a copy. */ 
+</span>    <a href="execParallel.c.html#LN121"><span class='Ref_to_Parameter'>plan</span></a> <span class='Operator'>= </span><a href="../../include/nodes/nodes.h.html#LN618"><span class='Ref_to_Macro'>copyObject</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN121"><span class='Ref_to_Parameter'>plan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The worker will start its own copy of the executor, and that copy will 
+     * insert a junk filter if the toplevel node has any resjunk entries. We 
+     * don't want that to happen, because while resjunk columns shouldn't be 
+     * sent back to the user, here the tuples are coming back to another 
+     * backend which may very well need them.  So mutate the target list 
+     * accordingly.  This is sort of a hack; there might be better ways to do 
+     * this... 
+     */ 
+</span>    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN124"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN121"><span class='Ref_to_Parameter'>plan</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN143"><span class='Ref_to_Member'>targetlist</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN140"></a>        <a href="../../include/nodes/primnodes.h.html#LN1363"><span class='Ref_to_Struct'>TargetEntry</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tle</span> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN108"><span class='Ref_to_Macro'>lfirst_node</span></a><span class='Parentheses'>(</span><a href="../../include/nodes/primnodes.h.html#LN1363"><span class='Ref_to_Struct'>TargetEntry</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN124"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="execParallel.c.html#LN140"><span class='Ref_To_Local'>tle</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/primnodes.h.html#LN1373"><span class='Ref_to_Member'>resjunk</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create a dummy PlannedStmt.  Most of the fields don't need to be valid 
+     * for our purposes, but the worker will need at least a minimal 
+     * PlannedStmt to start the executor. 
+     */ 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a> <span class='Operator'>= </span><a href="../../include/nodes/nodes.h.html#LN556"><span class='Ref_to_Macro'>makeNode</span></a><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN40"><span class='Ref_to_Struct'>PlannedStmt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN44"><span class='Ref_to_Member'>commandType</span></a> <span class='Operator'>= </span><a href="../../include/nodes/nodes.h.html#LN650"><span class='Ref_to_EnumConst'>CMD_SELECT</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN46"><span class='Ref_to_Member'>queryId</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN48"><span class='Ref_to_Member'>hasReturning</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN50"><span class='Ref_to_Member'>hasModifyingCTE</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN52"><span class='Ref_to_Member'>canSetTag</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN54"><span class='Ref_to_Member'>transientPlan</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN56"><span class='Ref_to_Member'>dependsOnRole</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN58"><span class='Ref_to_Member'>parallelModeNeeded</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN60"><span class='Ref_to_Member'>planTree</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN121"><span class='Ref_to_Parameter'>plan</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN62"><span class='Ref_to_Member'>rtable</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN121"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN410"><span class='Ref_to_Member'>es_range_table</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN65"><span class='Ref_to_Member'>resultRelations</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN71"><span class='Ref_to_Member'>nonleafResultRelations</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Transfer only parallel-safe subplans, leaving a NULL "hole" in the list 
+     * for unsafe ones (so that the list indexes of the safe ones are 
+     * preserved).  This positively ensures that the worker won't try to run, 
+     * or even do ExecInitNode on, an unsafe subplan.  That's important to 
+     * protect, eg, non-parallel-aware FDWs from getting into trouble. 
+     */ 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN80"><span class='Ref_to_Member'>subplans</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span>    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN124"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN121"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN411"><span class='Ref_to_Member'>es_plannedstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN80"><span class='Ref_to_Member'>subplans</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN174"></a>        <a href="../../include/nodes/plannodes.h.html#LN117"><span class='Ref_to_Struct'>Plan</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>subplan</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN117"><span class='Ref_to_Struct'>Plan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN124"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN174"><span class='Ref_To_Local'>subplan</span></a> <span class='Operator'>&& !</span><a href="execParallel.c.html#LN174"><span class='Ref_To_Local'>subplan</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN137"><span class='Ref_to_Member'>parallel_safe</span></a><span class='Parentheses'>) 
+</span>            <a href="execParallel.c.html#LN174"><span class='Ref_To_Local'>subplan</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN80"><span class='Ref_to_Member'>subplans</span></a> <span class='Operator'>= </span><a href="../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN80"><span class='Ref_to_Member'>subplans</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN174"><span class='Ref_To_Local'>subplan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN83"><span class='Ref_to_Member'>rewindPlanIDs</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN85"><span class='Ref_to_Member'>rowMarks</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN87"><span class='Ref_to_Member'>relationOids</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN89"><span class='Ref_to_Member'>invalItems</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* workers can't replan anyway... */ 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN91"><span class='Ref_to_Member'>nParamExec</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN121"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN411"><span class='Ref_to_Member'>es_plannedstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN91"><span class='Ref_to_Member'>nParamExec</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN93"><span class='Ref_to_Member'>utilityStmt</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN96"><span class='Ref_to_Member'>stmt_location</span></a> <span class='Operator'>= -</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN97"><span class='Ref_to_Member'>stmt_len</span></a> <span class='Operator'>= -</span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Return serialized copy of our dummy PlannedStmt. */ 
+</span>    <span class='Control'>return</span> <a href="../../include/nodes/nodes.h.html#LN598"><span class='Ref_to_Proto'>nodeToString</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN123"><span class='Ref_To_Local'>pstmt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecSerializePlan &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Ordinary plan nodes won't do anything here, but parallel-aware plan nodes 
+ * may need some state which is shared across all parallel workers.  Before 
+ * we size the DSM, give them a chance to call shm_toc_estimate_chunk or 
+ * shm_toc_estimate_keys on &pcxt-&GT;estimator. 
+ * 
+ * While we're at it, count the number of PlanState nodes in the tree, so 
+ * we know how many SharedPlanStateInstrumentation structures we need. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN204"></a><span class='Declare_Function'>ExecParallelEstimate</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>planstate</span><span class='Delimiter'>, </span><a href="execParallel.c.html#LN89"><span class='Ref_to_Struct'>ExecParallelEstimateContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>e</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Count this node. */ 
+</span>    <a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>e</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN92"><span class='Ref_to_Member'>nnodes</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Call estimators for parallel-aware nodes. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN136"><span class='Ref_to_Member'>parallel_aware</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN105"><span class='Ref_to_EnumConst'>T_SeqScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeSeqscan.h.html#LN25"><span class='Ref_to_Proto'>ExecSeqScanEstimate</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1067"><span class='Ref_to_Struct'>SeqScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                    <a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>e</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN91"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN107"><span class='Ref_to_EnumConst'>T_IndexScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeIndexscan.h.html#LN25"><span class='Ref_to_Proto'>ExecIndexScanEstimate</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1139"><span class='Ref_to_Struct'>IndexScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                      <a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>e</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN91"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN108"><span class='Ref_to_EnumConst'>T_IndexOnlyScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeIndexonlyscan.h.html#LN27"><span class='Ref_to_Proto'>ExecIndexOnlyScanEstimate</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1185"><span class='Ref_to_Struct'>IndexOnlyScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                          <a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>e</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN91"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN119"><span class='Ref_to_EnumConst'>T_ForeignScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeForeignscan.h.html#LN24"><span class='Ref_to_Proto'>ExecForeignScanEstimate</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1499"><span class='Ref_to_Struct'>ForeignScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                        <a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>e</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN91"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN120"><span class='Ref_to_EnumConst'>T_CustomScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeCustom.h.html#LN33"><span class='Ref_to_Proto'>ExecCustomScanEstimate</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1524"><span class='Ref_to_Struct'>CustomScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                       <a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>e</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN91"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN110"><span class='Ref_to_EnumConst'>T_BitmapHeapScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeBitmapHeapscan.h.html#LN23"><span class='Ref_to_Proto'>ExecBitmapHeapEstimate</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1301"><span class='Ref_to_Struct'>BitmapHeapScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                       <a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>e</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN91"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>default</span><span class='Operator'>: 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch nodeTag(planstate) &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if planstate-&GT;plan-&GT;para... &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="../../include/nodes/nodeFuncs.h.html#LN76"><span class='Ref_to_Proto'>planstate_tree_walker</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN105"><span class='Ref_to_Proto'>ExecParallelEstimate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN204"><span class='Ref_to_Parameter'>e</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecParallelEstimate &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize the dynamic shared memory segment that will be used to control 
+ * parallel execution. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN254"></a><span class='Declare_Function'>ExecParallelInitializeDSM</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>planstate</span><span class='Delimiter'>, 
+</span><a name="LN255"></a>                          <a href="execParallel.c.html#LN96"><span class='Ref_to_Struct'>ExecParallelInitializeDSMContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>d</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If instrumentation is enabled, initialize slot for this node. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN99"><span class='Ref_to_Member'>instrumentation</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN99"><span class='Ref_to_Member'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN81"><span class='Ref_to_Member'>plan_node_id</span></a><span class='Delimiter'>[</span><a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN100"><span class='Ref_to_Member'>nnodes</span></a><span class='Delimiter'>] </span><span class='Operator'>= 
+</span>            <a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN142"><span class='Ref_to_Member'>plan_node_id</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Count this node. */ 
+</span>    <a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN100"><span class='Ref_to_Member'>nnodes</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Call initializers for parallel-aware plan nodes. 
+     * 
+     * Ordinary plan nodes won't do anything here, but parallel-aware plan 
+     * nodes may need to initialize shared state in the DSM before parallel 
+     * workers are available.  They can allocate the space they previously 
+     * estimated using shm_toc_allocate, and add the keys they previously 
+     * estimated using shm_toc_insert, in each case targeting pcxt-&GT;toc. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN136"><span class='Ref_to_Member'>parallel_aware</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN105"><span class='Ref_to_EnumConst'>T_SeqScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeSeqscan.h.html#LN26"><span class='Ref_to_Proto'>ExecSeqScanInitializeDSM</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1067"><span class='Ref_to_Struct'>SeqScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                         <a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN98"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN107"><span class='Ref_to_EnumConst'>T_IndexScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeIndexscan.h.html#LN26"><span class='Ref_to_Proto'>ExecIndexScanInitializeDSM</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1139"><span class='Ref_to_Struct'>IndexScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                           <a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN98"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN108"><span class='Ref_to_EnumConst'>T_IndexOnlyScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeIndexonlyscan.h.html#LN29"><span class='Ref_to_Proto'>ExecIndexOnlyScanInitializeDSM</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1185"><span class='Ref_to_Struct'>IndexOnlyScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                               <a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN98"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN119"><span class='Ref_to_EnumConst'>T_ForeignScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeForeignscan.h.html#LN26"><span class='Ref_to_Proto'>ExecForeignScanInitializeDSM</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1499"><span class='Ref_to_Struct'>ForeignScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                             <a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN98"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN120"><span class='Ref_to_EnumConst'>T_CustomScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeCustom.h.html#LN35"><span class='Ref_to_Proto'>ExecCustomScanInitializeDSM</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1524"><span class='Ref_to_Struct'>CustomScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                            <a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN98"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN110"><span class='Ref_to_EnumConst'>T_BitmapHeapScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeBitmapHeapscan.h.html#LN25"><span class='Ref_to_Proto'>ExecBitmapHeapInitializeDSM</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1301"><span class='Ref_to_Struct'>BitmapHeapScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                            <a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN98"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>default</span><span class='Operator'>: 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch nodeTag(planstate) &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if planstate-&GT;plan-&GT;para... &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="../../include/nodes/nodeFuncs.h.html#LN76"><span class='Ref_to_Proto'>planstate_tree_walker</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN254"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN107"><span class='Ref_to_Proto'>ExecParallelInitializeDSM</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN255"><span class='Ref_to_Parameter'>d</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecParallelInitializeDSM &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * It sets up the response queues for backend workers to return tuples 
+ * to the main backend and start the workers. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../storage/ipc/shm_mq.c.html#LN126"><span class='Ref_to_Struct'>shm_mq_handle</span></a> <span class='Operator'>** 
+</span><a name="LN319"></a><span class='Declare_Function'>ExecParallelSetupTupleQueues</span><span class='Parentheses'>(</span><a href="../../include/access/parallel.h.html#LN31"><span class='Ref_to_Struct'>ParallelContext</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>pcxt</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>reinitialize</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN321"></a>    <a href="../storage/ipc/shm_mq.c.html#LN126"><span class='Ref_to_Struct'>shm_mq_handle</span></a> <span class='Operator'>**</span><span class='Declare_Local'>responseq</span><span class='Delimiter'>; 
+</span><a name="LN322"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>tqueuespace</span><span class='Delimiter'>; 
+</span><a name="LN323"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Skip this if no workers. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN35"><span class='Ref_to_Member'>nworkers</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Allocate memory for shared memory queue handles. */ 
+</span>    <a href="execParallel.c.html#LN321"><span class='Ref_To_Local'>responseq</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../storage/ipc/shm_mq.c.html#LN126"><span class='Ref_to_Struct'>shm_mq_handle</span></a> <span class='Operator'>**</span><span class='Parentheses'>) 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN35"><span class='Ref_to_Member'>nworkers</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../storage/ipc/shm_mq.c.html#LN126"><span class='Ref_to_Struct'>shm_mq_handle</span></a> <span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If not reinitializing, allocate space from the DSM for the queues; 
+     * otherwise, find the already allocated space. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>reinitialize</span></a><span class='Parentheses'>) 
+</span>        <a href="execParallel.c.html#LN322"><span class='Ref_To_Local'>tqueuespace</span></a> <span class='Operator'>= 
+</span>            <a href="../../include/storage/shm_toc.h.html#LN31"><span class='Ref_to_Proto'>shm_toc_allocate</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, 
+</span>                             <a href="../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN57"><span class='Ref_to_Const'>PARALLEL_TUPLE_QUEUE_SIZE</span></a><span class='Delimiter'>, 
+</span>                                      <a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN35"><span class='Ref_to_Member'>nworkers</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="execParallel.c.html#LN322"><span class='Ref_To_Local'>tqueuespace</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN34"><span class='Ref_to_Proto'>shm_toc_lookup</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN52"><span class='Ref_to_Const'>PARALLEL_KEY_TUPLE_QUEUE</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Create the queues, and become the receiver for each. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN323"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execParallel.c.html#LN323"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN35"><span class='Ref_to_Member'>nworkers</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="execParallel.c.html#LN323"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN348"></a>        <a href="../storage/ipc/shm_mq.c.html#LN68"><span class='Ref_to_Struct'>shm_mq</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>mq</span><span class='Delimiter'>; 
+</span> 
+        <a href="execParallel.c.html#LN348"><span class='Ref_To_Local'>mq</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_mq.h.html#LN49"><span class='Ref_to_Proto'>shm_mq_create</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN322"><span class='Ref_To_Local'>tqueuespace</span></a> <span class='Operator'>+ 
+</span>                           <span class='Parentheses'>((</span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a><span class='Parentheses'>) </span><a href="execParallel.c.html#LN323"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="execParallel.c.html#LN57"><span class='Ref_to_Const'>PARALLEL_TUPLE_QUEUE_SIZE</span></a><span class='Delimiter'>, 
+</span>                           <span class='Parentheses'>(</span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a><span class='Parentheses'>)</span> <a href="execParallel.c.html#LN57"><span class='Ref_to_Const'>PARALLEL_TUPLE_QUEUE_SIZE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/storage/shm_mq.h.html#LN50"><span class='Ref_to_Proto'>shm_mq_set_receiver</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN348"><span class='Ref_To_Local'>mq</span></a><span class='Delimiter'>, </span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN321"><span class='Ref_To_Local'>responseq</span></a><span class='Delimiter'>[</span><a href="execParallel.c.html#LN323"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../include/storage/shm_mq.h.html#LN58"><span class='Ref_to_Proto'>shm_mq_attach</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN348"><span class='Ref_To_Local'>mq</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN41"><span class='Ref_to_Member'>seg</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Add array of queues to shm_toc, so others can find it. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>reinitialize</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/storage/shm_toc.h.html#LN33"><span class='Ref_to_Proto'>shm_toc_insert</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN319"><span class='Ref_to_Parameter'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN52"><span class='Ref_to_Const'>PARALLEL_KEY_TUPLE_QUEUE</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN322"><span class='Ref_To_Local'>tqueuespace</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Return array of handles. */ 
+</span>    <span class='Control'>return</span> <a href="execParallel.c.html#LN321"><span class='Ref_To_Local'>responseq</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecParallelSetupTupleQueues &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Re-initialize the parallel executor info such that it can be reused by 
+ * workers. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN371"></a><span class='Declare_Function'>ExecParallelReinitialize</span><span class='Parentheses'>(</span><a href="../../include/executor/execParallel.h.html#LN23"><span class='Ref_to_Struct'>ParallelExecutorInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>pei</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../include/access/parallel.h.html#LN55"><span class='Ref_to_Proto'>ReinitializeParallelDSM</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN371"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN26"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN371"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN29"><span class='Ref_to_Member'>tqueue</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN109"><span class='Ref_to_Proto'>ExecParallelSetupTupleQueues</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN371"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN26"><span class='Ref_to_Member'>pcxt</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN371"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN31"><span class='Ref_to_Member'>finished</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Sets up the required infrastructure for backend workers to perform 
+ * execution and return results to the main backend. 
+ */ 
+</span><a href="../../include/executor/execParallel.h.html#LN23"><span class='Ref_to_Struct'>ParallelExecutorInfo</span></a> <span class='Operator'>* 
+</span><a name="LN383"></a><span class='Declare_Function'>ExecInitParallelPlan</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>planstate</span><span class='Delimiter'>, </span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nworkers</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN385"></a>    <a href="../../include/executor/execParallel.h.html#LN23"><span class='Ref_to_Struct'>ParallelExecutorInfo</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pei</span><span class='Delimiter'>; 
+</span><a name="LN386"></a>    <a href="../../include/access/parallel.h.html#LN31"><span class='Ref_to_Struct'>ParallelContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pcxt</span><span class='Delimiter'>; 
+</span><a name="LN387"></a>    <a href="execParallel.c.html#LN89"><span class='Ref_to_Struct'>ExecParallelEstimateContext</span></a> <span class='Declare_Local'>e</span><span class='Delimiter'>; 
+</span><a name="LN388"></a>    <a href="execParallel.c.html#LN96"><span class='Ref_to_Struct'>ExecParallelInitializeDSMContext</span></a> <span class='Declare_Local'>d</span><span class='Delimiter'>; 
+</span><a name="LN389"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>pstmt_data</span><span class='Delimiter'>; 
+</span><a name="LN390"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>pstmt_space</span><span class='Delimiter'>; 
+</span><a name="LN391"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>param_space</span><span class='Delimiter'>; 
+</span><a name="LN392"></a>    <a href="../../include/executor/instrument.h.html#LN18"><span class='Ref_to_Struct'>BufferUsage</span></a> <span class='Operator'>*</span><span class='Declare_Local'>bufusage_space</span><span class='Delimiter'>; 
+</span><a name="LN393"></a>    <a href="execParallel.c.html#LN75"><span class='Ref_to_Struct'>SharedExecutorInstrumentation</span></a> <span class='Operator'>*</span><span class='Declare_Local'>instrumentation</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN394"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pstmt_len</span><span class='Delimiter'>; 
+</span><a name="LN395"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>param_len</span><span class='Delimiter'>; 
+</span><a name="LN396"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>instrumentation_len</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN397"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>instrument_offset</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN398"></a>    <a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>dsa_minsize</span> <span class='Operator'>= </span><a href="../../include/utils/dsa.h.html#LN116"><span class='Ref_to_Proto'>dsa_minimum_size</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN399"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>query_string</span><span class='Delimiter'>; 
+</span><a name="LN400"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>query_len</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Allocate object for return value. */ 
+</span>    <a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/executor/execParallel.h.html#LN23"><span class='Ref_to_Struct'>ParallelExecutorInfo</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN31"><span class='Ref_to_Member'>finished</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN25"><span class='Ref_to_Member'>planstate</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Fix up and serialize plan to be sent to workers. */ 
+</span>    <a href="execParallel.c.html#LN389"><span class='Ref_To_Local'>pstmt_data</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN104"><span class='Ref_to_Proto'>ExecSerializePlan</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Create a parallel context. */ 
+</span>    <a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a> <span class='Operator'>= </span><a href="../../include/access/parallel.h.html#LN53"><span class='Ref_to_Proto'>CreateParallelContext</span></a><span class='Parentheses'>(</span><span class='String'>"postgres"</span><span class='Delimiter'>, </span><span class='String'>"ParallelQueryMain"</span><span class='Delimiter'>, </span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>nworkers</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN26"><span class='Ref_to_Member'>pcxt</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Before telling the parallel context to create a dynamic shared memory 
+     * segment, we need to figure out how big it should be.  Estimate space 
+     * for the various things we need to store. 
+     */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* Estimate space for query text. */ 
+</span>    <a href="execParallel.c.html#LN400"><span class='Ref_To_Local'>query_len</span></a> <span class='Operator'>= </span>strlen<span class='Parentheses'>(</span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN412"><span class='Ref_to_Member'>es_sourceText</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN50"><span class='Ref_to_Macro'>shm_toc_estimate_chunk</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN400"><span class='Ref_To_Local'>query_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN52"><span class='Ref_to_Macro'>shm_toc_estimate_keys</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Estimate space for serialized PlannedStmt. */ 
+</span>    <a href="execParallel.c.html#LN394"><span class='Ref_To_Local'>pstmt_len</span></a> <span class='Operator'>= </span>strlen<span class='Parentheses'>(</span><a href="execParallel.c.html#LN389"><span class='Ref_To_Local'>pstmt_data</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN50"><span class='Ref_to_Macro'>shm_toc_estimate_chunk</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN394"><span class='Ref_To_Local'>pstmt_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN52"><span class='Ref_to_Macro'>shm_toc_estimate_keys</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Estimate space for serialized ParamListInfo. */ 
+</span>    <a href="execParallel.c.html#LN395"><span class='Ref_To_Local'>param_len</span></a> <span class='Operator'>= </span><a href="../nodes/params.c.html#LN93"><span class='Ref_to_Func'>EstimateParamListSpace</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN441"><span class='Ref_to_Member'>es_param_list_info</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN50"><span class='Ref_to_Macro'>shm_toc_estimate_chunk</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN395"><span class='Ref_To_Local'>param_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN52"><span class='Ref_to_Macro'>shm_toc_estimate_keys</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Estimate space for BufferUsage. 
+     * 
+     * If EXPLAIN is not in use and there are no extensions loaded that care, 
+     * we could skip this.  But we have no way of knowing whether anyone's 
+     * looking at pgBufferUsage, so do it unconditionally. 
+     */ 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN50"><span class='Ref_to_Macro'>shm_toc_estimate_chunk</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, 
+</span>                           <a href="../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/executor/instrument.h.html#LN18"><span class='Ref_to_Struct'>BufferUsage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN35"><span class='Ref_to_Member'>nworkers</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN52"><span class='Ref_to_Macro'>shm_toc_estimate_keys</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Estimate space for tuple queues. */ 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN50"><span class='Ref_to_Macro'>shm_toc_estimate_chunk</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, 
+</span>                        <a href="../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN57"><span class='Ref_to_Const'>PARALLEL_TUPLE_QUEUE_SIZE</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN35"><span class='Ref_to_Member'>nworkers</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN52"><span class='Ref_to_Macro'>shm_toc_estimate_keys</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Give parallel-aware nodes a chance to add to the estimates, and get a 
+     * count of how many PlanState nodes there are. 
+     */ 
+</span>    <a href="execParallel.c.html#LN387"><span class='Ref_To_Local'>e</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN91"><span class='Ref_to_Member'>pcxt</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN387"><span class='Ref_To_Local'>e</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN92"><span class='Ref_to_Member'>nnodes</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN105"><span class='Ref_to_Proto'>ExecParallelEstimate</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execParallel.c.html#LN387"><span class='Ref_To_Local'>e</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Estimate space for instrumentation, if required. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN457"><span class='Ref_to_Member'>es_instrument</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="execParallel.c.html#LN396"><span class='Ref_To_Local'>instrumentation_len</span></a> <span class='Operator'>= 
+</span>            <a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN75"><span class='Ref_to_Struct'>SharedExecutorInstrumentation</span></a><span class='Delimiter'>, </span>plan_node_id<span class='Parentheses'>) </span><span class='Operator'>+ 
+</span>            <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="execParallel.c.html#LN387"><span class='Ref_To_Local'>e</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN92"><span class='Ref_to_Member'>nnodes</span></a><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN396"><span class='Ref_To_Local'>instrumentation_len</span></a> <span class='Operator'>= </span><a href="../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN396"><span class='Ref_To_Local'>instrumentation_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN397"><span class='Ref_To_Local'>instrument_offset</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN396"><span class='Ref_To_Local'>instrumentation_len</span></a><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN396"><span class='Ref_To_Local'>instrumentation_len</span></a> <span class='Operator'>+= 
+</span>            <a href="../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/executor/instrument.h.html#LN43"><span class='Ref_to_Struct'>Instrumentation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN387"><span class='Ref_To_Local'>e</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN92"><span class='Ref_to_Member'>nnodes</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>nworkers</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/shm_toc.h.html#LN50"><span class='Ref_to_Macro'>shm_toc_estimate_chunk</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN396"><span class='Ref_To_Local'>instrumentation_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/shm_toc.h.html#LN52"><span class='Ref_to_Macro'>shm_toc_estimate_keys</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Estimate space for DSA area. */ 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN50"><span class='Ref_to_Macro'>shm_toc_estimate_chunk</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN398"><span class='Ref_To_Local'>dsa_minsize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN52"><span class='Ref_to_Macro'>shm_toc_estimate_keys</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN40"><span class='Ref_to_Member'>estimator</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Everyone's had a chance to ask for space, so now create the DSM. */ 
+</span>    <a href="../../include/access/parallel.h.html#LN54"><span class='Ref_to_Proto'>InitializeParallelDSM</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * OK, now we have a dynamic shared memory segment, and it should be big 
+     * enough to store all of the data we estimated we would want to put into 
+     * it, plus whatever general stuff (not specifically executor-related) the 
+     * ParallelContext itself needs to store there.  None of the space we 
+     * asked for has been allocated or initialized yet, though, so do that. 
+     */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* Store query string */ 
+</span>    <a href="execParallel.c.html#LN399"><span class='Ref_To_Local'>query_string</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN31"><span class='Ref_to_Proto'>shm_toc_allocate</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN400"><span class='Ref_To_Local'>query_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    memcpy<span class='Parentheses'>(</span><a href="execParallel.c.html#LN399"><span class='Ref_To_Local'>query_string</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN412"><span class='Ref_to_Member'>es_sourceText</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN400"><span class='Ref_To_Local'>query_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN33"><span class='Ref_to_Proto'>shm_toc_insert</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN55"><span class='Ref_to_Const'>PARALLEL_KEY_QUERY_TEXT</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN399"><span class='Ref_To_Local'>query_string</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Store serialized PlannedStmt. */ 
+</span>    <a href="execParallel.c.html#LN390"><span class='Ref_To_Local'>pstmt_space</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN31"><span class='Ref_to_Proto'>shm_toc_allocate</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN394"><span class='Ref_To_Local'>pstmt_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    memcpy<span class='Parentheses'>(</span><a href="execParallel.c.html#LN390"><span class='Ref_To_Local'>pstmt_space</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN389"><span class='Ref_To_Local'>pstmt_data</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN394"><span class='Ref_To_Local'>pstmt_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN33"><span class='Ref_to_Proto'>shm_toc_insert</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN49"><span class='Ref_to_Const'>PARALLEL_KEY_PLANNEDSTMT</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN390"><span class='Ref_To_Local'>pstmt_space</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Store serialized ParamListInfo. */ 
+</span>    <a href="execParallel.c.html#LN391"><span class='Ref_To_Local'>param_space</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN31"><span class='Ref_to_Proto'>shm_toc_allocate</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN395"><span class='Ref_To_Local'>param_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN33"><span class='Ref_to_Proto'>shm_toc_insert</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN50"><span class='Ref_to_Const'>PARALLEL_KEY_PARAMS</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN391"><span class='Ref_To_Local'>param_space</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/nodes/params.h.html#LN107"><span class='Ref_to_Proto'>SerializeParamList</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN441"><span class='Ref_to_Member'>es_param_list_info</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execParallel.c.html#LN391"><span class='Ref_To_Local'>param_space</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Allocate space for each worker's BufferUsage; no need to initialize. */ 
+</span>    <a href="execParallel.c.html#LN392"><span class='Ref_To_Local'>bufusage_space</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN31"><span class='Ref_to_Proto'>shm_toc_allocate</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, 
+</span>                              <a href="../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/executor/instrument.h.html#LN18"><span class='Ref_to_Struct'>BufferUsage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN35"><span class='Ref_to_Member'>nworkers</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_toc.h.html#LN33"><span class='Ref_to_Proto'>shm_toc_insert</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN51"><span class='Ref_to_Const'>PARALLEL_KEY_BUFFER_USAGE</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN392"><span class='Ref_To_Local'>bufusage_space</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN27"><span class='Ref_to_Member'>buffer_usage</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN392"><span class='Ref_To_Local'>bufusage_space</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Set up tuple queues. */ 
+</span>    <a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN29"><span class='Ref_to_Member'>tqueue</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN109"><span class='Ref_to_Proto'>ExecParallelSetupTupleQueues</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If instrumentation options were supplied, allocate space for the data. 
+     * It only gets partially initialized here; the rest happens during 
+     * ExecParallelInitializeDSM. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN457"><span class='Ref_to_Member'>es_instrument</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN520"></a>        <a href="../../include/executor/instrument.h.html#LN43"><span class='Ref_to_Struct'>Instrumentation</span></a> <span class='Operator'>*</span><span class='Declare_Local'>instrument</span><span class='Delimiter'>; 
+</span><a name="LN521"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <a href="execParallel.c.html#LN393"><span class='Ref_To_Local'>instrumentation</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN31"><span class='Ref_to_Proto'>shm_toc_allocate</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN396"><span class='Ref_To_Local'>instrumentation_len</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN393"><span class='Ref_To_Local'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN77"><span class='Ref_to_Member'>instrument_options</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN457"><span class='Ref_to_Member'>es_instrument</span></a><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN393"><span class='Ref_To_Local'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN78"><span class='Ref_to_Member'>instrument_offset</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN397"><span class='Ref_To_Local'>instrument_offset</span></a><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN393"><span class='Ref_To_Local'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN79"><span class='Ref_to_Member'>num_workers</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>nworkers</span></a><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN393"><span class='Ref_To_Local'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN80"><span class='Ref_to_Member'>num_plan_nodes</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN387"><span class='Ref_To_Local'>e</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN92"><span class='Ref_to_Member'>nnodes</span></a><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN520"><span class='Ref_To_Local'>instrument</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN84"><span class='Ref_to_Macro'>GetInstrumentationArray</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN393"><span class='Ref_To_Local'>instrumentation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN521"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execParallel.c.html#LN521"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>nworkers</span></a> <span class='Operator'>* </span><a href="execParallel.c.html#LN387"><span class='Ref_To_Local'>e</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN92"><span class='Ref_to_Member'>nnodes</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="execParallel.c.html#LN521"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>            <a href="instrument.c.html#LN52"><span class='Ref_to_Func'>InstrInit</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN520"><span class='Ref_To_Local'>instrument</span></a><span class='Delimiter'>[</span><a href="execParallel.c.html#LN521"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], </span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN457"><span class='Ref_to_Member'>es_instrument</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/shm_toc.h.html#LN33"><span class='Ref_to_Proto'>shm_toc_insert</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN53"><span class='Ref_to_Const'>PARALLEL_KEY_INSTRUMENTATION</span></a><span class='Delimiter'>, 
+</span>                       <a href="execParallel.c.html#LN393"><span class='Ref_To_Local'>instrumentation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN28"><span class='Ref_to_Member'>instrumentation</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN393"><span class='Ref_To_Local'>instrumentation</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create a DSA area that can be used by the leader and all workers. 
+     * (However, if we failed to create a DSM and are using private memory 
+     * instead, then skip this.) 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN41"><span class='Ref_to_Member'>seg</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN543"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>area_space</span><span class='Delimiter'>; 
+</span> 
+        <a href="execParallel.c.html#LN543"><span class='Ref_To_Local'>area_space</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN31"><span class='Ref_to_Proto'>shm_toc_allocate</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN398"><span class='Ref_To_Local'>dsa_minsize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/shm_toc.h.html#LN33"><span class='Ref_to_Proto'>shm_toc_insert</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN43"><span class='Ref_to_Member'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN54"><span class='Ref_to_Const'>PARALLEL_KEY_DSA</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN543"><span class='Ref_To_Local'>area_space</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN30"><span class='Ref_to_Member'>area</span></a> <span class='Operator'>= </span><a href="../../include/utils/dsa.h.html#LN104"><span class='Ref_to_Proto'>dsa_create_in_place</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN543"><span class='Ref_To_Local'>area_space</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN398"><span class='Ref_To_Local'>dsa_minsize</span></a><span class='Delimiter'>, 
+</span>                                        <a href="../../include/storage/lwlock.h.html#LN213"><span class='Ref_to_EnumConst'>LWTRANCHE_PARALLEL_QUERY_DSA</span></a><span class='Delimiter'>, 
+</span>                                        <a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN41"><span class='Ref_to_Member'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Make the area available to executor nodes running in the leader.  See 
+     * also ParallelQueryMain which makes it available to workers. 
+     */ 
+</span>    <a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN487"><span class='Ref_to_Member'>es_query_dsa</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN30"><span class='Ref_to_Member'>area</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Give parallel-aware nodes a chance to initialize their shared data. 
+     * This also initializes the elements of instrumentation-&GT;ps_instrument, 
+     * if it exists. 
+     */ 
+</span>    <a href="execParallel.c.html#LN388"><span class='Ref_To_Local'>d</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN98"><span class='Ref_to_Member'>pcxt</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN386"><span class='Ref_To_Local'>pcxt</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN388"><span class='Ref_To_Local'>d</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN99"><span class='Ref_to_Member'>instrumentation</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN393"><span class='Ref_To_Local'>instrumentation</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN388"><span class='Ref_To_Local'>d</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN100"><span class='Ref_to_Member'>nnodes</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN107"><span class='Ref_to_Proto'>ExecParallelInitializeDSM</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN383"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execParallel.c.html#LN388"><span class='Ref_To_Local'>d</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Make sure that the world hasn't shifted under our feat.  This could 
+     * probably just be an Assert(), but let's be conservative for now. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN387"><span class='Ref_To_Local'>e</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN92"><span class='Ref_to_Member'>nnodes</span></a> <span class='Operator'>!= </span><a href="execParallel.c.html#LN388"><span class='Ref_To_Local'>d</span></a><span class='Operator'>.</span><a href="execParallel.c.html#LN100"><span class='Ref_to_Member'>nnodes</span></a><span class='Parentheses'>) 
+</span>        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"inconsistent count of PlanState nodes"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* OK, we're ready to rock and roll. */ 
+</span>    <span class='Control'>return</span> <a href="execParallel.c.html#LN385"><span class='Ref_To_Local'>pei</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecInitParallelPlan &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Copy instrumentation information about this node and its descendants from 
+ * dynamic shared memory. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN584"></a><span class='Declare_Function'>ExecParallelRetrieveInstrumentation</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>planstate</span><span class='Delimiter'>, 
+</span><a name="LN585"></a>                              <a href="execParallel.c.html#LN75"><span class='Ref_to_Struct'>SharedExecutorInstrumentation</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>instrumentation</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN587"></a>    <a href="../../include/executor/instrument.h.html#LN43"><span class='Ref_to_Struct'>Instrumentation</span></a> <span class='Operator'>*</span><span class='Declare_Local'>instrument</span><span class='Delimiter'>; 
+</span><a name="LN588"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN589"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>n</span><span class='Delimiter'>; 
+</span><a name="LN590"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>ibytes</span><span class='Delimiter'>; 
+</span><a name="LN591"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>plan_node_id</span> <span class='Operator'>= </span><a href="execParallel.c.html#LN584"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN142"><span class='Ref_to_Member'>plan_node_id</span></a><span class='Delimiter'>; 
+</span><a name="LN592"></a>    <a href="../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldcontext</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Find the instrumentation for this node. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN588"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execParallel.c.html#LN588"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execParallel.c.html#LN585"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN80"><span class='Ref_to_Member'>num_plan_nodes</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="execParallel.c.html#LN588"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN585"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN81"><span class='Ref_to_Member'>plan_node_id</span></a><span class='Delimiter'>[</span><a href="execParallel.c.html#LN588"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><a href="execParallel.c.html#LN591"><span class='Ref_To_Local'>plan_node_id</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN588"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&GT;= </span><a href="execParallel.c.html#LN585"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN80"><span class='Ref_to_Member'>num_plan_nodes</span></a><span class='Parentheses'>) 
+</span>        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"plan node %d not found"</span><span class='Delimiter'>, </span><a href="execParallel.c.html#LN591"><span class='Ref_To_Local'>plan_node_id</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Accumulate the statistics from all workers. */ 
+</span>    <a href="execParallel.c.html#LN587"><span class='Ref_To_Local'>instrument</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN84"><span class='Ref_to_Macro'>GetInstrumentationArray</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN585"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN587"><span class='Ref_To_Local'>instrument</span></a> <span class='Operator'>+= </span><a href="execParallel.c.html#LN588"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>* </span><a href="execParallel.c.html#LN585"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN79"><span class='Ref_to_Member'>num_workers</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN589"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execParallel.c.html#LN589"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>&LT; </span><a href="execParallel.c.html#LN585"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN79"><span class='Ref_to_Member'>num_workers</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="execParallel.c.html#LN589"><span class='Ref_To_Local'>n</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/executor/instrument.h.html#LN78"><span class='Ref_to_Proto'>InstrAggNode</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN584"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN818"><span class='Ref_to_Member'>instrument</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execParallel.c.html#LN587"><span class='Ref_To_Local'>instrument</span></a><span class='Delimiter'>[</span><a href="execParallel.c.html#LN589"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Also store the per-worker detail. 
+     * 
+     * Worker instrumentation should be allocated in the same context as the 
+     * regular instrumentation information, which is the per-query context. 
+     * Switch into per-query memory context. 
+     */ 
+</span>    <a href="execParallel.c.html#LN592"><span class='Ref_To_Local'>oldcontext</span></a> <span class='Operator'>= </span><a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN584"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN814"><span class='Ref_to_Member'>state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN447"><span class='Ref_to_Member'>es_query_cxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN590"><span class='Ref_To_Local'>ibytes</span></a> <span class='Operator'>= </span><a href="../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN585"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN79"><span class='Ref_to_Member'>num_workers</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/executor/instrument.h.html#LN43"><span class='Ref_to_Struct'>Instrumentation</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN584"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN819"><span class='Ref_to_Member'>worker_instrument</span></a> <span class='Operator'>= 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN590"><span class='Ref_To_Local'>ibytes</span></a> <span class='Operator'>+ </span><a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../include/executor/instrument.h.html#LN65"><span class='Ref_to_Struct'>WorkerInstrumentation</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN587"><span class='Ref_To_Local'>instrument</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN592"><span class='Ref_To_Local'>oldcontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="execParallel.c.html#LN584"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN819"><span class='Ref_to_Member'>worker_instrument</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/instrument.h.html#LN67"><span class='Ref_to_Member'>num_workers</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN585"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN79"><span class='Ref_to_Member'>num_workers</span></a><span class='Delimiter'>; 
+</span>    memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN584"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN819"><span class='Ref_to_Member'>worker_instrument</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/instrument.h.html#LN68"><span class='Ref_to_Member'>instrument</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN587"><span class='Ref_To_Local'>instrument</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN590"><span class='Ref_To_Local'>ibytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../include/nodes/nodeFuncs.h.html#LN76"><span class='Ref_to_Proto'>planstate_tree_walker</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN584"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN111"><span class='Ref_to_Proto'>ExecParallelRetrieveInstrumentation</span></a><span class='Delimiter'>, 
+</span>                                 <a href="execParallel.c.html#LN585"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecParallelRetrieveInstrumentation &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Finish parallel execution.  We wait for parallel workers to finish, and 
+ * accumulate their buffer usage and instrumentation. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN632"></a><span class='Declare_Function'>ExecParallelFinish</span><span class='Parentheses'>(</span><a href="../../include/executor/execParallel.h.html#LN23"><span class='Ref_to_Struct'>ParallelExecutorInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>pei</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN634"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN632"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN31"><span class='Ref_to_Member'>finished</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* First, wait for the workers to finish. */ 
+</span>    <a href="../../include/access/parallel.h.html#LN57"><span class='Ref_to_Proto'>WaitForParallelWorkersToFinish</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN632"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN26"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Next, accumulate buffer usage. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN634"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execParallel.c.html#LN634"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execParallel.c.html#LN632"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN26"><span class='Ref_to_Member'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN36"><span class='Ref_to_Member'>nworkers_launched</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="execParallel.c.html#LN634"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/executor/instrument.h.html#LN81"><span class='Ref_to_Proto'>InstrAccumParallelQuery</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN632"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN27"><span class='Ref_to_Member'>buffer_usage</span></a><span class='Delimiter'>[</span><a href="execParallel.c.html#LN634"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Finally, accumulate instrumentation, if any. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN632"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN28"><span class='Ref_to_Member'>instrumentation</span></a><span class='Parentheses'>) 
+</span>        <a href="execParallel.c.html#LN111"><span class='Ref_to_Proto'>ExecParallelRetrieveInstrumentation</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN632"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN25"><span class='Ref_to_Member'>planstate</span></a><span class='Delimiter'>, 
+</span>                                            <a href="execParallel.c.html#LN632"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN28"><span class='Ref_to_Member'>instrumentation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="execParallel.c.html#LN632"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN31"><span class='Ref_to_Member'>finished</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecParallelFinish &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Clean up whatever ParallelExecutorInfo resources still exist after 
+ * ExecParallelFinish.  We separate these routines because someone might 
+ * want to examine the contents of the DSM after ExecParallelFinish and 
+ * before calling this routine. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN661"></a><span class='Declare_Function'>ExecParallelCleanup</span><span class='Parentheses'>(</span><a href="../../include/executor/execParallel.h.html#LN23"><span class='Ref_to_Struct'>ParallelExecutorInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>pei</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN661"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN30"><span class='Ref_to_Member'>area</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/utils/dsa.h.html#LN112"><span class='Ref_to_Proto'>dsa_detach</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN661"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN30"><span class='Ref_to_Member'>area</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN661"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN30"><span class='Ref_to_Member'>area</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN661"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN26"><span class='Ref_to_Member'>pcxt</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/access/parallel.h.html#LN58"><span class='Ref_to_Proto'>DestroyParallelContext</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN661"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN26"><span class='Ref_to_Member'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execParallel.c.html#LN661"><span class='Ref_to_Parameter'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN26"><span class='Ref_to_Member'>pcxt</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN661"><span class='Ref_to_Parameter'>pei</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Create a DestReceiver to write tuples we produce to the shm_mq designated 
+ * for that purpose. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/tcop/dest.h.html#LN112"><span class='Ref_to_Typedef'>DestReceiver</span></a> <span class='Operator'>* 
+</span><a name="LN681"></a><span class='Declare_Function'>ExecParallelGetReceiver</span><span class='Parentheses'>(</span><a href="../storage/ipc/dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Delimiter'>, </span><a href="../storage/ipc/shm_toc.c.html#LN25"><span class='Ref_to_Struct'>shm_toc</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>toc</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN683"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>mqspace</span><span class='Delimiter'>; 
+</span><a name="LN684"></a>    <a href="../storage/ipc/shm_mq.c.html#LN68"><span class='Ref_to_Struct'>shm_mq</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>mq</span><span class='Delimiter'>; 
+</span> 
+    <a href="execParallel.c.html#LN683"><span class='Ref_To_Local'>mqspace</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN34"><span class='Ref_to_Proto'>shm_toc_lookup</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN681"><span class='Ref_to_Parameter'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN52"><span class='Ref_to_Const'>PARALLEL_KEY_TUPLE_QUEUE</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN683"><span class='Ref_To_Local'>mqspace</span></a> <span class='Operator'>+= </span><a href="../access/transam/parallel.c.html#LN93"><span class='Ref_to_Global_Var'>ParallelWorkerNumber</span></a> <span class='Operator'>* </span><a href="execParallel.c.html#LN57"><span class='Ref_to_Const'>PARALLEL_TUPLE_QUEUE_SIZE</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN684"><span class='Ref_To_Local'>mq</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../storage/ipc/shm_mq.c.html#LN68"><span class='Ref_to_Struct'>shm_mq</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN683"><span class='Ref_To_Local'>mqspace</span></a><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/shm_mq.h.html#LN51"><span class='Ref_to_Proto'>shm_mq_set_sender</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN684"><span class='Ref_To_Local'>mq</span></a><span class='Delimiter'>, </span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="../../include/executor/tqueue.h.html#LN23"><span class='Ref_to_Proto'>CreateTupleQueueDestReceiver</span></a><span class='Parentheses'>(</span><a href="../../include/storage/shm_mq.h.html#LN58"><span class='Ref_to_Proto'>shm_mq_attach</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN684"><span class='Ref_To_Local'>mq</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN681"><span class='Ref_to_Parameter'>seg</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Create a QueryDesc for the PlannedStmt we are to execute, and return it. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/executor/execdesc.h.html#LN32"><span class='Ref_to_Struct'>QueryDesc</span></a> <span class='Operator'>* 
+</span><a name="LN697"></a><span class='Declare_Function'>ExecParallelGetQueryDesc</span><span class='Parentheses'>(</span><a href="../storage/ipc/shm_toc.c.html#LN25"><span class='Ref_to_Struct'>shm_toc</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>toc</span><span class='Delimiter'>, </span><a href="../../include/tcop/dest.h.html#LN112"><span class='Ref_to_Typedef'>DestReceiver</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>receiver</span><span class='Delimiter'>, 
+</span><a name="LN698"></a>                         <span class='Keyword'>int </span><span class='Declare_Parameter'>instrument_options</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN700"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>pstmtspace</span><span class='Delimiter'>; 
+</span><a name="LN701"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>paramspace</span><span class='Delimiter'>; 
+</span><a name="LN702"></a>    <a href="../../include/nodes/plannodes.h.html#LN40"><span class='Ref_to_Struct'>PlannedStmt</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pstmt</span><span class='Delimiter'>; 
+</span><a name="LN703"></a>    <a href="../../include/nodes/params.h.html#LN61"><span class='Ref_to_Typedef'>ParamListInfo</span></a> <span class='Declare_Local'>paramLI</span><span class='Delimiter'>; 
+</span><a name="LN704"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>queryString</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get the query string from shared memory */ 
+</span>    <a href="execParallel.c.html#LN704"><span class='Ref_To_Local'>queryString</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN34"><span class='Ref_to_Proto'>shm_toc_lookup</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN697"><span class='Ref_to_Parameter'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN55"><span class='Ref_to_Const'>PARALLEL_KEY_QUERY_TEXT</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Reconstruct leader-supplied PlannedStmt. */ 
+</span>    <a href="execParallel.c.html#LN700"><span class='Ref_To_Local'>pstmtspace</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN34"><span class='Ref_to_Proto'>shm_toc_lookup</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN697"><span class='Ref_to_Parameter'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN49"><span class='Ref_to_Const'>PARALLEL_KEY_PLANNEDSTMT</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN702"><span class='Ref_To_Local'>pstmt</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN40"><span class='Ref_to_Struct'>PlannedStmt</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../nodes/read.c.html#LN36"><span class='Ref_to_Func'>stringToNode</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN700"><span class='Ref_To_Local'>pstmtspace</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Reconstruct ParamListInfo. */ 
+</span>    <a href="execParallel.c.html#LN701"><span class='Ref_To_Local'>paramspace</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN34"><span class='Ref_to_Proto'>shm_toc_lookup</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN697"><span class='Ref_to_Parameter'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN50"><span class='Ref_to_Const'>PARALLEL_KEY_PARAMS</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN703"><span class='Ref_To_Local'>paramLI</span></a> <span class='Operator'>= </span><a href="../../include/nodes/params.h.html#LN108"><span class='Ref_to_Proto'>RestoreParamList</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN701"><span class='Ref_To_Local'>paramspace</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create a QueryDesc for the query. 
+     * 
+     * It's not obvious how to obtain the query string from here; and even if 
+     * we could copying it would take more cycles than not copying it. But 
+     * it's a bit unsatisfying to just use a dummy string here, so consider 
+     * revising this someday. 
+     */ 
+</span>    <span class='Control'>return</span> <a href="../../include/executor/execdesc.h.html#LN58"><span class='Ref_to_Proto'>CreateQueryDesc</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN702"><span class='Ref_To_Local'>pstmt</span></a><span class='Delimiter'>, 
+</span>                           <a href="execParallel.c.html#LN704"><span class='Ref_To_Local'>queryString</span></a><span class='Delimiter'>, 
+</span>                           <a href="../../include/utils/snapmgr.h.html#LN77"><span class='Ref_to_Proto'>GetActiveSnapshot</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><a href="../../include/utils/snapshot.h.html#LN24"><span class='Ref_to_Const'>InvalidSnapshot</span></a><span class='Delimiter'>, 
+</span>                           <a href="execParallel.c.html#LN697"><span class='Ref_to_Parameter'>receiver</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN703"><span class='Ref_To_Local'>paramLI</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><a href="execParallel.c.html#LN698"><span class='Ref_to_Parameter'>instrument_options</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecParallelGetQueryDesc &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Copy instrumentation information from this node and its descendants into 
+ * dynamic shared memory, so that the parallel leader can retrieve it. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN736"></a><span class='Declare_Function'>ExecParallelReportInstrumentation</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>planstate</span><span class='Delimiter'>, 
+</span><a name="LN737"></a>                              <a href="execParallel.c.html#LN75"><span class='Ref_to_Struct'>SharedExecutorInstrumentation</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>instrumentation</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN739"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN740"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>plan_node_id</span> <span class='Operator'>= </span><a href="execParallel.c.html#LN736"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN142"><span class='Ref_to_Member'>plan_node_id</span></a><span class='Delimiter'>; 
+</span><a name="LN741"></a>    <a href="../../include/executor/instrument.h.html#LN43"><span class='Ref_to_Struct'>Instrumentation</span></a> <span class='Operator'>*</span><span class='Declare_Local'>instrument</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/executor/instrument.h.html#LN77"><span class='Ref_to_Proto'>InstrEndLoop</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN736"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN818"><span class='Ref_to_Member'>instrument</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we shuffled the plan_node_id values in ps_instrument into sorted 
+     * order, we could use binary search here.  This might matter someday if 
+     * we're pushing down sufficiently large plan trees.  For now, do it the 
+     * slow, dumb way. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN739"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execParallel.c.html#LN739"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execParallel.c.html#LN737"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN80"><span class='Ref_to_Member'>num_plan_nodes</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="execParallel.c.html#LN739"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN737"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN81"><span class='Ref_to_Member'>plan_node_id</span></a><span class='Delimiter'>[</span><a href="execParallel.c.html#LN739"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><a href="execParallel.c.html#LN740"><span class='Ref_To_Local'>plan_node_id</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN739"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&GT;= </span><a href="execParallel.c.html#LN737"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN80"><span class='Ref_to_Member'>num_plan_nodes</span></a><span class='Parentheses'>) 
+</span>        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"plan node %d not found"</span><span class='Delimiter'>, </span><a href="execParallel.c.html#LN740"><span class='Ref_To_Local'>plan_node_id</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Add our statistics to the per-node, per-worker totals.  It's possible 
+     * that this could happen more than once if we relaunched workers. 
+     */ 
+</span>    <a href="execParallel.c.html#LN741"><span class='Ref_To_Local'>instrument</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN84"><span class='Ref_to_Macro'>GetInstrumentationArray</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN737"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN741"><span class='Ref_To_Local'>instrument</span></a> <span class='Operator'>+= </span><a href="execParallel.c.html#LN739"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>* </span><a href="execParallel.c.html#LN737"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN79"><span class='Ref_to_Member'>num_workers</span></a><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../include/access/parallel.h.html#LN51"><span class='Ref_to_Macro'>IsParallelWorker</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../access/transam/parallel.c.html#LN93"><span class='Ref_to_Global_Var'>ParallelWorkerNumber</span></a> <span class='Operator'>&LT; </span><a href="execParallel.c.html#LN737"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN79"><span class='Ref_to_Member'>num_workers</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/executor/instrument.h.html#LN78"><span class='Ref_to_Proto'>InstrAggNode</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN741"><span class='Ref_To_Local'>instrument</span></a><span class='Delimiter'>[</span><a href="../access/transam/parallel.c.html#LN93"><span class='Ref_to_Global_Var'>ParallelWorkerNumber</span></a><span class='Delimiter'>], </span><a href="execParallel.c.html#LN736"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN818"><span class='Ref_to_Member'>instrument</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../include/nodes/nodeFuncs.h.html#LN76"><span class='Ref_to_Proto'>planstate_tree_walker</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN736"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN735"><span class='Ref_to_Func'>ExecParallelReportInstrumentation</span></a><span class='Delimiter'>, 
+</span>                                 <a href="execParallel.c.html#LN737"><span class='Ref_to_Parameter'>instrumentation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecParallelReportInstrumentation &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize the PlanState and its descendants with the information 
+ * retrieved from shared memory.  This has to be done once the PlanState 
+ * is allocated and initialized by executor; that is, after ExecutorStart(). 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN777"></a><span class='Declare_Function'>ExecParallelInitializeWorker</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>planstate</span><span class='Delimiter'>, </span><a href="../storage/ipc/shm_toc.c.html#LN25"><span class='Ref_to_Struct'>shm_toc</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>toc</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Call initializers for parallel-aware plan nodes. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN136"><span class='Ref_to_Member'>parallel_aware</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN105"><span class='Ref_to_EnumConst'>T_SeqScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeSeqscan.h.html#LN27"><span class='Ref_to_Proto'>ExecSeqScanInitializeWorker</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1067"><span class='Ref_to_Struct'>SeqScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>toc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN107"><span class='Ref_to_EnumConst'>T_IndexScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeIndexscan.h.html#LN27"><span class='Ref_to_Proto'>ExecIndexScanInitializeWorker</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1139"><span class='Ref_to_Struct'>IndexScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>toc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN108"><span class='Ref_to_EnumConst'>T_IndexOnlyScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeIndexonlyscan.h.html#LN31"><span class='Ref_to_Proto'>ExecIndexOnlyScanInitializeWorker</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1185"><span class='Ref_to_Struct'>IndexOnlyScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>toc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN119"><span class='Ref_to_EnumConst'>T_ForeignScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeForeignscan.h.html#LN28"><span class='Ref_to_Proto'>ExecForeignScanInitializeWorker</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1499"><span class='Ref_to_Struct'>ForeignScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                                <a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>toc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN120"><span class='Ref_to_EnumConst'>T_CustomScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeCustom.h.html#LN37"><span class='Ref_to_Proto'>ExecCustomScanInitializeWorker</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1524"><span class='Ref_to_Struct'>CustomScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, 
+</span>                                               <a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>toc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN110"><span class='Ref_to_EnumConst'>T_BitmapHeapScanState</span></a><span class='Operator'>: 
+</span>                <a href="../../include/executor/nodeBitmapHeapscan.h.html#LN27"><span class='Ref_to_Proto'>ExecBitmapHeapInitializeWorker</span></a><span class='Parentheses'>(</span> 
+                                     <span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1301"><span class='Ref_to_Struct'>BitmapHeapScanState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>toc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Control'>default</span><span class='Operator'>: 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch nodeTag(planstate) &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if planstate-&GT;plan-&GT;para... &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="../../include/nodes/nodeFuncs.h.html#LN76"><span class='Ref_to_Proto'>planstate_tree_walker</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN776"><span class='Ref_to_Func'>ExecParallelInitializeWorker</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN777"><span class='Ref_to_Parameter'>toc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecParallelInitializeWorker &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Main entrypoint for parallel query worker processes. 
+ * 
+ * We reach this function from ParallelWorkerMain, so the setup necessary to 
+ * create a sensible parallel environment has already been done; 
+ * ParallelWorkerMain worries about stuff like the transaction state, combo 
+ * CID mappings, and GUC values, so we don't need to deal with any of that 
+ * here. 
+ * 
+ * Our job is to deal with concerns specific to the executor.  The parallel 
+ * group leader will have stored a serialized PlannedStmt, and it's our job 
+ * to execute that plan and write the resulting tuples to the appropriate 
+ * tuple queue.  Various bits of supporting information that we need in order 
+ * to do this are also stored in the dsm_segment and can be accessed through 
+ * the shm_toc. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN833"></a><span class='Declare_Function'>ParallelQueryMain</span><span class='Parentheses'>(</span><a href="../storage/ipc/dsm.c.html#LN66"><span class='Ref_to_Struct'>dsm_segment</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>seg</span><span class='Delimiter'>, </span><a href="../storage/ipc/shm_toc.c.html#LN25"><span class='Ref_to_Struct'>shm_toc</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>toc</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN835"></a>    <a href="../../include/executor/instrument.h.html#LN18"><span class='Ref_to_Struct'>BufferUsage</span></a> <span class='Operator'>*</span><span class='Declare_Local'>buffer_usage</span><span class='Delimiter'>; 
+</span><a name="LN836"></a>    <a href="../../include/tcop/dest.h.html#LN112"><span class='Ref_to_Typedef'>DestReceiver</span></a> <span class='Operator'>*</span><span class='Declare_Local'>receiver</span><span class='Delimiter'>; 
+</span><a name="LN837"></a>    <a href="../../include/executor/execdesc.h.html#LN32"><span class='Ref_to_Struct'>QueryDesc</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>queryDesc</span><span class='Delimiter'>; 
+</span><a name="LN838"></a>    <a href="execParallel.c.html#LN75"><span class='Ref_to_Struct'>SharedExecutorInstrumentation</span></a> <span class='Operator'>*</span><span class='Declare_Local'>instrumentation</span><span class='Delimiter'>; 
+</span><a name="LN839"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>instrument_options</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN840"></a>    <span class='Keyword'>void</span>       <span class='Operator'>*</span><span class='Declare_Local'>area_space</span><span class='Delimiter'>; 
+</span><a name="LN841"></a>    <a href="../utils/mmgr/dsa.c.html#LN353"><span class='Ref_to_Struct'>dsa_area</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>area</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Set up DestReceiver, SharedExecutorInstrumentation, and QueryDesc. */ 
+</span>    <a href="execParallel.c.html#LN836"><span class='Ref_To_Local'>receiver</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN115"><span class='Ref_to_Proto'>ExecParallelGetReceiver</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN833"><span class='Ref_to_Parameter'>seg</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN833"><span class='Ref_to_Parameter'>toc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN838"><span class='Ref_To_Local'>instrumentation</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN34"><span class='Ref_to_Proto'>shm_toc_lookup</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN833"><span class='Ref_to_Parameter'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN53"><span class='Ref_to_Const'>PARALLEL_KEY_INSTRUMENTATION</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN838"><span class='Ref_To_Local'>instrumentation</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="execParallel.c.html#LN839"><span class='Ref_To_Local'>instrument_options</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN838"><span class='Ref_To_Local'>instrumentation</span></a><span class='Operator'>-&GT;</span><a href="execParallel.c.html#LN77"><span class='Ref_to_Member'>instrument_options</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN696"><span class='Ref_to_Func'>ExecParallelGetQueryDesc</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN833"><span class='Ref_to_Parameter'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN836"><span class='Ref_To_Local'>receiver</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN839"><span class='Ref_To_Local'>instrument_options</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Setting debug_query_string for individual workers */ 
+</span>    <a href="../tcop/postgres.c.html#LN84"><span class='Ref_to_Global_Var'>debug_query_string</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execdesc.h.html#LN37"><span class='Ref_to_Member'>sourceText</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Report workers' query for monitoring purposes */ 
+</span>    <a href="../../include/pgstat.h.html#LN1168"><span class='Ref_to_Proto'>pgstat_report_activity</span></a><span class='Parentheses'>(</span><a href="../../include/pgstat.h.html#LN724"><span class='Ref_to_EnumConst'>STATE_RUNNING</span></a><span class='Delimiter'>, </span><a href="../tcop/postgres.c.html#LN84"><span class='Ref_to_Global_Var'>debug_query_string</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Prepare to track buffer usage during query execution. */ 
+</span>    <a href="../../include/executor/instrument.h.html#LN79"><span class='Ref_to_Proto'>InstrStartParallelQuery</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Attach to the dynamic shared memory area. */ 
+</span>    <a href="execParallel.c.html#LN840"><span class='Ref_To_Local'>area_space</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN34"><span class='Ref_to_Proto'>shm_toc_lookup</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN833"><span class='Ref_to_Parameter'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN54"><span class='Ref_to_Const'>PARALLEL_KEY_DSA</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN841"><span class='Ref_To_Local'>area</span></a> <span class='Operator'>= </span><a href="../../include/utils/dsa.h.html#LN107"><span class='Ref_to_Proto'>dsa_attach_in_place</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN840"><span class='Ref_To_Local'>area_space</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN833"><span class='Ref_to_Parameter'>seg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Start up the executor */ 
+</span>    <a href="execMain.c.html#LN144"><span class='Ref_to_Func'>ExecutorStart</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Special executor initialization steps for parallel workers */ 
+</span>    <a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execdesc.h.html#LN48"><span class='Ref_to_Member'>planstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN814"><span class='Ref_to_Member'>state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN487"><span class='Ref_to_Member'>es_query_dsa</span></a> <span class='Operator'>= </span><a href="execParallel.c.html#LN841"><span class='Ref_To_Local'>area</span></a><span class='Delimiter'>; 
+</span>    <a href="execParallel.c.html#LN776"><span class='Ref_to_Func'>ExecParallelInitializeWorker</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execdesc.h.html#LN48"><span class='Ref_to_Member'>planstate</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN833"><span class='Ref_to_Parameter'>toc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Run the plan */ 
+</span>    <a href="../../include/executor/executor.h.html#LN169"><span class='Ref_to_Proto'>ExecutorRun</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a><span class='Delimiter'>, </span><a href="../../include/access/sdir.h.html#LN25"><span class='Ref_to_EnumConst'>ForwardScanDirection</span></a><span class='Delimiter'>, </span><span class='Number'>0L</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Shut down the executor */ 
+</span>    <a href="../../include/executor/executor.h.html#LN173"><span class='Ref_to_Proto'>ExecutorFinish</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Report buffer usage during parallel execution. */ 
+</span>    <a href="execParallel.c.html#LN835"><span class='Ref_To_Local'>buffer_usage</span></a> <span class='Operator'>= </span><a href="../../include/storage/shm_toc.h.html#LN34"><span class='Ref_to_Proto'>shm_toc_lookup</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN833"><span class='Ref_to_Parameter'>toc</span></a><span class='Delimiter'>, </span><a href="execParallel.c.html#LN51"><span class='Ref_to_Const'>PARALLEL_KEY_BUFFER_USAGE</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/executor/instrument.h.html#LN80"><span class='Ref_to_Proto'>InstrEndParallelQuery</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execParallel.c.html#LN835"><span class='Ref_To_Local'>buffer_usage</span></a><span class='Delimiter'>[</span><a href="../access/transam/parallel.c.html#LN93"><span class='Ref_to_Global_Var'>ParallelWorkerNumber</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Report instrumentation data if any instrumentation options are set. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execParallel.c.html#LN838"><span class='Ref_To_Local'>instrumentation</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="execParallel.c.html#LN735"><span class='Ref_to_Func'>ExecParallelReportInstrumentation</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execdesc.h.html#LN48"><span class='Ref_to_Member'>planstate</span></a><span class='Delimiter'>, 
+</span>                                          <a href="execParallel.c.html#LN838"><span class='Ref_To_Local'>instrumentation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Must do this after capturing instrumentation. */ 
+</span>    <a href="../../include/executor/executor.h.html#LN175"><span class='Ref_to_Proto'>ExecutorEnd</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Cleanup. */ 
+</span>    <a href="../../include/utils/dsa.h.html#LN112"><span class='Ref_to_Proto'>dsa_detach</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN841"><span class='Ref_To_Local'>area</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/executor/execdesc.h.html#LN67"><span class='Ref_to_Proto'>FreeQueryDesc</span></a><span class='Parentheses'>(</span><a href="execParallel.c.html#LN837"><span class='Ref_To_Local'>queryDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="execParallel.c.html#LN836"><span class='Ref_To_Local'>receiver</span></a><span class='Operator'>-&GT;</span><a href="../../include/tcop/dest.h.html#LN125"><span class='Ref_to_Member'>rDestroy</span></a><span class='Parentheses'>) (</span><a href="execParallel.c.html#LN836"><span class='Ref_To_Local'>receiver</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ParallelQueryMain &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

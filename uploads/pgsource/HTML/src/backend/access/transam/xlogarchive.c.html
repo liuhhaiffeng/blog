@@ -1,0 +1,790 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\transam\xlogarchive.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\transam\xlogarchive.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:31 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * xlogarchive.c 
+ *      Functions for archiving WAL files and restoring from the archive. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * src/backend/access/transam/xlogarchive.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/stat.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/wait.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;signal.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog_internal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/startup.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/walsender.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/fd.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/pmsignal.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Attempt to retrieve the specified file from off-line archival storage. 
+ * If successful, fill "path" with its complete path (note that this will be 
+ * a temp file name that doesn't follow the normal naming convention), and 
+ * return TRUE. 
+ * 
+ * If not successful, fill "path" with the name of the normal on-line file 
+ * (which may or may not actually exist, but we'll try to use it), and return 
+ * FALSE. 
+ * 
+ * For fixed-size files, the caller may pass the expected size as an 
+ * additional crosscheck on successful recovery.  If the file size is not 
+ * known, set expectedSize = 0. 
+ * 
+ * When 'cleanupEnabled' is false, refrain from deleting any old WAL segments 
+ * in the archive. This is used when fetching the initial checkpoint record, 
+ * when we are not yet sure how far back we need the WAL. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN50"></a><span class='Declare_Function'>RestoreArchivedFile</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>path</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlogfname</span><span class='Delimiter'>, 
+</span><a name="LN51"></a>                    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>recovername</span><span class='Delimiter'>, </span>off_t <span class='Declare_Parameter'>expectedSize</span><span class='Delimiter'>, 
+</span><a name="LN52"></a>                    <span class='Keyword'>bool </span><span class='Declare_Parameter'>cleanupEnabled</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN54"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>xlogpath</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN55"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>xlogRestoreCmd</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN56"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>lastRestartPointFname</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN57"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>dp</span><span class='Delimiter'>; 
+</span><a name="LN58"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>endp</span><span class='Delimiter'>; 
+</span><a name="LN59"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>sp</span><span class='Delimiter'>; 
+</span><a name="LN60"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span><a name="LN61"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>signaled</span><span class='Delimiter'>; 
+</span><a name="LN62"></a>    <span class='Control'>struct</span> <a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a> <span class='Declare_Local'>stat_buf</span><span class='Delimiter'>; 
+</span><a name="LN63"></a>    <a href="../../../include/access/xlogdefs.h.html#LN33"><span class='Ref_to_Typedef'>XLogSegNo</span></a>   <span class='Declare_Local'>restartSegNo</span><span class='Delimiter'>; 
+</span><a name="LN64"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>restartRedoPtr</span><span class='Delimiter'>; 
+</span><a name="LN65"></a>    <a href="../../../include/access/xlogdefs.h.html#LN44"><span class='Ref_to_Typedef'>TimeLineID</span></a>  <span class='Declare_Local'>restartTli</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* In standby mode, restore_command might not be supplied */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlog.c.html#LN256"><span class='Ref_to_Global_Var'>recoveryRestoreCommand</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>goto</span> <span class='Symbol_Characters'>&darr;</span><a href="xlogarchive.c.html#LN304"><span class='Ref_to_Label'>not_available</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * When doing archive recovery, we always prefer an archived log file even 
+     * if a file of the same name exists in XLOGDIR.  The reason is that the 
+     * file in XLOGDIR could be an old, un-filled or partly-filled version 
+     * that was copied and restored as part of backing up $PGDATA. 
+     * 
+     * We could try to optimize this slightly by checking the local copy 
+     * lastchange timestamp against the archived copy, but we have no API to 
+     * do this, nor can we guarantee that the lastchange timestamp was 
+     * preserved correctly when we copied to archive. Our aim is robustness, 
+     * so we elect not to do this. 
+     * 
+     * If we cannot obtain the log file from the archive, however, we will try 
+     * to use the XLOGDIR file if it exists.  This is so that we can make use 
+     * of log segments that weren't yet transferred to the archive. 
+     * 
+     * Notice that we don't actually overwrite any files when we copy back 
+     * from archive because the restore_command may inadvertently restore 
+     * inappropriate xlogs, or they may be corrupt, so we may wish to fallback 
+     * to the segments remaining in current XLOGDIR later. The 
+     * copy-from-archive filename is always the same, ensuring that we don't 
+     * run out of disk space on long recoveries. 
+     */ 
+</span>    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN54"><span class='Ref_To_Local'>xlogpath</span></a><span class='Delimiter'>, </span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlog_internal.h.html#LN130"><span class='Ref_to_Const'>XLOGDIR</span></a> <span class='String'>"/%s"</span><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN51"><span class='Ref_to_Parameter'>recovername</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Make sure there is no existing file named recovername. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN54"><span class='Ref_To_Local'>xlogpath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN62"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>errno <span class='Operator'>!= </span>ENOENT<span class='Parentheses'>) 
+</span>            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                     <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not stat file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                            <a href="xlogarchive.c.html#LN54"><span class='Ref_To_Local'>xlogpath</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../timezone/private.h.html#LN59"><span class='Ref_to_Proto'>unlink</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN54"><span class='Ref_To_Local'>xlogpath</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                     <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not remove file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                            <a href="xlogarchive.c.html#LN54"><span class='Ref_To_Local'>xlogpath</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Calculate the archive file cutoff point for use during log shipping 
+     * replication. All files earlier than this point can be deleted from the 
+     * archive, though there is no requirement to do so. 
+     * 
+     * If cleanup is not enabled, initialise this with the filename of 
+     * InvalidXLogRecPtr, which will prevent the deletion of any WAL files 
+     * from the archive because of the alphabetic sorting property of WAL 
+     * filenames. 
+     * 
+     * Once we have successfully located the redo pointer of the checkpoint 
+     * from which we start recovery we never request a file prior to the redo 
+     * pointer of the last restartpoint. When redo begins we know that we have 
+     * successfully located it, so there is no need for additional status 
+     * flags to signify the point when we can begin deleting WAL files from 
+     * the archive. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN52"><span class='Ref_to_Parameter'>cleanupEnabled</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/access/xlog_internal.h.html#LN292"><span class='Ref_to_Proto'>GetOldestRestartPoint</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN64"><span class='Ref_To_Local'>restartRedoPtr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN65"><span class='Ref_To_Local'>restartTli</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xlog_internal.h.html#LN105"><span class='Ref_to_Macro'>XLByteToSeg</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN64"><span class='Ref_To_Local'>restartRedoPtr</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN63"><span class='Ref_To_Local'>restartSegNo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xlog_internal.h.html#LN142"><span class='Ref_to_Macro'>XLogFileName</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN56"><span class='Ref_To_Local'>lastRestartPointFname</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN65"><span class='Ref_To_Local'>restartTli</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN63"><span class='Ref_To_Local'>restartSegNo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* we shouldn't need anything earlier than last restart point */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN56"><span class='Ref_To_Local'>lastRestartPointFname</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN50"><span class='Ref_to_Parameter'>xlogfname</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT;= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <a href="../../../include/access/xlog_internal.h.html#LN142"><span class='Ref_to_Macro'>XLogFileName</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN56"><span class='Ref_To_Local'>lastRestartPointFname</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Number'>0L</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * construct the command to be executed 
+     */ 
+</span>    <a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>= </span><a href="xlogarchive.c.html#LN55"><span class='Ref_To_Local'>xlogRestoreCmd</span></a><span class='Delimiter'>; 
+</span>    <a href="xlogarchive.c.html#LN58"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>= </span><a href="xlogarchive.c.html#LN55"><span class='Ref_To_Local'>xlogRestoreCmd</span></a> <span class='Operator'>+ </span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="xlogarchive.c.html#LN58"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a> <span class='Operator'>= </span><a href="xlog.c.html#LN256"><span class='Ref_to_Global_Var'>recoveryRestoreCommand</span></a><span class='Delimiter'>; </span><span class='Operator'>*</span><a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; </span><a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a> <span class='Operator'>== </span><span class='String'>'%'</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>case</span> <span class='String'>'p'</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* %p: relative path of target file */ 
+</span>                    <a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                    <a href="../../../include/c.h.html#LN829"><span class='Ref_to_Macro'>StrNCpy</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN54"><span class='Ref_To_Local'>xlogpath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN58"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>- </span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="../../../include/port.h.html#LN43"><span class='Ref_to_Proto'>make_native_path</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>+= </span>strlen<span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>case</span> <span class='String'>'f'</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* %f: filename of desired file */ 
+</span>                    <a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                    <a href="../../../include/c.h.html#LN829"><span class='Ref_to_Macro'>StrNCpy</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN50"><span class='Ref_to_Parameter'>xlogfname</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN58"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>- </span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>+= </span>strlen<span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>case</span> <span class='String'>'r'</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* %r: filename of last restartpoint */ 
+</span>                    <a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                    <a href="../../../include/c.h.html#LN829"><span class='Ref_to_Macro'>StrNCpy</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN56"><span class='Ref_To_Local'>lastRestartPointFname</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN58"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>- </span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>+= </span>strlen<span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>case</span> <span class='String'>'%'</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* convert %% to a single % */ 
+</span>                    <a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>&LT; </span><a href="xlogarchive.c.html#LN58"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>) 
+</span>                        <span class='Operator'>*</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Operator'>++ = *</span><a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>default</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* otherwise treat the % as not special */ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>&LT; </span><a href="xlogarchive.c.html#LN58"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>) 
+</span>                        <span class='Operator'>*</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Operator'>++ = *</span><a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch sp[1] &raquo; </span> 
+        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if *sp=='%' &raquo; </span> 
+        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>&LT; </span><a href="xlogarchive.c.html#LN58"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>) 
+</span>                <span class='Operator'>*</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a><span class='Operator'>++ = *</span><a href="xlogarchive.c.html#LN59"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for sp=recoveryRestoreCom... &raquo; </span> 
+    <span class='Operator'>*</span><a href="xlogarchive.c.html#LN57"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN825"><span class='Ref_to_Func'>errmsg_internal</span></a><span class='Parentheses'>(</span><span class='String'>"executing restore command \"%s\""</span><span class='Delimiter'>, 
+</span>                             <a href="xlogarchive.c.html#LN55"><span class='Ref_To_Local'>xlogRestoreCmd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check signals before restore command and reset afterwards. 
+     */ 
+</span>    <a href="../../../include/postmaster/startup.h.html#LN16"><span class='Ref_to_Proto'>PreRestoreCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Copy xlog from archival storage to XLOGDIR 
+     */ 
+</span>    <a href="xlogarchive.c.html#LN60"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/port.h.html#LN312"><span class='Ref_to_Macro'>system</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN55"><span class='Ref_To_Local'>xlogRestoreCmd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/postmaster/startup.h.html#LN17"><span class='Ref_to_Proto'>PostRestoreCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN60"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * command apparently succeeded, but let's make sure the file is 
+         * really there now and has the correct size. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN54"><span class='Ref_To_Local'>xlogpath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN62"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN51"><span class='Ref_to_Parameter'>expectedSize</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="xlogarchive.c.html#LN62"><span class='Ref_To_Local'>stat_buf</span></a><span class='Operator'>.</span>st_size <span class='Operator'>!= </span><a href="xlogarchive.c.html#LN51"><span class='Ref_to_Parameter'>expectedSize</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN223"></a>                <span class='Keyword'>int</span>         <span class='Declare_Local'>elevel</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * If we find a partial file in standby mode, we assume it's 
+                 * because it's just being copied to the archive, and keep 
+                 * trying. 
+                 * 
+                 * Otherwise treat a wrong-sized file as FATAL to ensure the 
+                 * DBA would notice it, but is that too strong? We could try 
+                 * to plow ahead with a local copy of the file ... but the 
+                 * problem is that there probably isn't one, and we'd 
+                 * incorrectly conclude we've reached the end of WAL and we're 
+                 * done recovering ... 
+                 */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlog.c.html#LN276"><span class='Ref_to_Global_Var'>StandbyMode</span></a> <span class='Operator'>&& </span><a href="xlogarchive.c.html#LN62"><span class='Ref_To_Local'>stat_buf</span></a><span class='Operator'>.</span>st_size <span class='Operator'>&LT; </span><a href="xlogarchive.c.html#LN51"><span class='Ref_to_Parameter'>expectedSize</span></a><span class='Parentheses'>) 
+</span>                    <a href="xlogarchive.c.html#LN223"><span class='Ref_To_Local'>elevel</span></a> <span class='Operator'>= </span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>else</span> 
+                    <a href="xlogarchive.c.html#LN223"><span class='Ref_To_Local'>elevel</span></a> <span class='Operator'>= </span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>; 
+</span>                <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN223"><span class='Ref_To_Local'>elevel</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"archive file \"%s\" has wrong size: %lu instead of %lu"</span><span class='Delimiter'>, 
+</span>                                <a href="xlogarchive.c.html#LN50"><span class='Ref_to_Parameter'>xlogfname</span></a><span class='Delimiter'>, 
+</span>                                <span class='Parentheses'>(</span><span class='Keyword'>unsigned long</span><span class='Parentheses'>) </span><a href="xlogarchive.c.html#LN62"><span class='Ref_To_Local'>stat_buf</span></a><span class='Operator'>.</span>st_size<span class='Delimiter'>, 
+</span>                                <span class='Parentheses'>(</span><span class='Keyword'>unsigned long</span><span class='Parentheses'>) </span><a href="xlogarchive.c.html#LN51"><span class='Ref_to_Parameter'>expectedSize</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if expectedSize&GT;0&&stat_... &raquo; </span> 
+            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"restored log file \"%s\" from archive"</span><span class='Delimiter'>, 
+</span>                                <a href="xlogarchive.c.html#LN50"><span class='Ref_to_Parameter'>xlogfname</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                <a href="../../../../contrib/cube/cubeparse.y.html#LN150"><span class='Ref_to_Proto'>strcpy</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN50"><span class='Ref_to_Parameter'>path</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN54"><span class='Ref_To_Local'>xlogpath</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if stat(xlogpath,&stat_b... &raquo; </span> 
+        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* stat failed */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span>errno <span class='Operator'>!= </span>ENOENT<span class='Parentheses'>) 
+</span>                <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                         <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not stat file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                                <a href="xlogarchive.c.html#LN54"><span class='Ref_To_Local'>xlogpath</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if rc==0 &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Remember, we rollforward UNTIL the restore fails so failure here is 
+     * just part of the process... that makes it difficult to determine 
+     * whether the restore failed because there isn't an archive to restore, 
+     * or because the administrator has specified the restore program 
+     * incorrectly.  We have to assume the former. 
+     * 
+     * However, if the failure was due to any sort of signal, it's best to 
+     * punt and abort recovery.  (If we "return false" here, upper levels will 
+     * assume that recovery is complete and start up the database!) It's 
+     * essential to abort on child SIGINT and SIGQUIT, because per spec 
+     * system() ignores SIGINT and SIGQUIT while waiting; if we see one of 
+     * those it's a good bet we should have gotten it too. 
+     * 
+     * On SIGTERM, assume we have received a fast shutdown request, and exit 
+     * cleanly. It's pure chance whether we receive the SIGTERM first, or the 
+     * child process. If we receive it first, the signal handler will call 
+     * proc_exit, otherwise we do it here. If we or the child process received 
+     * SIGTERM for any other reason than a fast shutdown request, postmaster 
+     * will perform an immediate shutdown when it sees us exiting 
+     * unexpectedly. 
+     * 
+     * Per the Single Unix Spec, shells report exit status &GT; 128 when a called 
+     * command died on a signal.  Also, 126 and 127 are used to report 
+     * problems such as an unfindable command; treat those as fatal errors 
+     * too. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port/win32.h.html#LN172"><span class='Ref_to_Macro'>WIFSIGNALED</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN60"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>) </span><span class='Operator'>&& </span><a href="../../../include/port/win32.h.html#LN174"><span class='Ref_to_Macro'>WTERMSIG</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN60"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span>SIGTERM<span class='Parentheses'>)</span> 
+        <a href="../../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="xlogarchive.c.html#LN61"><span class='Ref_To_Local'>signaled</span></a> <span class='Operator'>= </span><a href="../../../include/port/win32.h.html#LN172"><span class='Ref_to_Macro'>WIFSIGNALED</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN60"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>) </span><span class='Operator'>|| </span><a href="../../../timezone/private.h.html#LN44"><span class='Ref_to_Macro'>WEXITSTATUS</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN60"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><span class='Number'>125</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN61"><span class='Ref_To_Local'>signaled</span></a> <span class='Operator'>? </span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a> <span class='Operator'>: </span><a href="../../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not restore file \"%s\" from archive: %s"</span><span class='Delimiter'>, 
+</span>                    <a href="xlogarchive.c.html#LN50"><span class='Ref_to_Parameter'>xlogfname</span></a><span class='Delimiter'>, </span><a href="../../../common/wait_error.c.html#LN30"><span class='Ref_to_Func'>wait_result_to_str</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN60"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span> 
+<a name="LN304"></a><span class='Label'>not_available</span><span class='Operator'>: 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * if an archived file is not available, there might still be a version of 
+     * this file in XLOGDIR, so return that as the filename to open. 
+     * 
+     * In many recovery scenarios we expect this to fail also, but if so that 
+     * just means we've reached the end of WAL. 
+     */ 
+</span>    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN50"><span class='Ref_to_Parameter'>path</span></a><span class='Delimiter'>, </span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlog_internal.h.html#LN130"><span class='Ref_to_Const'>XLOGDIR</span></a> <span class='String'>"/%s"</span><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN50"><span class='Ref_to_Parameter'>xlogfname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RestoreArchivedFile &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Attempt to execute an external shell command during recovery. 
+ * 
+ * 'command' is the shell command to be executed, 'commandName' is a 
+ * human-readable name describing the command emitted in the logs. If 
+ * 'failOnSignal' is true and the command is killed by a signal, a FATAL 
+ * error is thrown. Otherwise a WARNING is emitted. 
+ * 
+ * This is currently used for recovery_end_command and archive_cleanup_command. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN328"></a><span class='Declare_Function'>ExecuteRecoveryCommand</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>command</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>commandName</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>failOnSignal</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN330"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>xlogRecoveryCmd</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN331"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>lastRestartPointFname</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN332"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>dp</span><span class='Delimiter'>; 
+</span><a name="LN333"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>endp</span><span class='Delimiter'>; 
+</span><a name="LN334"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>sp</span><span class='Delimiter'>; 
+</span><a name="LN335"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span><a name="LN336"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>signaled</span><span class='Delimiter'>; 
+</span><a name="LN337"></a>    <a href="../../../include/access/xlogdefs.h.html#LN33"><span class='Ref_to_Typedef'>XLogSegNo</span></a>   <span class='Declare_Local'>restartSegNo</span><span class='Delimiter'>; 
+</span><a name="LN338"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>restartRedoPtr</span><span class='Delimiter'>; 
+</span><a name="LN339"></a>    <a href="../../../include/access/xlogdefs.h.html#LN44"><span class='Ref_to_Typedef'>TimeLineID</span></a>  <span class='Declare_Local'>restartTli</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN328"><span class='Ref_to_Parameter'>command</span></a> <span class='Operator'>&& </span><a href="xlogarchive.c.html#LN328"><span class='Ref_to_Parameter'>commandName</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Calculate the archive file cutoff point for use during log shipping 
+     * replication. All files earlier than this point can be deleted from the 
+     * archive, though there is no requirement to do so. 
+     */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN292"><span class='Ref_to_Proto'>GetOldestRestartPoint</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN338"><span class='Ref_To_Local'>restartRedoPtr</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN339"><span class='Ref_To_Local'>restartTli</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN105"><span class='Ref_to_Macro'>XLByteToSeg</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN338"><span class='Ref_To_Local'>restartRedoPtr</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN337"><span class='Ref_To_Local'>restartSegNo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN142"><span class='Ref_to_Macro'>XLogFileName</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN331"><span class='Ref_To_Local'>lastRestartPointFname</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN339"><span class='Ref_To_Local'>restartTli</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN337"><span class='Ref_To_Local'>restartSegNo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * construct the command to be executed 
+     */ 
+</span>    <a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>= </span><a href="xlogarchive.c.html#LN330"><span class='Ref_To_Local'>xlogRecoveryCmd</span></a><span class='Delimiter'>; 
+</span>    <a href="xlogarchive.c.html#LN333"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>= </span><a href="xlogarchive.c.html#LN330"><span class='Ref_To_Local'>xlogRecoveryCmd</span></a> <span class='Operator'>+ </span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="xlogarchive.c.html#LN333"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a> <span class='Operator'>= </span><a href="xlogarchive.c.html#LN328"><span class='Ref_to_Parameter'>command</span></a><span class='Delimiter'>; </span><span class='Operator'>*</span><a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; </span><a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a> <span class='Operator'>== </span><span class='String'>'%'</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>case</span> <span class='String'>'r'</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* %r: filename of last restartpoint */ 
+</span>                    <a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                    <a href="../../../include/c.h.html#LN829"><span class='Ref_to_Macro'>StrNCpy</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN331"><span class='Ref_To_Local'>lastRestartPointFname</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN333"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>- </span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>+= </span>strlen<span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>case</span> <span class='String'>'%'</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* convert %% to a single % */ 
+</span>                    <a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>&LT; </span><a href="xlogarchive.c.html#LN333"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>) 
+</span>                        <span class='Operator'>*</span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a><span class='Operator'>++ = *</span><a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>default</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* otherwise treat the % as not special */ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>&LT; </span><a href="xlogarchive.c.html#LN333"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>) 
+</span>                        <span class='Operator'>*</span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a><span class='Operator'>++ = *</span><a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch sp[1] &raquo; </span> 
+        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if *sp=='%' &raquo; </span> 
+        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>&LT; </span><a href="xlogarchive.c.html#LN333"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>) 
+</span>                <span class='Operator'>*</span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a><span class='Operator'>++ = *</span><a href="xlogarchive.c.html#LN334"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for sp=command;*sp;sp++ &raquo; </span> 
+    <span class='Operator'>*</span><a href="xlogarchive.c.html#LN332"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN825"><span class='Ref_to_Func'>errmsg_internal</span></a><span class='Parentheses'>(</span><span class='String'>"executing %s \"%s\""</span><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN328"><span class='Ref_to_Parameter'>commandName</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN328"><span class='Ref_to_Parameter'>command</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * execute the constructed command 
+     */ 
+</span>    <a href="xlogarchive.c.html#LN335"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/port.h.html#LN312"><span class='Ref_to_Macro'>system</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN330"><span class='Ref_To_Local'>xlogRecoveryCmd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN335"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * If the failure was due to any sort of signal, it's best to punt and 
+         * abort recovery. See also detailed comments on signals in 
+         * RestoreArchivedFile(). 
+         */ 
+</span>        <a href="xlogarchive.c.html#LN336"><span class='Ref_To_Local'>signaled</span></a> <span class='Operator'>= </span><a href="../../../include/port/win32.h.html#LN172"><span class='Ref_to_Macro'>WIFSIGNALED</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN335"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>) </span><span class='Operator'>|| </span><a href="../../../timezone/private.h.html#LN44"><span class='Ref_to_Macro'>WEXITSTATUS</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN335"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><span class='Number'>125</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>((</span><a href="xlogarchive.c.html#LN336"><span class='Ref_To_Local'>signaled</span></a> <span class='Operator'>&& </span><a href="xlogarchive.c.html#LN328"><span class='Ref_to_Parameter'>failOnSignal</span></a><span class='Parentheses'>)</span> <span class='Operator'>? </span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a> <span class='Operator'>: </span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>        <span class='Comment_Multi_Line'>/*------ 
+           translator: First %s represents a recovery.conf parameter name like 
+          "recovery_end_command", the 2nd is the value of that parameter, the 
+          third an already translated error message. */ 
+</span>                <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"%s \"%s\": %s"</span><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN328"><span class='Ref_to_Parameter'>commandName</span></a><span class='Delimiter'>, 
+</span>                        <a href="xlogarchive.c.html#LN328"><span class='Ref_to_Parameter'>command</span></a><span class='Delimiter'>, </span><a href="../../../common/wait_error.c.html#LN30"><span class='Ref_to_Func'>wait_result_to_str</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN335"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end ExecuteRecoveryCommand &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * A file was restored from the archive under a temporary filename (path), 
+ * and now we want to keep it. Rename it under the permanent filename in 
+ * in pg_wal (xlogfname), replacing any existing file with the same name. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN425"></a><span class='Declare_Function'>KeepFileRestoredFromArchive</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>path</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlogfname</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN427"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>xlogfpath</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN428"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>reload</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN429"></a>    <span class='Control'>struct</span> <a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a> <span class='Declare_Local'>statbuf</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN427"><span class='Ref_To_Local'>xlogfpath</span></a><span class='Delimiter'>, </span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlog_internal.h.html#LN130"><span class='Ref_to_Const'>XLOGDIR</span></a> <span class='String'>"/%s"</span><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN425"><span class='Ref_to_Parameter'>xlogfname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN427"><span class='Ref_To_Local'>xlogfpath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN429"><span class='Ref_To_Local'>statbuf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN435"></a>        <span class='Keyword'>char</span>        <span class='Declare_Local'>oldpath</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span> 
+<span class='Directive'>#ifdef</span> <a href="../../../include/c.h.html#LN61"><span class='Ref_to_Const'>WIN32</span></a> 
+<a name="LN438"></a>        <span class='Keyword'>static unsigned int </span><span class='Declare_Local'>deletedcounter</span> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * On Windows, if another process (e.g a walsender process) holds the 
+         * file open in FILE_SHARE_DELETE mode, unlink will succeed, but the 
+         * file will still show up in directory listing until the last handle 
+         * is closed, and we cannot rename the new file in its place until 
+         * that. To avoid that problem, rename the old file to a temporary 
+         * name first. Use a counter to create a unique filename, because the 
+         * same file might be restored from the archive multiple times, and a 
+         * walsender could still be holding onto an old deleted version of it. 
+         */ 
+</span>        <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN435"><span class='Ref_To_Local'>oldpath</span></a><span class='Delimiter'>, </span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>, </span><span class='String'>"%s.deleted%u"</span><span class='Delimiter'>, 
+</span>                 <a href="xlogarchive.c.html#LN427"><span class='Ref_To_Local'>xlogfpath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN438"><span class='Ref_To_Local'>deletedcounter</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../port/dirmod.c.html#LN121"><span class='Ref_to_Macro'>rename</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN427"><span class='Ref_To_Local'>xlogfpath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN435"><span class='Ref_To_Local'>oldpath</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                     <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not rename file \"%s\" to \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                            <a href="xlogarchive.c.html#LN427"><span class='Ref_To_Local'>xlogfpath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN435"><span class='Ref_To_Local'>oldpath</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span><span class='Directive'>#else</span> 
+        <span class='Comment_Multi_Line'>/* same-size buffers, so this never truncates */ 
+</span>        <a href="../../../port/strlcpy.c.html#LN43"><span class='Ref_to_Func'>strlcpy</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN435"><span class='Ref_To_Local'>oldpath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN427"><span class='Ref_To_Local'>xlogfpath</span></a><span class='Delimiter'>, </span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../timezone/private.h.html#LN59"><span class='Ref_to_Proto'>unlink</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN435"><span class='Ref_To_Local'>oldpath</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                     <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not remove file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                            <a href="xlogarchive.c.html#LN427"><span class='Ref_To_Local'>xlogfpath</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <a href="xlogarchive.c.html#LN428"><span class='Ref_To_Local'>reload</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if stat(xlogfpath,&statb... &raquo; </span> 
+ 
+    <a href="../../../include/common/file_utils.h.html#LN22"><span class='Ref_to_Proto'>durable_rename</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN425"><span class='Ref_to_Parameter'>path</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN427"><span class='Ref_To_Local'>xlogfpath</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create .done file forcibly to prevent the restored segment from being 
+     * archived again later. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlog.c.html#LN93"><span class='Ref_to_Global_Var'>XLogArchiveMode</span></a> <span class='Operator'>!= </span><a href="../../../include/access/xlog.h.html#LN118"><span class='Ref_to_EnumConst'>ARCHIVE_MODE_ALWAYS</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/access/xlog_internal.h.html#LN314"><span class='Ref_to_Proto'>XLogArchiveForceDone</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN425"><span class='Ref_to_Parameter'>xlogfname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="../../../include/access/xlog_internal.h.html#LN312"><span class='Ref_to_Proto'>XLogArchiveNotify</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN425"><span class='Ref_to_Parameter'>xlogfname</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the existing file was replaced, since walsenders might have it open, 
+     * request them to reload a currently-open segment. This is only required 
+     * for WAL segments, walsenders don't hold other files open, but there's 
+     * no harm in doing this too often, and we don't know what kind of a file 
+     * we're dealing with here. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN428"><span class='Ref_To_Local'>reload</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/replication/walsender.h.html#LN49"><span class='Ref_to_Proto'>WalSndRqstFileReload</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Signal walsender that new WAL has arrived. Again, this isn't necessary 
+     * if we restored something other than a WAL segment, but it does no harm 
+     * either. 
+     */ 
+</span>    <a href="../../../include/replication/walsender.h.html#LN45"><span class='Ref_to_Proto'>WalSndWakeup</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end KeepFileRestoredFromArchive &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * XLogArchiveNotify 
+ * 
+ * Create an archive notification file 
+ * 
+ * The name of the notification file is the message that will be picked up 
+ * by the archiver, e.g. we write 0000000100000001000000C6.ready 
+ * and the archiver then knows to archive XLOGDIR/0000000100000001000000C6, 
+ * then when complete, rename it to 0000000100000001000000C6.done 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN511"></a><span class='Declare_Function'>XLogArchiveNotify</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN513"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>archiveStatusPath</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN514"></a>    FILE       <span class='Operator'>*</span><span class='Declare_Local'>fd</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* insert an otherwise empty file called &LT;XLOG&GT;.ready */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN513"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN511"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".ready"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="xlogarchive.c.html#LN514"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN83"><span class='Ref_to_Proto'>AllocateFile</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN513"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='String'>"w"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN514"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not create archive status file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="xlogarchive.c.html#LN513"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN84"><span class='Ref_to_Proto'>FreeFile</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN514"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not write archive status file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="xlogarchive.c.html#LN513"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Notify archiver that it's got something to do */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/pmsignal.h.html#LN45"><span class='Ref_to_Proto'>SendPostmasterSignal</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/pmsignal.h.html#LN26"><span class='Ref_to_EnumConst'>PMSIGNAL_WAKEN_ARCHIVER</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogArchiveNotify &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Convenience routine to notify using segment number representation of filename 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN545"></a><span class='Declare_Function'>XLogArchiveNotifySeg</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN33"><span class='Ref_to_Typedef'>XLogSegNo</span></a> <span class='Declare_Parameter'>segno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN547"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>xlog</span><span class='Delimiter'>[</span><a href="../../../include/access/xlog_internal.h.html#LN137"><span class='Ref_to_Const'>MAXFNAMELEN</span></a><span class='Delimiter'>]; 
+</span> 
+    <a href="../../../include/access/xlog_internal.h.html#LN142"><span class='Ref_to_Macro'>XLogFileName</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN547"><span class='Ref_To_Local'>xlog</span></a><span class='Delimiter'>, </span><a href="xlog.c.html#LN178"><span class='Ref_to_Global_Var'>ThisTimeLineID</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN545"><span class='Ref_to_Parameter'>segno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN312"><span class='Ref_to_Proto'>XLogArchiveNotify</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN547"><span class='Ref_To_Local'>xlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * XLogArchiveForceDone 
+ * 
+ * Emit notification forcibly that an XLOG segment file has been successfully 
+ * archived, by creating &LT;XLOG&GT;.done regardless of whether &LT;XLOG&GT;.ready 
+ * exists or not. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN561"></a><span class='Declare_Function'>XLogArchiveForceDone</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN563"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>archiveReady</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN564"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>archiveDone</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN565"></a>    <span class='Control'>struct</span> <a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a> <span class='Declare_Local'>stat_buf</span><span class='Delimiter'>; 
+</span><a name="LN566"></a>    FILE       <span class='Operator'>*</span><span class='Declare_Local'>fd</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Exit if already known done */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN564"><span class='Ref_To_Local'>archiveDone</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN561"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".done"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN564"><span class='Ref_To_Local'>archiveDone</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN565"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If .ready exists, rename it to .done */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN563"><span class='Ref_To_Local'>archiveReady</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN561"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".ready"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN563"><span class='Ref_To_Local'>archiveReady</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN565"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="../../../include/common/file_utils.h.html#LN22"><span class='Ref_to_Proto'>durable_rename</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN563"><span class='Ref_To_Local'>archiveReady</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN564"><span class='Ref_To_Local'>archiveDone</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* insert an otherwise empty file called &LT;XLOG&GT;.done */ 
+</span>    <a href="xlogarchive.c.html#LN566"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN83"><span class='Ref_to_Proto'>AllocateFile</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN564"><span class='Ref_To_Local'>archiveDone</span></a><span class='Delimiter'>, </span><span class='String'>"w"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN566"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not create archive status file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="xlogarchive.c.html#LN564"><span class='Ref_To_Local'>archiveDone</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN84"><span class='Ref_to_Proto'>FreeFile</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN566"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not write archive status file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="xlogarchive.c.html#LN564"><span class='Ref_To_Local'>archiveDone</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end XLogArchiveForceDone &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * XLogArchiveCheckDone 
+ * 
+ * This is called when we are ready to delete or recycle an old XLOG segment 
+ * file or backup history file.  If it is okay to delete it then return true. 
+ * If it is not time to delete it, make sure a .ready file exists, and return 
+ * false. 
+ * 
+ * If &LT;XLOG&GT;.done exists, then return true; else if &LT;XLOG&GT;.ready exists, 
+ * then return false; else create &LT;XLOG&GT;.ready and return false. 
+ * 
+ * The reason we do things this way is so that if the original attempt to 
+ * create &LT;XLOG&GT;.ready fails, we'll retry during subsequent checkpoints. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN616"></a><span class='Declare_Function'>XLogArchiveCheckDone</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN618"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>archiveStatusPath</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN619"></a>    <span class='Control'>struct</span> <a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a> <span class='Declare_Local'>stat_buf</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Always deletable if archiving is off */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xlog.h.html#LN133"><span class='Ref_to_Macro'>XLogArchivingActive</span></a><span class='Parentheses'>())</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* First check for .done --- this means archiver is done with it */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN618"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN616"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".done"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN618"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN619"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* check for .ready --- this means archiver is still busy with it */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN618"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN616"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".ready"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN618"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN619"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Race condition --- maybe archiver just finished, so recheck */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN618"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN616"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".done"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN618"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN619"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Retry creation of the .ready file */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN312"><span class='Ref_to_Proto'>XLogArchiveNotify</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN616"><span class='Ref_to_Parameter'>xlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogArchiveCheckDone &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * XLogArchiveIsBusy 
+ * 
+ * Check to see if an XLOG segment file is still unarchived. 
+ * This is almost but not quite the inverse of XLogArchiveCheckDone: in 
+ * the first place we aren't chartered to recreate the .ready file, and 
+ * in the second place we should consider that if the file is already gone 
+ * then it's not busy.  (This check is needed to handle the race condition 
+ * that a checkpoint already deleted the no-longer-needed file.) 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN656"></a><span class='Declare_Function'>XLogArchiveIsBusy</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN658"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>archiveStatusPath</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN659"></a>    <span class='Control'>struct</span> <a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a> <span class='Declare_Local'>stat_buf</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* First check for .done --- this means archiver is done with it */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN658"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN656"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".done"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN658"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN659"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* check for .ready --- this means archiver is still busy with it */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN658"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN656"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".ready"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN658"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN659"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Race condition --- maybe archiver just finished, so recheck */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN658"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN656"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".done"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN658"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN659"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check to see if the WAL file has been removed by checkpoint, which 
+     * implies it has already been archived, and explains why we can't see a 
+     * status file for it. 
+     */ 
+</span>    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN658"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlog_internal.h.html#LN130"><span class='Ref_to_Const'>XLOGDIR</span></a> <span class='String'>"/%s"</span><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN656"><span class='Ref_to_Parameter'>xlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN658"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN659"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>        errno <span class='Operator'>== </span>ENOENT<span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogArchiveIsBusy &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * XLogArchiveIsReadyOrDone 
+ * 
+ * Check to see if an XLOG segment file has a .ready or .done file. 
+ * This is similar to XLogArchiveIsBusy(), but returns true if the file 
+ * is already archived or is about to be archived. 
+ * 
+ * This is currently only used at recovery.  During normal operation this 
+ * would be racy: the file might get removed or marked with .ready as we're 
+ * checking it, or immediately after we return. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN701"></a><span class='Declare_Function'>XLogArchiveIsReadyOrDone</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN703"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>archiveStatusPath</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN704"></a>    <span class='Control'>struct</span> <a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a> <span class='Declare_Local'>stat_buf</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* First check for .done --- this means archiver is done with it */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN703"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN701"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".done"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN703"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN704"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* check for .ready --- this means archiver is still busy with it */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN703"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN701"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".ready"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN703"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN704"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Race condition --- maybe archiver just finished, so recheck */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN703"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN701"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".done"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN703"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN704"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end XLogArchiveIsReadyOrDone &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * XLogArchiveIsReady 
+ * 
+ * Check to see if an XLOG segment file has an archive notification (.ready) 
+ * file. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN731"></a><span class='Declare_Function'>XLogArchiveIsReady</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN733"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>archiveStatusPath</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN734"></a>    <span class='Control'>struct</span> <a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a> <span class='Declare_Local'>stat_buf</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN733"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN731"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".ready"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/port.h.html#LN275"><span class='Ref_to_Macro'>stat</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN733"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="xlogarchive.c.html#LN734"><span class='Ref_To_Local'>stat_buf</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * XLogArchiveCleanup 
+ * 
+ * Cleanup archive notification file(s) for a particular xlog segment 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN749"></a><span class='Declare_Function'>XLogArchiveCleanup</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN751"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>archiveStatusPath</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Remove the .done file */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN751"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN749"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".done"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../timezone/private.h.html#LN59"><span class='Ref_to_Proto'>unlink</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN751"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* should we complain about failure? */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* Remove the .ready file if present --- normally it shouldn't be */ 
+</span>    <a href="../../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN751"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Delimiter'>, </span><a href="xlogarchive.c.html#LN749"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".ready"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../timezone/private.h.html#LN59"><span class='Ref_to_Proto'>unlink</span></a><span class='Parentheses'>(</span><a href="xlogarchive.c.html#LN751"><span class='Ref_To_Local'>archiveStatusPath</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* should we complain about failure? */ 
+</span><span class='Delimiter'>} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

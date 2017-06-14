@@ -1,0 +1,679 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\brin\brin_revmap.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\brin\brin_revmap.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:27 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/* 
+ * brin_revmap.c 
+ *      Range map for BRIN indexes 
+ * 
+ * The range map (revmap) is a translation structure for BRIN indexes: for each 
+ * page range there is one summary tuple, and its location is tracked by the 
+ * revmap.  Whenever a new tuple is inserted into a table that violates the 
+ * previously recorded summary values, a new tuple is inserted into the index 
+ * and the revmap is updated to point to it. 
+ * 
+ * The revmap is stored in the first pages of the index, immediately following 
+ * the metapage.  When the revmap needs to be expanded, all tuples on the 
+ * regular BRIN page at that block (if any) are moved out of the way. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/access/brin/brin_revmap.c 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/brin_page.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/brin_pageops.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/brin_revmap.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/brin_tuple.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/brin_xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/rmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xloginsert.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/bufmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/rel.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * In revmap pages, each item stores an ItemPointerData.  These defines let one 
+ * find the logical revmap page number and index number of the revmap item for 
+ * the given heap block number. 
+ */ 
+</span><a name="LN40"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>HEAPBLK_TO_REVMAP_BLK</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>pagesPerRange</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <span class='Parentheses'>((</span><a href="brin_revmap.c.html#LN40"><span class='Ref_to_Parameter'>heapBlk</span></a> <span class='Operator'>/ </span><a href="brin_revmap.c.html#LN40"><span class='Ref_to_Parameter'>pagesPerRange</span></a><span class='Parentheses'>) </span><span class='Operator'>/ </span><a href="../../../include/access/brin_page.h.html#LN92"><span class='Ref_to_Const'>REVMAP_PAGE_MAXITEMS</span></a><span class='Parentheses'>)</span> 
+<a name="LN42"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>HEAPBLK_TO_REVMAP_INDEX</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>pagesPerRange</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <span class='Parentheses'>((</span><a href="brin_revmap.c.html#LN42"><span class='Ref_to_Parameter'>heapBlk</span></a> <span class='Operator'>/ </span><a href="brin_revmap.c.html#LN42"><span class='Ref_to_Parameter'>pagesPerRange</span></a><span class='Parentheses'>) </span><span class='Operator'>% </span><a href="../../../include/access/brin_page.h.html#LN92"><span class='Ref_to_Const'>REVMAP_PAGE_MAXITEMS</span></a><span class='Parentheses'>)</span> 
+ 
+ 
+<a name="LN46"></a><span class='Control'>struct</span> <span class='Declare_Struct'>BrinRevmap</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN48"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Member'>rm_irel</span><span class='Delimiter'>; 
+</span><a name="LN49"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Member'>rm_pagesPerRange</span><span class='Delimiter'>; 
+</span><a name="LN50"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Member'>rm_lastRevmapPage</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* cached from the metapage */ 
+</span><a name="LN51"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Member'>rm_metaBuf</span><span class='Delimiter'>; 
+</span><a name="LN52"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Member'>rm_currBuf</span><span class='Delimiter'>; 
+}; 
+</span> 
+<span class='Comment_Multi_Line'>/* typedef appears in brin_revmap.h */ 
+</span> 
+ 
+<a name="LN58"></a><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Prototype'>revmap_get_blkno</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Delimiter'>, 
+</span><a name="LN59"></a>                 <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN60"></a><span class='Keyword'>static </span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Prototype'>revmap_get_buffer</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN61"></a><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Prototype'>revmap_extend_and_get_blkno</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Delimiter'>, 
+</span><a name="LN62"></a>                            <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN63"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>revmap_physical_extend</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize an access object for a range map.  This must be freed by 
+ * brinRevmapTerminate when caller is done with it. 
+ */ 
+</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>* 
+</span><a name="LN70"></a><span class='Declare_Function'>brinRevmapInitialize</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>idxrel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>pagesPerRange</span><span class='Delimiter'>, 
+</span><a name="LN71"></a>                     <a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a> <span class='Declare_Parameter'>snapshot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN73"></a>    <a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Local'>revmap</span><span class='Delimiter'>; 
+</span><a name="LN74"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>meta</span><span class='Delimiter'>; 
+</span><a name="LN75"></a>    <a href="../../../include/access/brin_page.h.html#LN63"><span class='Ref_to_Struct'>BrinMetaPageData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>metadata</span><span class='Delimiter'>; 
+</span><a name="LN76"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span> 
+    <a href="brin_revmap.c.html#LN74"><span class='Ref_To_Local'>meta</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN167"><span class='Ref_to_Proto'>ReadBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN70"><span class='Ref_to_Parameter'>idxrel</span></a><span class='Delimiter'>, </span><a href="../../../include/access/brin_page.h.html#LN74"><span class='Ref_to_Const'>BRIN_METAPAGE_BLKNO</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN74"><span class='Ref_To_Local'>meta</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN87"><span class='Ref_to_Const'>BUFFER_LOCK_SHARE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN76"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN74"><span class='Ref_To_Local'>meta</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN263"><span class='Ref_to_Func'>TestForOldSnapshot</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN71"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN70"><span class='Ref_to_Parameter'>idxrel</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN76"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN75"><span class='Ref_To_Local'>metadata</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/brin_page.h.html#LN63"><span class='Ref_to_Struct'>BrinMetaPageData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN242"><span class='Ref_to_Macro'>PageGetContents</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN76"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="brin_revmap.c.html#LN73"><span class='Ref_To_Local'>revmap</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN73"><span class='Ref_To_Local'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN48"><span class='Ref_to_Member'>rm_irel</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN70"><span class='Ref_to_Parameter'>idxrel</span></a><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN73"><span class='Ref_To_Local'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN75"><span class='Ref_To_Local'>metadata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN67"><span class='Ref_to_Member'>pagesPerRange</span></a><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN73"><span class='Ref_To_Local'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN50"><span class='Ref_to_Member'>rm_lastRevmapPage</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN75"><span class='Ref_To_Local'>metadata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN68"><span class='Ref_to_Member'>lastRevmapPage</span></a><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN73"><span class='Ref_To_Local'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN74"><span class='Ref_To_Local'>meta</span></a><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN73"><span class='Ref_To_Local'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="brin_revmap.c.html#LN70"><span class='Ref_to_Parameter'>pagesPerRange</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN75"><span class='Ref_To_Local'>metadata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN67"><span class='Ref_to_Member'>pagesPerRange</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN74"><span class='Ref_To_Local'>meta</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="brin_revmap.c.html#LN73"><span class='Ref_To_Local'>revmap</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end brinRevmapInitialize &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Release resources associated with a revmap access object. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN102"></a><span class='Declare_Function'>brinRevmapTerminate</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN102"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN102"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN102"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN102"><span class='Ref_to_Parameter'>revmap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Extend the revmap to cover the given heap block number. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN114"></a><span class='Declare_Function'>brinRevmapExtend</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN116"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> mapBlk <span class='Declare_Local'>PG_USED_FOR_ASSERTS_ONLY</span><span class='Delimiter'>; 
+</span> 
+    mapBlk <span class='Operator'>= </span><a href="brin_revmap.c.html#LN61"><span class='Ref_to_Proto'>revmap_extend_and_get_blkno</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN114"><span class='Ref_to_Parameter'>revmap</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN114"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Ensure the buffer we got is in the expected range */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span>mapBlk <span class='Operator'>!= </span><a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a> <span class='Operator'>&& 
+</span>           mapBlk <span class='Operator'>!= </span><a href="../../../include/access/brin_page.h.html#LN74"><span class='Ref_to_Const'>BRIN_METAPAGE_BLKNO</span></a> <span class='Operator'>&& 
+</span>           mapBlk <span class='Operator'>&LT;= </span><a href="brin_revmap.c.html#LN114"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN50"><span class='Ref_to_Member'>rm_lastRevmapPage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Prepare to insert an entry into the revmap; the revmap buffer in which the 
+ * entry is to reside is locked and returned.  Most callers should call 
+ * brinRevmapExtend beforehand, as this routine does not extend the revmap if 
+ * it's not long enough. 
+ * 
+ * The returned buffer is also recorded in the revmap struct; finishing that 
+ * releases the buffer, therefore the caller needn't do it explicitly. 
+ */ 
+</span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> 
+<a name="LN136"></a><span class='Declare_Function'>brinLockRevmapPageForUpdate</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN138"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>rmBuf</span><span class='Delimiter'>; 
+</span> 
+    <a href="brin_revmap.c.html#LN138"><span class='Ref_To_Local'>rmBuf</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN60"><span class='Ref_to_Proto'>revmap_get_buffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN136"><span class='Ref_to_Parameter'>revmap</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN136"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN138"><span class='Ref_To_Local'>rmBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="brin_revmap.c.html#LN138"><span class='Ref_To_Local'>rmBuf</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * In the given revmap buffer (locked appropriately by caller), which is used 
+ * in a BRIN index of pagesPerRange pages per range, set the element 
+ * corresponding to heap block number heapBlk to the given TID. 
+ * 
+ * Once the operation is complete, the caller must update the LSN on the 
+ * returned buffer. 
+ * 
+ * This is used both in regular operation and during WAL replay. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN157"></a><span class='Declare_Function'>brinSetHeapBlockItemptr</span><span class='Parentheses'>(</span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Declare_Parameter'>buf</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>pagesPerRange</span><span class='Delimiter'>, 
+</span><a name="LN158"></a>                        <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Delimiter'>, </span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Declare_Parameter'>tid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN160"></a>    <a href="../../../include/access/brin_page.h.html#LN77"><span class='Ref_to_Struct'>RevmapContents</span></a> <span class='Operator'>*</span><span class='Declare_Local'>contents</span><span class='Delimiter'>; 
+</span><a name="LN161"></a>    <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>iptr</span><span class='Delimiter'>; 
+</span><a name="LN162"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* The correct page should already be pinned and locked */ 
+</span>    <a href="brin_revmap.c.html#LN162"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN157"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN160"><span class='Ref_To_Local'>contents</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/brin_page.h.html#LN77"><span class='Ref_to_Struct'>RevmapContents</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN242"><span class='Ref_to_Macro'>PageGetContents</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN162"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN161"><span class='Ref_To_Local'>iptr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="brin_revmap.c.html#LN160"><span class='Ref_To_Local'>contents</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN84"><span class='Ref_to_Member'>rm_tids</span></a><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN161"><span class='Ref_To_Local'>iptr</span></a> <span class='Operator'>+= </span><a href="brin_revmap.c.html#LN42"><span class='Ref_to_Macro'>HEAPBLK_TO_REVMAP_INDEX</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN157"><span class='Ref_to_Parameter'>pagesPerRange</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN158"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN158"><span class='Ref_to_Parameter'>tid</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/storage/itemptr.h.html#LN103"><span class='Ref_to_Macro'>ItemPointerSet</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN161"><span class='Ref_To_Local'>iptr</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/storage/itemptr.h.html#LN74"><span class='Ref_to_Macro'>ItemPointerGetBlockNumber</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN158"><span class='Ref_to_Parameter'>tid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                       <a href="../../../include/storage/itemptr.h.html#LN93"><span class='Ref_to_Macro'>ItemPointerGetOffsetNumber</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN158"><span class='Ref_to_Parameter'>tid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="../../../include/storage/itemptr.h.html#LN148"><span class='Ref_to_Macro'>ItemPointerSetInvalid</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN161"><span class='Ref_To_Local'>iptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end brinSetHeapBlockItemptr &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Fetch the BrinTuple for a given heap block. 
+ * 
+ * The buffer containing the tuple is locked, and returned in *buf.  The 
+ * returned tuple points to the shared buffer and must not be freed; if caller 
+ * wants to use it after releasing the buffer lock, it must create its own 
+ * palloc'ed copy.  As an optimization, the caller can pass a pinned buffer 
+ * *buf on entry, which will avoid a pin-unpin cycle when the next tuple is on 
+ * the same page as a previous one. 
+ * 
+ * If no tuple is found for the given heap range, returns NULL. In that case, 
+ * *buf might still be updated (and pin must be released by caller), but it's 
+ * not locked. 
+ * 
+ * The output tuple offset within the buffer is returned in *off, and its size 
+ * is returned in *size. 
+ */ 
+</span><a href="../../../include/access/brin_tuple.h.html#LN53"><span class='Ref_to_Struct'>BrinTuple</span></a> <span class='Operator'>* 
+</span><a name="LN196"></a><span class='Declare_Function'>brinGetTupleForHeapBlock</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Delimiter'>, 
+</span><a name="LN197"></a>                         <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>buf</span><span class='Delimiter'>, </span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>off</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>size</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>mode</span><span class='Delimiter'>, 
+</span><a name="LN198"></a>                         <a href="../../../include/utils/snapshot.h.html#LN22"><span class='Ref_to_Typedef'>Snapshot</span></a> <span class='Declare_Parameter'>snapshot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN200"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>idxRel</span> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN48"><span class='Ref_to_Member'>rm_irel</span></a><span class='Delimiter'>; 
+</span><a name="LN201"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>mapBlk</span><span class='Delimiter'>; 
+</span><a name="LN202"></a>    <a href="../../../include/access/brin_page.h.html#LN77"><span class='Ref_to_Struct'>RevmapContents</span></a> <span class='Operator'>*</span><span class='Declare_Local'>contents</span><span class='Delimiter'>; 
+</span><a name="LN203"></a>    <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>iptr</span><span class='Delimiter'>; 
+</span><a name="LN204"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>blk</span><span class='Delimiter'>; 
+</span><a name="LN205"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span><a name="LN206"></a>    <a href="../../../include/storage/itemid.h.html#LN30"><span class='Ref_to_Typedef'>ItemId</span></a>      <span class='Declare_Local'>lp</span><span class='Delimiter'>; 
+</span><a name="LN207"></a>    <a href="../../../include/access/brin_tuple.h.html#LN53"><span class='Ref_to_Struct'>BrinTuple</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>tup</span><span class='Delimiter'>; 
+</span><a name="LN208"></a>    <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Declare_Local'>previptr</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* normalize the heap block number to be the first page in the range */ 
+</span>    <a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>heapBlk</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>heapBlk</span></a> <span class='Operator'>/ </span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Compute the revmap page number we need.  If Invalid is returned (i.e., 
+     * the revmap page hasn't been created yet), the requested page range is 
+     * not summarized. 
+     */ 
+</span>    <a href="brin_revmap.c.html#LN201"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN58"><span class='Ref_to_Proto'>revmap_get_blkno</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN201"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>== </span><a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>off</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN25"><span class='Ref_to_Const'>InvalidOffsetNumber</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/itemptr.h.html#LN148"><span class='Ref_to_Macro'>ItemPointerSetInvalid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN208"><span class='Ref_To_Local'>previptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a> <span class='Operator'>== </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a> <span class='Operator'>|| 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN187"><span class='Ref_to_Proto'>BufferGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="brin_revmap.c.html#LN201"><span class='Ref_To_Local'>mapBlk</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Parentheses'>) 
+</span>                <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN201"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN167"><span class='Ref_to_Proto'>ReadBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN48"><span class='Ref_to_Member'>rm_irel</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN201"><span class='Ref_To_Local'>mapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN87"><span class='Ref_to_Const'>BUFFER_LOCK_SHARE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="brin_revmap.c.html#LN202"><span class='Ref_To_Local'>contents</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/brin_page.h.html#LN77"><span class='Ref_to_Struct'>RevmapContents</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>            <a href="../../../include/storage/bufpage.h.html#LN242"><span class='Ref_to_Macro'>PageGetContents</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN203"><span class='Ref_To_Local'>iptr</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN202"><span class='Ref_To_Local'>contents</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN84"><span class='Ref_to_Member'>rm_tids</span></a><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN203"><span class='Ref_To_Local'>iptr</span></a> <span class='Operator'>+= </span><a href="brin_revmap.c.html#LN42"><span class='Ref_to_Macro'>HEAPBLK_TO_REVMAP_INDEX</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN203"><span class='Ref_To_Local'>iptr</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Check the TID we got in a previous iteration, if any, and save the 
+         * current TID we got from the revmap; if we loop, we can sanity-check 
+         * that the next one we get is different.  Otherwise we might be stuck 
+         * looping forever if the revmap is somehow badly broken. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN208"><span class='Ref_To_Local'>previptr</span></a><span class='Parentheses'>) </span><span class='Operator'>&& </span><a href="../../storage/page/itemptr.c.html#LN27"><span class='Ref_to_Func'>ItemPointerEquals</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN208"><span class='Ref_To_Local'>previptr</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN203"><span class='Ref_To_Local'>iptr</span></a><span class='Parentheses'>))</span> 
+            <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INDEX_CORRUPTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>            <a href="../../utils/error/elog.c.html#LN825"><span class='Ref_to_Func'>errmsg_internal</span></a><span class='Parentheses'>(</span><span class='String'>"corrupted BRIN index: inconsistent range map"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN208"><span class='Ref_To_Local'>previptr</span></a> <span class='Operator'>= *</span><a href="brin_revmap.c.html#LN203"><span class='Ref_To_Local'>iptr</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="brin_revmap.c.html#LN204"><span class='Ref_To_Local'>blk</span></a> <span class='Operator'>= </span><a href="../../../include/storage/itemptr.h.html#LN74"><span class='Ref_to_Macro'>ItemPointerGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN203"><span class='Ref_To_Local'>iptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>off</span></a> <span class='Operator'>= </span><a href="../../../include/storage/itemptr.h.html#LN93"><span class='Ref_to_Macro'>ItemPointerGetOffsetNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN203"><span class='Ref_To_Local'>iptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Ok, got a pointer to where the BrinTuple should be. Fetch it. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>) </span><span class='Operator'>|| </span><a href="../../../include/storage/bufmgr.h.html#LN187"><span class='Ref_to_Proto'>BufferGetBlockNumber</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="brin_revmap.c.html#LN204"><span class='Ref_To_Local'>blk</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN113"><span class='Ref_to_Macro'>BufferIsValid</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>buf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN167"><span class='Ref_to_Proto'>ReadBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN200"><span class='Ref_To_Local'>idxRel</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN204"><span class='Ref_To_Local'>blk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>buf</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>mode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN205"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN263"><span class='Ref_to_Func'>TestForOldSnapshot</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN198"><span class='Ref_to_Parameter'>snapshot</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN200"><span class='Ref_To_Local'>idxRel</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN205"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If we land on a revmap page, start over */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/brin_page.h.html#LN56"><span class='Ref_to_Macro'>BRIN_IS_REGULAR_PAGE</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN205"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>off</span></a> <span class='Operator'>&GT; </span><a href="../../../include/storage/bufpage.h.html#LN353"><span class='Ref_to_Macro'>PageGetMaxOffsetNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN205"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INDEX_CORRUPTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                         <a href="../../utils/error/elog.c.html#LN825"><span class='Ref_to_Func'>errmsg_internal</span></a><span class='Parentheses'>(</span><span class='String'>"corrupted BRIN index: inconsistent range map"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <a href="brin_revmap.c.html#LN206"><span class='Ref_To_Local'>lp</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN205"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>off</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/itemid.h.html#LN90"><span class='Ref_to_Macro'>ItemIdIsUsed</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN206"><span class='Ref_To_Local'>lp</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="brin_revmap.c.html#LN207"><span class='Ref_To_Local'>tup</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/brin_tuple.h.html#LN53"><span class='Ref_to_Struct'>BrinTuple</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN336"><span class='Ref_to_Macro'>PageGetItem</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN205"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN206"><span class='Ref_To_Local'>lp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN207"><span class='Ref_To_Local'>tup</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_tuple.h.html#LN56"><span class='Ref_to_Member'>bt_blkno</span></a> <span class='Operator'>== </span><a href="brin_revmap.c.html#LN196"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>size</span></a><span class='Parentheses'>) 
+</span>                        <span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>size</span></a> <span class='Operator'>= </span><a href="../../../include/storage/itemid.h.html#LN57"><span class='Ref_to_Macro'>ItemIdGetLength</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN206"><span class='Ref_To_Local'>lp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Comment_Multi_Line'>/* found it! */ 
+</span>                    <span class='Control'>return</span> <a href="brin_revmap.c.html#LN207"><span class='Ref_To_Local'>tup</span></a><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if BRIN_IS_REGULAR_PAGE(... &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* 
+         * No luck. Assume that the revmap was updated concurrently. 
+         */ 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="brin_revmap.c.html#LN197"><span class='Ref_to_Parameter'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+    <span class='Comment_Multi_Line'>/* not reached, but keep compiler quiet */ 
+</span>    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end brinGetTupleForHeapBlock &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Delete an index tuple, marking a page range as unsummarized. 
+ * 
+ * Index must be locked in ShareUpdateExclusiveLock mode. 
+ * 
+ * Return FALSE if caller should retry. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN320"></a><span class='Declare_Function'>brinRevmapDesummarizeRange</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>idxrel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN322"></a>    <a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Local'>revmap</span><span class='Delimiter'>; 
+</span><a name="LN323"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>pagesPerRange</span><span class='Delimiter'>; 
+</span><a name="LN324"></a>    <a href="../../../include/access/brin_page.h.html#LN77"><span class='Ref_to_Struct'>RevmapContents</span></a> <span class='Operator'>*</span><span class='Declare_Local'>contents</span><span class='Delimiter'>; 
+</span><a name="LN325"></a>    <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>iptr</span><span class='Delimiter'>; 
+</span><a name="LN326"></a>    <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Declare_Local'>invalidIptr</span><span class='Delimiter'>; 
+</span><a name="LN327"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>revmapBlk</span><span class='Delimiter'>; 
+</span><a name="LN328"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>revmapBuf</span><span class='Delimiter'>; 
+</span><a name="LN329"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>regBuf</span><span class='Delimiter'>; 
+</span><a name="LN330"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>revmapPg</span><span class='Delimiter'>; 
+</span><a name="LN331"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>regPg</span><span class='Delimiter'>; 
+</span><a name="LN332"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>revmapOffset</span><span class='Delimiter'>; 
+</span><a name="LN333"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>regOffset</span><span class='Delimiter'>; 
+</span><a name="LN334"></a>    <a href="../../../include/storage/itemid.h.html#LN30"><span class='Ref_to_Typedef'>ItemId</span></a>      <span class='Declare_Local'>lp</span><span class='Delimiter'>; 
+</span><a name="LN335"></a>    <a href="../../../include/access/brin_tuple.h.html#LN53"><span class='Ref_to_Struct'>BrinTuple</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>tup</span><span class='Delimiter'>; 
+</span> 
+    <a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a> <span class='Operator'>= </span><a href="../../../include/access/brin_revmap.h.html#LN25"><span class='Ref_to_Proto'>brinRevmapInitialize</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN320"><span class='Ref_to_Parameter'>idxrel</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN323"><span class='Ref_To_Local'>pagesPerRange</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="brin_revmap.c.html#LN327"><span class='Ref_To_Local'>revmapBlk</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN58"><span class='Ref_to_Proto'>revmap_get_blkno</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN320"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/block.h.html#LN69"><span class='Ref_to_Macro'>BlockNumberIsValid</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN327"><span class='Ref_To_Local'>revmapBlk</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* revmap page doesn't exist: range not summarized, we're done */ 
+</span>        <a href="../../../include/access/brin_revmap.h.html#LN27"><span class='Ref_to_Proto'>brinRevmapTerminate</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Lock the revmap page, obtain the index tuple pointer from it */ 
+</span>    <a href="brin_revmap.c.html#LN328"><span class='Ref_To_Local'>revmapBuf</span></a> <span class='Operator'>= </span><a href="../../../include/access/brin_revmap.h.html#LN31"><span class='Ref_to_Proto'>brinLockRevmapPageForUpdate</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN320"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN330"><span class='Ref_To_Local'>revmapPg</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN328"><span class='Ref_To_Local'>revmapBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN332"><span class='Ref_To_Local'>revmapOffset</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN42"><span class='Ref_to_Macro'>HEAPBLK_TO_REVMAP_INDEX</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN320"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="brin_revmap.c.html#LN324"><span class='Ref_To_Local'>contents</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/brin_page.h.html#LN77"><span class='Ref_to_Struct'>RevmapContents</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN242"><span class='Ref_to_Macro'>PageGetContents</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN330"><span class='Ref_To_Local'>revmapPg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN325"><span class='Ref_To_Local'>iptr</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN324"><span class='Ref_To_Local'>contents</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN84"><span class='Ref_to_Member'>rm_tids</span></a><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN325"><span class='Ref_To_Local'>iptr</span></a> <span class='Operator'>+= </span><a href="brin_revmap.c.html#LN332"><span class='Ref_To_Local'>revmapOffset</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN325"><span class='Ref_To_Local'>iptr</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* no index tuple: range not summarized, we're done */ 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN328"><span class='Ref_To_Local'>revmapBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/brin_revmap.h.html#LN27"><span class='Ref_to_Proto'>brinRevmapTerminate</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="brin_revmap.c.html#LN329"><span class='Ref_To_Local'>regBuf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN167"><span class='Ref_to_Proto'>ReadBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN320"><span class='Ref_to_Parameter'>idxrel</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/itemptr.h.html#LN74"><span class='Ref_to_Macro'>ItemPointerGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN325"><span class='Ref_To_Local'>iptr</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN329"><span class='Ref_To_Local'>regBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN331"><span class='Ref_To_Local'>regPg</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN329"><span class='Ref_To_Local'>regBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* if this is no longer a regular page, tell caller to start over */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/brin_page.h.html#LN56"><span class='Ref_to_Macro'>BRIN_IS_REGULAR_PAGE</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN331"><span class='Ref_To_Local'>regPg</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN328"><span class='Ref_To_Local'>revmapBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN329"><span class='Ref_To_Local'>regBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/brin_revmap.h.html#LN27"><span class='Ref_to_Proto'>brinRevmapTerminate</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="brin_revmap.c.html#LN333"><span class='Ref_To_Local'>regOffset</span></a> <span class='Operator'>= </span><a href="../../../include/storage/itemptr.h.html#LN93"><span class='Ref_to_Macro'>ItemPointerGetOffsetNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN325"><span class='Ref_To_Local'>iptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN333"><span class='Ref_To_Local'>regOffset</span></a> <span class='Operator'>&GT; </span><a href="../../../include/storage/bufpage.h.html#LN353"><span class='Ref_to_Macro'>PageGetMaxOffsetNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN331"><span class='Ref_To_Local'>regPg</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INDEX_CORRUPTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"corrupted BRIN index: inconsistent range map"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="brin_revmap.c.html#LN334"><span class='Ref_To_Local'>lp</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufpage.h.html#LN231"><span class='Ref_to_Macro'>PageGetItemId</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN331"><span class='Ref_To_Local'>regPg</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN333"><span class='Ref_To_Local'>regOffset</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/itemid.h.html#LN90"><span class='Ref_to_Macro'>ItemIdIsUsed</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN334"><span class='Ref_To_Local'>lp</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INDEX_CORRUPTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"corrupted BRIN index: inconsistent range map"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN335"><span class='Ref_To_Local'>tup</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/brin_tuple.h.html#LN53"><span class='Ref_to_Struct'>BrinTuple</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN336"><span class='Ref_to_Macro'>PageGetItem</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN331"><span class='Ref_To_Local'>regPg</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN334"><span class='Ref_To_Local'>lp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* XXX apply sanity checks?  Might as well delete a bogus tuple ... */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We're only removing data, not reading it, so there's no need to 
+     * TestForOldSnapshot here. 
+     */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Because of SUE lock, this function shouldn't run concurrently with 
+     * summarization.  Placeholder tuples can only exist as leftovers from 
+     * crashed summarization, so if we detect any, we complain but proceed. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/brin_tuple.h.html#LN82"><span class='Ref_to_Macro'>BrinTupleIsPlaceholder</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN335"><span class='Ref_To_Local'>tup</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"leftover placeholder tuple detected in BRIN index \"%s\", deleting"</span><span class='Delimiter'>, 
+</span>                        <a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN320"><span class='Ref_to_Parameter'>idxrel</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/miscadmin.h.html#LN132"><span class='Ref_to_Macro'>START_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/itemptr.h.html#LN148"><span class='Ref_to_Macro'>ItemPointerSetInvalid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN326"><span class='Ref_To_Local'>invalidIptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/brin_revmap.h.html#LN33"><span class='Ref_to_Proto'>brinSetHeapBlockItemptr</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN328"><span class='Ref_To_Local'>revmapBuf</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN320"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Delimiter'>, 
+</span>                            <a href="brin_revmap.c.html#LN326"><span class='Ref_To_Local'>invalidIptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufpage.h.html#LN432"><span class='Ref_to_Proto'>PageIndexTupleDeleteNoCompact</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN331"><span class='Ref_To_Local'>regPg</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN333"><span class='Ref_To_Local'>regOffset</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* XXX record free space in FSM? */ 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN176"><span class='Ref_to_Proto'>MarkBufferDirty</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN329"><span class='Ref_To_Local'>regBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN176"><span class='Ref_to_Proto'>MarkBufferDirty</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN328"><span class='Ref_To_Local'>revmapBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN505"><span class='Ref_to_Macro'>RelationNeedsWAL</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN320"><span class='Ref_to_Parameter'>idxrel</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN419"></a>        <a href="../../../include/access/brin_xlog.h.html#LN132"><span class='Ref_to_Struct'>xl_brin_desummarize</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span><a name="LN420"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span><span class='Delimiter'>; 
+</span> 
+        <a href="brin_revmap.c.html#LN419"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/brin_xlog.h.html#LN134"><span class='Ref_to_Member'>pagesPerRange</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN419"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/brin_xlog.h.html#LN136"><span class='Ref_to_Member'>heapBlk</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN320"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN419"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/brin_xlog.h.html#LN138"><span class='Ref_to_Member'>regOffset</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN333"><span class='Ref_To_Local'>regOffset</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN419"><span class='Ref_To_Local'>xlrec</span></a><span class='Delimiter'>, </span><a href="../../../include/access/brin_xlog.h.html#LN141"><span class='Ref_to_Const'>SizeOfBrinDesummarize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN46"><span class='Ref_to_Proto'>XLogRegisterBuffer</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN328"><span class='Ref_To_Local'>revmapBuf</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN46"><span class='Ref_to_Proto'>XLogRegisterBuffer</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN329"><span class='Ref_To_Local'>regBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xloginsert.h.html#LN34"><span class='Ref_to_Const'>REGBUF_STANDARD</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN420"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_BRIN_ID<span class='Delimiter'>, </span><a href="../../../include/access/brin_xlog.h.html#LN35"><span class='Ref_to_Const'>XLOG_BRIN_DESUMMARIZE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/bufpage.h.html#LN364"><span class='Ref_to_Macro'>PageSetLSN</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN330"><span class='Ref_To_Local'>revmapPg</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN420"><span class='Ref_To_Local'>recptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/bufpage.h.html#LN364"><span class='Ref_to_Macro'>PageSetLSN</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN331"><span class='Ref_To_Local'>regPg</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN420"><span class='Ref_To_Local'>recptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/miscadmin.h.html#LN134"><span class='Ref_to_Macro'>END_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN175"><span class='Ref_to_Proto'>UnlockReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN329"><span class='Ref_To_Local'>regBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN328"><span class='Ref_To_Local'>revmapBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/brin_revmap.h.html#LN27"><span class='Ref_to_Proto'>brinRevmapTerminate</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN322"><span class='Ref_To_Local'>revmap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end brinRevmapDesummarizeRange &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Given a heap block number, find the corresponding physical revmap block 
+ * number and return it.  If the revmap page hasn't been allocated yet, return 
+ * InvalidBlockNumber. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN450"></a><span class='Declare_Function'>revmap_get_blkno</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN452"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>targetblk</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* obtain revmap block number, skip 1 for metapage block */ 
+</span>    <a href="brin_revmap.c.html#LN452"><span class='Ref_To_Local'>targetblk</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN40"><span class='Ref_to_Macro'>HEAPBLK_TO_REVMAP_BLK</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN450"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN450"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Normal case: the revmap page is already allocated */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN452"><span class='Ref_To_Local'>targetblk</span></a> <span class='Operator'>&LT;= </span><a href="brin_revmap.c.html#LN450"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN50"><span class='Ref_to_Member'>rm_lastRevmapPage</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="brin_revmap.c.html#LN452"><span class='Ref_To_Local'>targetblk</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Obtain and return a buffer containing the revmap page for the given heap 
+ * page.  The revmap must have been previously extended to cover that page. 
+ * The returned buffer is also recorded in the revmap struct; finishing that 
+ * releases the buffer, therefore the caller needn't do it explicitly. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a> 
+<a name="LN471"></a><span class='Declare_Function'>revmap_get_buffer</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN473"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>mapBlk</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Translate the heap block number to physical index location. */ 
+</span>    <a href="brin_revmap.c.html#LN473"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN58"><span class='Ref_to_Proto'>revmap_get_blkno</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>revmap</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN473"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>== </span><a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"revmap does not cover heap block %u"</span><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Ensure the buffer we got is in the expected range */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN473"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>!= </span><a href="../../../include/access/brin_page.h.html#LN74"><span class='Ref_to_Const'>BRIN_METAPAGE_BLKNO</span></a> <span class='Operator'>&& 
+</span>           <a href="brin_revmap.c.html#LN473"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>&LT;= </span><a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN50"><span class='Ref_to_Member'>rm_lastRevmapPage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Obtain the buffer from which we need to read.  If we already have the 
+     * correct buffer in our access struct, use that; otherwise, release that, 
+     * (if valid) and read the one we need. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a> <span class='Operator'>== </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a> <span class='Operator'>|| 
+</span>        <a href="brin_revmap.c.html#LN473"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/bufmgr.h.html#LN187"><span class='Ref_to_Proto'>BufferGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a> <span class='Operator'>!= </span><a href="../../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN167"><span class='Ref_to_Proto'>ReadBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN48"><span class='Ref_to_Member'>rm_irel</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN473"><span class='Ref_To_Local'>mapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="brin_revmap.c.html#LN471"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN52"><span class='Ref_to_Member'>rm_currBuf</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end revmap_get_buffer &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Given a heap block number, find the corresponding physical revmap block 
+ * number and return it. If the revmap page hasn't been allocated yet, extend 
+ * the revmap until it is. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN508"></a><span class='Declare_Function'>revmap_extend_and_get_blkno</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>heapBlk</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN510"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>targetblk</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* obtain revmap block number, skip 1 for metapage block */ 
+</span>    <a href="brin_revmap.c.html#LN510"><span class='Ref_To_Local'>targetblk</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN40"><span class='Ref_to_Macro'>HEAPBLK_TO_REVMAP_BLK</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN508"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN508"><span class='Ref_to_Parameter'>heapBlk</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Extend the revmap, if necessary */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN510"><span class='Ref_To_Local'>targetblk</span></a> <span class='Operator'>&GT; </span><a href="brin_revmap.c.html#LN508"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN50"><span class='Ref_to_Member'>rm_lastRevmapPage</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN63"><span class='Ref_to_Proto'>revmap_physical_extend</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN508"><span class='Ref_to_Parameter'>revmap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="brin_revmap.c.html#LN510"><span class='Ref_To_Local'>targetblk</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Try to extend the revmap by one page.  This might not happen for a number of 
+ * reasons; caller is expected to retry until the expected outcome is obtained. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN530"></a><span class='Declare_Function'>revmap_physical_extend</span><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN46"><span class='Ref_to_Struct'>BrinRevmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>revmap</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN532"></a>    <a href="../../../include/storage/buf.h.html#LN22"><span class='Ref_to_Typedef'>Buffer</span></a>      <span class='Declare_Local'>buf</span><span class='Delimiter'>; 
+</span><a name="LN533"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>page</span><span class='Delimiter'>; 
+</span><a name="LN534"></a>    <a href="../../../include/storage/bufpage.h.html#LN73"><span class='Ref_to_Typedef'>Page</span></a>        <span class='Declare_Local'>metapage</span><span class='Delimiter'>; 
+</span><a name="LN535"></a>    <a href="../../../include/access/brin_page.h.html#LN63"><span class='Ref_to_Struct'>BrinMetaPageData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>metadata</span><span class='Delimiter'>; 
+</span><a name="LN536"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>mapBlk</span><span class='Delimiter'>; 
+</span><a name="LN537"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>nblocks</span><span class='Delimiter'>; 
+</span><a name="LN538"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>irel</span> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN48"><span class='Ref_to_Member'>rm_irel</span></a><span class='Delimiter'>; 
+</span><a name="LN539"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>needLock</span> <span class='Operator'>= !</span><a href="../../../include/utils/rel.h.html#LN523"><span class='Ref_to_Macro'>RELATION_IS_LOCAL</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Lock the metapage. This locks out concurrent extensions of the revmap, 
+     * but note that we still need to grab the relation extension lock because 
+     * another backend can extend the index with regular BRIN pages. 
+     */ 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN534"><span class='Ref_To_Local'>metapage</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="brin_revmap.c.html#LN535"><span class='Ref_To_Local'>metadata</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/brin_page.h.html#LN63"><span class='Ref_to_Struct'>BrinMetaPageData</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/storage/bufpage.h.html#LN242"><span class='Ref_to_Macro'>PageGetContents</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN534"><span class='Ref_To_Local'>metapage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check that our cached lastRevmapPage value was up-to-date; if it 
+     * wasn't, update the cached copy and have caller start over. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN535"><span class='Ref_To_Local'>metadata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN68"><span class='Ref_to_Member'>lastRevmapPage</span></a> <span class='Operator'>!= </span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN50"><span class='Ref_to_Member'>rm_lastRevmapPage</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN50"><span class='Ref_to_Member'>rm_lastRevmapPage</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN535"><span class='Ref_To_Local'>metadata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN68"><span class='Ref_to_Member'>lastRevmapPage</span></a><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="brin_revmap.c.html#LN536"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN535"><span class='Ref_To_Local'>metadata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN68"><span class='Ref_to_Member'>lastRevmapPage</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span> 
+    <a href="brin_revmap.c.html#LN537"><span class='Ref_To_Local'>nblocks</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN198"><span class='Ref_to_Macro'>RelationGetNumberOfBlocks</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN536"><span class='Ref_To_Local'>mapBlk</span></a> <span class='Operator'>&LT; </span><a href="brin_revmap.c.html#LN537"><span class='Ref_To_Local'>nblocks</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN167"><span class='Ref_to_Proto'>ReadBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN536"><span class='Ref_To_Local'>mapBlk</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN533"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN539"><span class='Ref_To_Local'>needLock</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/storage/lmgr.h.html#LN53"><span class='Ref_to_Proto'>LockRelationForExtension</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN43"><span class='Ref_to_Const'>ExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN167"><span class='Ref_to_Proto'>ReadBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN81"><span class='Ref_to_Const'>P_NEW</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/bufmgr.h.html#LN187"><span class='Ref_to_Proto'>BufferGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="brin_revmap.c.html#LN536"><span class='Ref_To_Local'>mapBlk</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * Very rare corner case: somebody extended the relation 
+             * concurrently after we read its length.  If this happens, give 
+             * up and have caller start over.  We will have to evacuate that 
+             * page from under whoever is using it. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN539"><span class='Ref_To_Local'>needLock</span></a><span class='Parentheses'>) 
+</span>                <a href="../../../include/storage/lmgr.h.html#LN54"><span class='Ref_to_Proto'>UnlockRelationForExtension</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN43"><span class='Ref_to_Const'>ExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/bufmgr.h.html#LN174"><span class='Ref_to_Proto'>ReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN88"><span class='Ref_to_Const'>BUFFER_LOCK_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="brin_revmap.c.html#LN533"><span class='Ref_To_Local'>page</span></a> <span class='Operator'>= </span><a href="../../../include/storage/bufmgr.h.html#LN159"><span class='Ref_to_Macro'>BufferGetPage</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN539"><span class='Ref_To_Local'>needLock</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/storage/lmgr.h.html#LN54"><span class='Ref_to_Proto'>UnlockRelationForExtension</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN43"><span class='Ref_to_Const'>ExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Check that it's a regular block (or an empty page) */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/storage/bufpage.h.html#LN225"><span class='Ref_to_Macro'>PageIsNew</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN533"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>) </span><span class='Operator'>&& !</span><a href="../../../include/access/brin_page.h.html#LN56"><span class='Ref_to_Macro'>BRIN_IS_REGULAR_PAGE</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN533"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INDEX_CORRUPTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>          <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"unexpected page type 0x%04X in BRIN index \"%s\" block %u"</span><span class='Delimiter'>, 
+</span>                 <a href="../../../include/access/brin_page.h.html#LN41"><span class='Ref_to_Macro'>BrinPageType</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN533"><span class='Ref_To_Local'>page</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../../include/storage/bufmgr.h.html#LN187"><span class='Ref_to_Proto'>BufferGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If the page is in use, evacuate it and restart */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/brin_pageops.h.html#LN31"><span class='Ref_to_Proto'>brin_start_evacuating_page</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/brin_pageops.h.html#LN32"><span class='Ref_to_Proto'>brin_evacuate_page</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN538"><span class='Ref_To_Local'>irel</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN49"><span class='Ref_to_Member'>rm_pagesPerRange</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* have caller start over */ 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Ok, we have now locked the metapage and the target block. Re-initialize 
+     * it as a revmap page. 
+     */ 
+</span>    <a href="../../../include/miscadmin.h.html#LN132"><span class='Ref_to_Macro'>START_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* the rm_tids array is initialized to all invalid by PageInit */ 
+</span>    <a href="../../../include/access/brin_pageops.h.html#LN27"><span class='Ref_to_Proto'>brin_page_init</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN533"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="../../../include/access/brin_page.h.html#LN51"><span class='Ref_to_Const'>BRIN_PAGETYPE_REVMAP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN176"><span class='Ref_to_Proto'>MarkBufferDirty</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="brin_revmap.c.html#LN535"><span class='Ref_To_Local'>metadata</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/brin_page.h.html#LN68"><span class='Ref_to_Member'>lastRevmapPage</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN536"><span class='Ref_To_Local'>mapBlk</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/bufmgr.h.html#LN176"><span class='Ref_to_Proto'>MarkBufferDirty</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/utils/rel.h.html#LN505"><span class='Ref_to_Macro'>RelationNeedsWAL</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN48"><span class='Ref_to_Member'>rm_irel</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN630"></a>        <a href="../../../include/access/brin_xlog.h.html#LN114"><span class='Ref_to_Struct'>xl_brin_revmap_extend</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span><a name="LN631"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span><span class='Delimiter'>; 
+</span> 
+        <a href="brin_revmap.c.html#LN630"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/brin_xlog.h.html#LN120"><span class='Ref_to_Member'>targetBlk</span></a> <span class='Operator'>= </span><a href="brin_revmap.c.html#LN536"><span class='Ref_To_Local'>mapBlk</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="brin_revmap.c.html#LN630"><span class='Ref_To_Local'>xlrec</span></a><span class='Delimiter'>, </span><a href="../../../include/access/brin_xlog.h.html#LN123"><span class='Ref_to_Const'>SizeOfBrinRevmapExtend</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN46"><span class='Ref_to_Proto'>XLogRegisterBuffer</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN46"><span class='Ref_to_Proto'>XLogRegisterBuffer</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xloginsert.h.html#LN31"><span class='Ref_to_Const'>REGBUF_WILL_INIT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="brin_revmap.c.html#LN631"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_BRIN_ID<span class='Delimiter'>, </span><a href="../../../include/access/brin_xlog.h.html#LN34"><span class='Ref_to_Const'>XLOG_BRIN_REVMAP_EXTEND</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/bufpage.h.html#LN364"><span class='Ref_to_Macro'>PageSetLSN</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN534"><span class='Ref_To_Local'>metapage</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN631"><span class='Ref_To_Local'>recptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/bufpage.h.html#LN364"><span class='Ref_to_Macro'>PageSetLSN</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN533"><span class='Ref_To_Local'>page</span></a><span class='Delimiter'>, </span><a href="brin_revmap.c.html#LN631"><span class='Ref_To_Local'>recptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/miscadmin.h.html#LN134"><span class='Ref_to_Macro'>END_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN214"><span class='Ref_to_Proto'>LockBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN530"><span class='Ref_to_Parameter'>revmap</span></a><span class='Operator'>-&GT;</span><a href="brin_revmap.c.html#LN51"><span class='Ref_to_Member'>rm_metaBuf</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/bufmgr.h.html#LN86"><span class='Ref_to_Const'>BUFFER_LOCK_UNLOCK</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/bufmgr.h.html#LN175"><span class='Ref_to_Proto'>UnlockReleaseBuffer</span></a><span class='Parentheses'>(</span><a href="brin_revmap.c.html#LN532"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end revmap_physical_extend &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

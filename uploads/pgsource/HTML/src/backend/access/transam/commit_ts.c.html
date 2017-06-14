@@ -1,0 +1,1051 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\transam\commit_ts.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\transam\commit_ts.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:30 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * commit_ts.c 
+ *      PostgreSQL commit timestamp manager 
+ * 
+ * This module is a pg_xact-like system that stores the commit timestamp 
+ * for each transaction. 
+ * 
+ * XLOG interactions: this module generates an XLOG record whenever a new 
+ * CommitTs page is initialized to zeroes.  Also, one XLOG record is 
+ * generated for setting of values when the caller requests it; this allows 
+ * us to support values coming from places other than transaction commit. 
+ * Other writes of CommitTS come from recording of transaction commit in 
+ * xact.c, which generates its own XLOG records for these events and will 
+ * re-perform the status update on redo; so we need make no additional XLOG 
+ * entry here. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * src/backend/access/transam/commit_ts.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/commit_ts.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/htup_details.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/slru.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/transam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_type.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"funcapi.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pg_trace.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/builtins.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/snapmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/timestamp.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Defines for CommitTs page sizes.  A page is the same BLCKSZ as is used 
+ * everywhere else in Postgres. 
+ * 
+ * Note: because TransactionIds are 32 bits and wrap around at 0xFFFFFFFF, 
+ * CommitTs page numbering also wraps around at 
+ * 0xFFFFFFFF/COMMIT_TS_XACTS_PER_PAGE, and CommitTs segment numbering at 
+ * 0xFFFFFFFF/COMMIT_TS_XACTS_PER_PAGE/SLRU_PAGES_PER_SEGMENT.  We need take no 
+ * explicit notice of that fact in this module, except when comparing segment 
+ * and page numbers in TruncateCommitTs (see CommitTsPagePrecedes). 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * We need 8+2 bytes per xact.  Note that enlarging this struct might mean 
+ * the largest possible file name is more than 5 chars long; see 
+ * SlruScanDirectory. 
+ */ 
+</span><a name="LN56"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>CommitTimestampEntry</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN58"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Member'>time</span><span class='Delimiter'>; 
+</span><a name="LN59"></a>    <a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Declare_Member'>nodeid</span><span class='Delimiter'>; 
+</span><a name="LN60"></a>} <span class='Declare_Typedef'>CommitTimestampEntry</span><span class='Delimiter'>; 
+</span> 
+<a name="LN62"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>SizeOfCommitTimestampEntry</span> <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN56"><span class='Ref_to_Struct'>CommitTimestampEntry</span></a><span class='Delimiter'>, </span>nodeid<span class='Parentheses'>) </span><span class='Operator'>+ \ 
+</span>                                    <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a><span class='Parentheses'>))</span> 
+ 
+<a name="LN65"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>COMMIT_TS_XACTS_PER_PAGE</span> <span class='Operator'>\ 
+</span>    <span class='Parentheses'>(</span>BLCKSZ <span class='Operator'>/ </span><a href="commit_ts.c.html#LN62"><span class='Ref_to_Const'>SizeOfCommitTimestampEntry</span></a><span class='Parentheses'>) 
+</span> 
+<a name="LN68"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>TransactionIdToCTsPage</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>xid</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <span class='Parentheses'>((</span><a href="commit_ts.c.html#LN68"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>/ </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="commit_ts.c.html#LN65"><span class='Ref_to_Const'>COMMIT_TS_XACTS_PER_PAGE</span></a><span class='Parentheses'>)</span> 
+<a name="LN70"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>TransactionIdToCTsEntry</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>xid</span><span class='Parentheses'>)</span>    <span class='Operator'>\ 
+</span>    <span class='Parentheses'>((</span><a href="commit_ts.c.html#LN70"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>% </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="commit_ts.c.html#LN65"><span class='Ref_to_Const'>COMMIT_TS_XACTS_PER_PAGE</span></a><span class='Parentheses'>)</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Link to shared-memory data structures for CommitTs control 
+ */ 
+</span><a name="LN76"></a><span class='Keyword'>static </span><a href="../../../include/access/slru.h.html#LN116"><span class='Ref_to_Struct'>SlruCtlData</span></a> <span class='Declare_Var'>CommitTsCtlData</span><span class='Delimiter'>; 
+</span> 
+<a name="LN78"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CommitTsCtl</span> <span class='Parentheses'>(</span><span class='Operator'>&</span><a href="commit_ts.c.html#LN76"><span class='Ref_to_Global_Var'>CommitTsCtlData</span></a><span class='Parentheses'>) 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * We keep a cache of the last value set in shared memory. 
+ * 
+ * This is also good place to keep the activation status.  We keep this 
+ * separate from the GUC so that the standby can activate the module if the 
+ * primary has it active independently of the value of the GUC. 
+ * 
+ * This is protected by CommitTsLock.  In some places, we use commitTsActive 
+ * without acquiring the lock; where this happens, a comment explains the 
+ * rationale for it. 
+ */ 
+</span><a name="LN91"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>CommitTimestampShared</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN93"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Member'>xidLastCommit</span><span class='Delimiter'>; 
+</span><a name="LN94"></a>    <a href="commit_ts.c.html#LN56"><span class='Ref_to_Struct'>CommitTimestampEntry</span></a> <span class='Declare_Member'>dataLastCommit</span><span class='Delimiter'>; 
+</span><a name="LN95"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>commitTsActive</span><span class='Delimiter'>; 
+</span><a name="LN96"></a>} <span class='Declare_Typedef'>CommitTimestampShared</span><span class='Delimiter'>; 
+</span> 
+<a name="LN98"></a><a href="commit_ts.c.html#LN91"><span class='Ref_to_Struct'>CommitTimestampShared</span></a> <span class='Operator'>*</span><span class='Declare_Var'>commitTsShared</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* GUC variable */ 
+</span><a name="LN102"></a><span class='Keyword'>bool</span>        <span class='Declare_Var'>track_commit_timestamp</span><span class='Delimiter'>; 
+</span> 
+<a name="LN104"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>SetXidCommitTsInPage</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, 
+</span><a name="LN105"></a>                     <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>ts</span><span class='Delimiter'>, 
+</span><a name="LN106"></a>                     <a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Declare_Parameter'>nodeid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN107"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>TransactionIdSetCommitTs</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>ts</span><span class='Delimiter'>, 
+</span><a name="LN108"></a>                         <a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Declare_Parameter'>nodeid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>slotno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN109"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>error_commit_ts_disabled</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN110"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>ZeroCommitTsPage</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>writeXlog</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN111"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>CommitTsPagePrecedes</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>page1</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>page2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN112"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>ActivateCommitTs</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN113"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>DeactivateCommitTs</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN114"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>WriteZeroPageXlogRec</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN115"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>WriteTruncateXlogRec</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestXid</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN116"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>WriteSetTimestampXlogRec</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>mainxid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, 
+</span><a name="LN117"></a>                         <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>timestamp</span><span class='Delimiter'>, 
+</span><a name="LN118"></a>                         <a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Declare_Parameter'>nodeid</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * TransactionTreeSetCommitTsData 
+ * 
+ * Record the final commit timestamp of transaction entries in the commit log 
+ * for a transaction and its subtransaction tree, as efficiently as possible. 
+ * 
+ * xid is the top level transaction id. 
+ * 
+ * subxids is an array of xids of length nsubxids, representing subtransactions 
+ * in the tree of xid. In various cases nsubxids may be zero. 
+ * The reason why tracking just the parent xid commit timestamp is not enough 
+ * is that the subtrans SLRU does not stay valid across crashes (it's not 
+ * permanent) so we need to keep the information about them here. If the 
+ * subtrans implementation changes in the future, we might want to revisit the 
+ * decision of storing timestamp info for each subxid. 
+ * 
+ * The write_xlog parameter tells us whether to include an XLog record of this 
+ * or not.  Normally, this is called from transaction commit routines (both 
+ * normal and prepared) and the information will be stored in the transaction 
+ * commit XLog record, and so they should pass "false" for this.  The XLog redo 
+ * code should use "false" here as well.  Other callers probably want to pass 
+ * true, so that the given values persist in case of crashes. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN144"></a><span class='Declare_Function'>TransactionTreeSetCommitTsData</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, 
+</span><a name="LN145"></a>                               <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>timestamp</span><span class='Delimiter'>, 
+</span><a name="LN146"></a>                               <a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Declare_Parameter'>nodeid</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>write_xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN148"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN149"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>headxid</span><span class='Delimiter'>; 
+</span><a name="LN150"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>newestXact</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * No-op if the module is not active. 
+     * 
+     * An unlocked read here is fine, because in a standby (the only place 
+     * where the flag can change in flight) this routine is only called by the 
+     * recovery process, which is also the only process which can change the 
+     * flag. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Comply with the WAL-before-data rule: if caller specified it wants this 
+     * value to be recorded in WAL, do so before touching the data. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN146"><span class='Ref_to_Parameter'>write_xlog</span></a><span class='Parentheses'>) 
+</span>        <a href="commit_ts.c.html#LN116"><span class='Ref_to_Proto'>WriteSetTimestampXlogRec</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN144"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN144"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN145"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN145"><span class='Ref_to_Parameter'>timestamp</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN146"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Figure out the latest Xid in this batch: either the last subxid if 
+     * there's any, otherwise the parent xid. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN144"><span class='Ref_to_Parameter'>nsubxids</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="commit_ts.c.html#LN150"><span class='Ref_To_Local'>newestXact</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN145"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="commit_ts.c.html#LN144"><span class='Ref_to_Parameter'>nsubxids</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span>    <span class='Control'>else</span> 
+        <a href="commit_ts.c.html#LN150"><span class='Ref_To_Local'>newestXact</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN144"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We split the xids to set the timestamp to in groups belonging to the 
+     * same SLRU page; the first element in each such set is its head.  The 
+     * first group has the main XID as the head; subsequent sets use the first 
+     * subxid not on the previous page as head.  This way, we only have to 
+     * lock/modify each SLRU page once. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN149"><span class='Ref_To_Local'>headxid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN144"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN188"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span> <span class='Operator'>= </span><a href="commit_ts.c.html#LN68"><span class='Ref_to_Macro'>TransactionIdToCTsPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN149"><span class='Ref_To_Local'>headxid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN189"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>j</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN189"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; </span><a href="commit_ts.c.html#LN189"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>&LT; </span><a href="commit_ts.c.html#LN144"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Delimiter'>; </span><a href="commit_ts.c.html#LN189"><span class='Ref_To_Local'>j</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN68"><span class='Ref_to_Macro'>TransactionIdToCTsPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN145"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="commit_ts.c.html#LN189"><span class='Ref_To_Local'>j</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="commit_ts.c.html#LN188"><span class='Ref_To_Local'>pageno</span></a><span class='Parentheses'>)</span> 
+                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Comment_Multi_Line'>/* subxids[i..j] are on the same page as the head */ 
+</span> 
+        <a href="commit_ts.c.html#LN104"><span class='Ref_to_Proto'>SetXidCommitTsInPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN149"><span class='Ref_To_Local'>headxid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN189"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>- </span><a href="commit_ts.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN145"><span class='Ref_to_Parameter'>subxids</span></a> <span class='Operator'>+ </span><a href="commit_ts.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN145"><span class='Ref_to_Parameter'>timestamp</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN146"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Delimiter'>, 
+</span>                             <a href="commit_ts.c.html#LN188"><span class='Ref_To_Local'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* if we wrote out all subxids, we're done. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN189"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>+ </span><span class='Number'>1</span> <span class='Operator'>&GT;= </span><a href="commit_ts.c.html#LN144"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Set the new head and skip over it, as well as over the subxids we 
+         * just wrote. 
+         */ 
+</span>        <a href="commit_ts.c.html#LN149"><span class='Ref_To_Local'>headxid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN145"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="commit_ts.c.html#LN189"><span class='Ref_To_Local'>j</span></a><span class='Delimiter'>]; 
+</span>        <a href="commit_ts.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>+= </span><a href="commit_ts.c.html#LN189"><span class='Ref_To_Local'>j</span></a> <span class='Operator'>- </span><a href="commit_ts.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0,headxid=xid;; &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* update the cached value in shared memory */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN93"><span class='Ref_to_Member'>xidLastCommit</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN144"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN58"><span class='Ref_to_Member'>time</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN145"><span class='Ref_to_Parameter'>timestamp</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN59"><span class='Ref_to_Member'>nodeid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN146"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* and move forwards our endpoint, if needed */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN129"><span class='Ref_to_Member'>newestCommitTsXid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN150"><span class='Ref_To_Local'>newestXact</span></a><span class='Parentheses'>))</span> 
+        <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN129"><span class='Ref_to_Member'>newestCommitTsXid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN150"><span class='Ref_To_Local'>newestXact</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TransactionTreeSetCommitTsData &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Record the commit timestamp of transaction entries in the commit log for all 
+ * entries on a single page.  Atomic only on this page. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN230"></a><span class='Declare_Function'>SetXidCommitTsInPage</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, 
+</span><a name="LN231"></a>                     <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>ts</span><span class='Delimiter'>, 
+</span><a name="LN232"></a>                     <a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Declare_Parameter'>nodeid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN234"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span><a name="LN235"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN234"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="../../../include/access/slru.h.html#LN147"><span class='Ref_to_Proto'>SimpleLruReadPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN232"><span class='Ref_to_Parameter'>pageno</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN230"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN107"><span class='Ref_to_Proto'>TransactionIdSetCommitTs</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN230"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN231"><span class='Ref_to_Parameter'>ts</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN232"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN234"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN235"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="commit_ts.c.html#LN235"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="commit_ts.c.html#LN230"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Delimiter'>; </span><a href="commit_ts.c.html#LN235"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <a href="commit_ts.c.html#LN107"><span class='Ref_to_Proto'>TransactionIdSetCommitTs</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN231"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="commit_ts.c.html#LN235"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], </span><a href="commit_ts.c.html#LN231"><span class='Ref_to_Parameter'>ts</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN232"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN234"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_dirty<span class='Delimiter'>[</span><a href="commit_ts.c.html#LN234"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SetXidCommitTsInPage &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Sets the commit timestamp of a single transaction. 
+ * 
+ * Must be called with CommitTsControlLock held 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN256"></a><span class='Declare_Function'>TransactionIdSetCommitTs</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>ts</span><span class='Delimiter'>, 
+</span><a name="LN257"></a>                         <a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Declare_Parameter'>nodeid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>slotno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN259"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>entryno</span> <span class='Operator'>= </span><a href="commit_ts.c.html#LN70"><span class='Ref_to_Macro'>TransactionIdToCTsEntry</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN256"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN260"></a>    <a href="commit_ts.c.html#LN56"><span class='Ref_to_Struct'>CommitTimestampEntry</span></a> <span class='Declare_Local'>entry</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN41"><span class='Ref_to_Macro'>TransactionIdIsNormal</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN256"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN260"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN58"><span class='Ref_to_Member'>time</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN256"><span class='Ref_to_Parameter'>ts</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN260"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN59"><span class='Ref_to_Member'>nodeid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN257"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Delimiter'>; 
+</span> 
+    memcpy<span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_buffer<span class='Delimiter'>[</span><a href="commit_ts.c.html#LN257"><span class='Ref_to_Parameter'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>+ 
+</span>           <a href="commit_ts.c.html#LN62"><span class='Ref_to_Const'>SizeOfCommitTimestampEntry</span></a> <span class='Operator'>* </span><a href="commit_ts.c.html#LN259"><span class='Ref_To_Local'>entryno</span></a><span class='Delimiter'>, 
+</span>           <span class='Operator'>&</span><a href="commit_ts.c.html#LN260"><span class='Ref_To_Local'>entry</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN62"><span class='Ref_to_Const'>SizeOfCommitTimestampEntry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Interrogate the commit timestamp of a transaction. 
+ * 
+ * The return value indicates whether a commit timestamp record was found for 
+ * the given xid.  The timestamp value is returned in *ts (which may not be 
+ * null), and the origin node for the Xid is returned in *nodeid, if it's not 
+ * null. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN281"></a><span class='Declare_Function'>TransactionIdGetCommitTsData</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ts</span><span class='Delimiter'>, 
+</span><a name="LN282"></a>                             <a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>nodeid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN284"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span> <span class='Operator'>= </span><a href="commit_ts.c.html#LN68"><span class='Ref_to_Macro'>TransactionIdToCTsPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN285"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>entryno</span> <span class='Operator'>= </span><a href="commit_ts.c.html#LN70"><span class='Ref_to_Macro'>TransactionIdToCTsEntry</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN286"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span><a name="LN287"></a>    <a href="commit_ts.c.html#LN56"><span class='Ref_to_Struct'>CommitTimestampEntry</span></a> <span class='Declare_Local'>entry</span><span class='Delimiter'>; 
+</span><a name="LN288"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>oldestCommitTsXid</span><span class='Delimiter'>; 
+</span><a name="LN289"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>newestCommitTsXid</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_INVALID_PARAMETER_VALUE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>        <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"cannot retrieve commit timestamp for transaction %u"</span><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN41"><span class='Ref_to_Macro'>TransactionIdIsNormal</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* frozen and bootstrap xids are always committed far in the past */ 
+</span>        <span class='Operator'>*</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>ts</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN282"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Parentheses'>) 
+</span>            <span class='Operator'>*</span><a href="commit_ts.c.html#LN282"><span class='Ref_to_Parameter'>nodeid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Error if module not enabled */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a><span class='Parentheses'>) 
+</span>        <a href="commit_ts.c.html#LN109"><span class='Ref_to_Proto'>error_commit_ts_disabled</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we're asked for the cached value, return that.  Otherwise, fall 
+     * through to read from SLRU. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN93"><span class='Ref_to_Member'>xidLastCommit</span></a> <span class='Operator'>== </span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>ts</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN58"><span class='Ref_to_Member'>time</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN282"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Parentheses'>) 
+</span>            <span class='Operator'>*</span><a href="commit_ts.c.html#LN282"><span class='Ref_to_Parameter'>nodeid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN59"><span class='Ref_to_Member'>nodeid</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Operator'>*</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>ts</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="commit_ts.c.html#LN288"><span class='Ref_To_Local'>oldestCommitTsXid</span></a> <span class='Operator'>= </span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN289"><span class='Ref_To_Local'>newestCommitTsXid</span></a> <span class='Operator'>= </span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN129"><span class='Ref_to_Member'>newestCommitTsXid</span></a><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* neither is invalid, or both are */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN288"><span class='Ref_To_Local'>oldestCommitTsXid</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN289"><span class='Ref_To_Local'>newestCommitTsXid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Return empty if the requested value is outside our valid range. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN288"><span class='Ref_To_Local'>oldestCommitTsXid</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>        <a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN288"><span class='Ref_To_Local'>oldestCommitTsXid</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>        <a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN289"><span class='Ref_To_Local'>newestCommitTsXid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>ts</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN282"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Parentheses'>) 
+</span>            <span class='Operator'>*</span><a href="commit_ts.c.html#LN282"><span class='Ref_to_Parameter'>nodeid</span></a> <span class='Operator'>= </span><a href="../../../include/replication/origin.h.html#LN33"><span class='Ref_to_Const'>InvalidRepOriginId</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* lock is acquired by SimpleLruReadPage_ReadOnly */ 
+</span>    <a href="commit_ts.c.html#LN286"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="../../../include/access/slru.h.html#LN149"><span class='Ref_to_Proto'>SimpleLruReadPage_ReadOnly</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN284"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="commit_ts.c.html#LN287"><span class='Ref_To_Local'>entry</span></a><span class='Delimiter'>, 
+</span>           <a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_buffer<span class='Delimiter'>[</span><a href="commit_ts.c.html#LN286"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>+ 
+</span>           <a href="commit_ts.c.html#LN62"><span class='Ref_to_Const'>SizeOfCommitTimestampEntry</span></a> <span class='Operator'>* </span><a href="commit_ts.c.html#LN285"><span class='Ref_To_Local'>entryno</span></a><span class='Delimiter'>, 
+</span>           <a href="commit_ts.c.html#LN62"><span class='Ref_to_Const'>SizeOfCommitTimestampEntry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>ts</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN287"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN58"><span class='Ref_to_Member'>time</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN282"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="commit_ts.c.html#LN282"><span class='Ref_to_Parameter'>nodeid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN287"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN59"><span class='Ref_to_Member'>nodeid</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Operator'>*</span><a href="commit_ts.c.html#LN281"><span class='Ref_to_Parameter'>ts</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TransactionIdGetCommitTsData &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Return the Xid of the latest committed transaction.  (As far as this module 
+ * is concerned, anyway; it's up to the caller to ensure the value is useful 
+ * for its purposes.) 
+ * 
+ * ts and extra are filled with the corresponding data; they can be passed 
+ * as NULL if not wanted. 
+ */ 
+</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> 
+<a name="LN367"></a><span class='Declare_Function'>GetLatestCommitTsData</span><span class='Parentheses'>(</span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ts</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>nodeid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN369"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Error if module not enabled */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a><span class='Parentheses'>) 
+</span>        <a href="commit_ts.c.html#LN109"><span class='Ref_to_Proto'>error_commit_ts_disabled</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN369"><span class='Ref_To_Local'>xid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN93"><span class='Ref_to_Member'>xidLastCommit</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN367"><span class='Ref_to_Parameter'>ts</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="commit_ts.c.html#LN367"><span class='Ref_to_Parameter'>ts</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN58"><span class='Ref_to_Member'>time</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN367"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="commit_ts.c.html#LN367"><span class='Ref_to_Parameter'>nodeid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN59"><span class='Ref_to_Member'>nodeid</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="commit_ts.c.html#LN369"><span class='Ref_To_Local'>xid</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end GetLatestCommitTsData &raquo; </span> 
+ 
+<span class='Keyword'>static void 
+</span><a name="LN388"></a><span class='Declare_Function'>error_commit_ts_disabled</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not get commit timestamp data"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="../../../include/access/xlog.h.html#LN242"><span class='Ref_to_Proto'>RecoveryInProgress</span></a><span class='Parentheses'>() </span><span class='Operator'>? 
+</span>             <a href="../../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Make sure the configuration parameter \"%s\" is set on the master server."</span><span class='Delimiter'>, 
+</span>                     <span class='String'>"track_commit_timestamp"</span><span class='Parentheses'>) </span><span class='Operator'>: 
+</span>             <a href="../../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Make sure the configuration parameter \"%s\" is set."</span><span class='Delimiter'>, 
+</span>                     <span class='String'>"track_commit_timestamp"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * SQL-callable wrapper to obtain commit time of a transaction 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN404"></a><span class='Declare_Function'>pg_xact_commit_timestamp</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN406"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid</span> <span class='Operator'>= </span><a href="../../../include/fmgr.h.html#LN234"><span class='Ref_to_Macro'>PG_GETARG_UINT32</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN407"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>ts</span><span class='Delimiter'>; 
+</span><a name="LN408"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN408"><span class='Ref_To_Local'>found</span></a> <span class='Operator'>= </span><a href="../../../include/access/commit_ts.h.html#LN27"><span class='Ref_to_Proto'>TransactionIdGetCommitTsData</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN406"><span class='Ref_To_Local'>xid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="commit_ts.c.html#LN407"><span class='Ref_To_Local'>ts</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN408"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/fmgr.h.html#LN304"><span class='Ref_to_Macro'>PG_RETURN_NULL</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/timestamp.h.html#LN39"><span class='Ref_to_Macro'>PG_RETURN_TIMESTAMPTZ</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN407"><span class='Ref_To_Local'>ts</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN420"></a><span class='Declare_Function'>pg_last_committed_xact</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN422"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid</span><span class='Delimiter'>; 
+</span><a name="LN423"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>ts</span><span class='Delimiter'>; 
+</span><a name="LN424"></a>    <a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Local'>values</span><span class='Delimiter'>[</span><span class='Number'>2</span><span class='Delimiter'>]; 
+</span><a name="LN425"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>nulls</span><span class='Delimiter'>[</span><span class='Number'>2</span><span class='Delimiter'>]; 
+</span><a name="LN426"></a>    <a href="../../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a>   <span class='Declare_Local'>tupdesc</span><span class='Delimiter'>; 
+</span><a name="LN427"></a>    <a href="../../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>htup</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* and construct a tuple with our data */ 
+</span>    <a href="commit_ts.c.html#LN422"><span class='Ref_To_Local'>xid</span></a> <span class='Operator'>= </span><a href="../../../include/access/commit_ts.h.html#LN29"><span class='Ref_to_Proto'>GetLatestCommitTsData</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="commit_ts.c.html#LN423"><span class='Ref_To_Local'>ts</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Construct a tuple descriptor for the result row.  This must match this 
+     * function's pg_proc entry! 
+     */ 
+</span>    <a href="commit_ts.c.html#LN426"><span class='Ref_To_Local'>tupdesc</span></a> <span class='Operator'>= </span><a href="../common/tupdesc.c.html#LN39"><span class='Ref_to_Func'>CreateTemplateTupleDesc</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/tupdesc.h.html#LN114"><span class='Ref_to_Proto'>TupleDescInitEntry</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN426"><span class='Ref_To_Local'>tupdesc</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/access/attnum.h.html#LN20"><span class='Ref_to_Typedef'>AttrNumber</span></a><span class='Parentheses'>) </span><span class='Number'>1</span><span class='Delimiter'>, </span><span class='String'>"xid"</span><span class='Delimiter'>, 
+</span>                       <a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN29"><span class='Ref_to_Const'>XIDOID</span></a><span class='Delimiter'>, </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/tupdesc.h.html#LN114"><span class='Ref_to_Proto'>TupleDescInitEntry</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN426"><span class='Ref_To_Local'>tupdesc</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/access/attnum.h.html#LN20"><span class='Ref_to_Typedef'>AttrNumber</span></a><span class='Parentheses'>) </span><span class='Number'>2</span><span class='Delimiter'>, </span><span class='String'>"timestamp"</span><span class='Delimiter'>, 
+</span>                       <a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN53"><span class='Ref_to_Const'>TIMESTAMPTZOID</span></a><span class='Delimiter'>, </span><span class='Operator'>-</span><span class='Number'>1</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN426"><span class='Ref_To_Local'>tupdesc</span></a> <span class='Operator'>= </span><a href="../../../include/funcapi.h.html#LN229"><span class='Ref_to_Proto'>BlessTupleDesc</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN426"><span class='Ref_To_Local'>tupdesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN41"><span class='Ref_to_Macro'>TransactionIdIsNormal</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN422"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        memset<span class='Parentheses'>(</span><a href="commit_ts.c.html#LN425"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN425"><span class='Ref_To_Local'>nulls</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="commit_ts.c.html#LN424"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN526"><span class='Ref_to_Macro'>TransactionIdGetDatum</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN422"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="commit_ts.c.html#LN425"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <a href="commit_ts.c.html#LN424"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN31"><span class='Ref_to_Macro'>TimestampTzGetDatum</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN423"><span class='Ref_To_Local'>ts</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="commit_ts.c.html#LN425"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="commit_ts.c.html#LN427"><span class='Ref_To_Local'>htup</span></a> <span class='Operator'>= </span><a href="../common/heaptuple.c.html#LN690"><span class='Ref_to_Func'>heap_form_tuple</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN426"><span class='Ref_To_Local'>tupdesc</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN424"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN425"><span class='Ref_To_Local'>nulls</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN312"><span class='Ref_to_Macro'>PG_RETURN_DATUM</span></a><span class='Parentheses'>(</span><a href="../../../include/funcapi.h.html#LN221"><span class='Ref_to_Macro'>HeapTupleGetDatum</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN427"><span class='Ref_To_Local'>htup</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pg_last_committed_xact &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Number of shared CommitTS buffers. 
+ * 
+ * We use a very similar logic as for the number of CLOG buffers; see comments 
+ * in CLOGShmemBuffers. 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN469"></a><span class='Declare_Function'>CommitTsShmemBuffers</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><span class='Number'>16</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN10"><span class='Ref_to_Macro'>Max</span></a><span class='Parentheses'>(</span><span class='Number'>4</span><span class='Delimiter'>, </span><a href="../../utils/init/globals.c.html#LN122"><span class='Ref_to_Global_Var'>NBuffers</span></a> <span class='Operator'>/ </span><span class='Number'>1024</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Shared memory sizing for CommitTs 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN478"></a><span class='Declare_Function'>CommitTsShmemSize</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="slru.c.html#LN143"><span class='Ref_to_Func'>SimpleLruShmemSize</span></a><span class='Parentheses'>(</span><a href="../../../include/access/commit_ts.h.html#LN32"><span class='Ref_to_Proto'>CommitTsShmemBuffers</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span> <span class='Operator'>+ 
+</span>        <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN91"><span class='Ref_to_Struct'>CommitTimestampShared</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize CommitTs at system startup (postmaster start or standalone 
+ * backend) 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN489"></a><span class='Declare_Function'>CommitTsShmemInit</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN491"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Operator'>-&GT;</span>PagePrecedes <span class='Operator'>= </span><a href="commit_ts.c.html#LN111"><span class='Ref_to_Proto'>CommitTsPagePrecedes</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/slru.h.html#LN144"><span class='Ref_to_Proto'>SimpleLruInit</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><span class='String'>"commit_timestamp"</span><span class='Delimiter'>, </span><a href="../../../include/access/commit_ts.h.html#LN32"><span class='Ref_to_Proto'>CommitTsShmemBuffers</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                  CommitTsControlLock<span class='Delimiter'>, </span><span class='String'>"pg_commit_ts"</span><span class='Delimiter'>, 
+</span>                  <a href="../../../include/storage/lwlock.h.html#LN198"><span class='Ref_to_EnumConst'>LWTRANCHE_COMMITTS_BUFFERS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN43"><span class='Ref_to_Proto'>ShmemInitStruct</span></a><span class='Parentheses'>(</span><span class='String'>"CommitTs shared"</span><span class='Delimiter'>, 
+</span>                                     <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN91"><span class='Ref_to_Struct'>CommitTimestampShared</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                     <span class='Operator'>&</span><a href="commit_ts.c.html#LN491"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN491"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN93"><span class='Ref_to_Member'>xidLastCommit</span></a> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span>        <a href="../../../include/datatype/timestamp.h.html#LN111"><span class='Ref_to_Macro'>TIMESTAMP_NOBEGIN</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN58"><span class='Ref_to_Member'>time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN59"><span class='Ref_to_Member'>nodeid</span></a> <span class='Operator'>= </span><a href="../../../include/replication/origin.h.html#LN33"><span class='Ref_to_Const'>InvalidRepOriginId</span></a><span class='Delimiter'>; 
+</span>        <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN491"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end CommitTsShmemInit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * This function must be called ONCE on system install. 
+ * 
+ * (The CommitTs directory is assumed to have been created by initdb, and 
+ * CommitTsShmemInit must have been called already.) 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN522"></a><span class='Declare_Function'>BootStrapCommitTs</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Nothing to do here at present, unlike most other SLRU modules; segments 
+     * are created when the server is started with this module enabled. See 
+     * ActivateCommitTs. 
+     */ 
+</span><span class='Delimiter'>} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize (or reinitialize) a page of CommitTs to zeroes. 
+ * If writeXlog is TRUE, also emit an XLOG record saying we did this. 
+ * 
+ * The page is not actually written, just set up in shared memory. 
+ * The slot number of the new page is returned. 
+ * 
+ * Control lock must be held at entry, and will be held at exit. 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN541"></a><span class='Declare_Function'>ZeroCommitTsPage</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>writeXlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN543"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN543"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="../../../include/access/slru.h.html#LN146"><span class='Ref_to_Proto'>SimpleLruZeroPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN541"><span class='Ref_to_Parameter'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN541"><span class='Ref_to_Parameter'>writeXlog</span></a><span class='Parentheses'>) 
+</span>        <a href="clog.c.html#LN84"><span class='Ref_to_Proto'>WriteZeroPageXlogRec</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN541"><span class='Ref_to_Parameter'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="commit_ts.c.html#LN543"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * This must be called ONCE during postmaster or standalone-backend startup, 
+ * after StartupXLOG has initialized ShmemVariableCache-&GT;nextXid. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN558"></a><span class='Declare_Function'>StartupCommitTs</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="commit_ts.c.html#LN112"><span class='Ref_to_Proto'>ActivateCommitTs</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * This must be called ONCE during postmaster or standalone-backend startup, 
+ * after recovery has finished. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN568"></a><span class='Declare_Function'>CompleteCommitTsInitialization</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * If the feature is not enabled, turn it off for good.  This also removes 
+     * any leftover data. 
+     * 
+     * Conversely, we activate the module if the feature is enabled.  This is 
+     * not necessary in a master system because we already did it earlier, but 
+     * if we're in a standby server that got promoted which had the feature 
+     * enabled and was following a master that had the feature disabled, this 
+     * is where we turn it on locally. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN102"><span class='Ref_to_Global_Var'>track_commit_timestamp</span></a><span class='Parentheses'>) 
+</span>        <a href="commit_ts.c.html#LN113"><span class='Ref_to_Proto'>DeactivateCommitTs</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="commit_ts.c.html#LN112"><span class='Ref_to_Proto'>ActivateCommitTs</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Activate or deactivate CommitTs' upon reception of a XLOG_PARAMETER_CHANGE 
+ * XLog record in a standby. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN591"></a><span class='Declare_Function'>CommitTsParameterChange</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>newvalue</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>oldvalue</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * If the commit_ts module is disabled in this server and we get word from 
+     * the master server that it is enabled there, activate it so that we can 
+     * replay future WAL records involving it; also mark it as active on 
+     * pg_control.  If the old value was already set, we already did this, so 
+     * don't do anything. 
+     * 
+     * If the module is disabled in the master, disable it here too, unless 
+     * the module is enabled locally. 
+     * 
+     * Note this only runs in the recovery process, so an unlocked read is 
+     * fine. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN591"><span class='Ref_to_Parameter'>newvalue</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a><span class='Parentheses'>) 
+</span>            <a href="commit_ts.c.html#LN112"><span class='Ref_to_Proto'>ActivateCommitTs</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a><span class='Parentheses'>) 
+</span>        <a href="commit_ts.c.html#LN113"><span class='Ref_to_Proto'>DeactivateCommitTs</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end CommitTsParameterChange &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Activate this module whenever necessary. 
+ *      This must happen during postmaster or standalone-backend startup, 
+ *      or during WAL replay anytime the track_commit_timestamp setting is 
+ *      changed in the master. 
+ * 
+ * The reason why this SLRU needs separate activation/deactivation functions is 
+ * that it can be enabled/disabled during start and the activation/deactivation 
+ * on master is propagated to slave via replay. Other SLRUs don't have this 
+ * property and they can be just initialized during normal startup. 
+ * 
+ * This is in charge of creating the currently active segment, if it's not 
+ * already there.  The reason for this is that the server might have been 
+ * running with this module disabled for a while and thus might have skipped 
+ * the normal creation point. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN632"></a><span class='Declare_Function'>ActivateCommitTs</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN634"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid</span><span class='Delimiter'>; 
+</span><a name="LN635"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If we've done this already, there's nothing to do */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN634"><span class='Ref_To_Local'>xid</span></a> <span class='Operator'>= </span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN116"><span class='Ref_to_Member'>nextXid</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN635"><span class='Ref_To_Local'>pageno</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN68"><span class='Ref_to_Macro'>TransactionIdToCTsPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN634"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Re-Initialize our idea of the latest page number. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>latest_page_number <span class='Operator'>= </span><a href="commit_ts.c.html#LN635"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If CommitTs is enabled, but it wasn't in the previous server run, we 
+     * need to set the oldest and newest values to the next Xid; that way, we 
+     * will not try to read data that might not have been set. 
+     * 
+     * XXX does this have a problem if a server is started with commitTs 
+     * enabled, then started with commitTs disabled, then restarted with it 
+     * enabled again?  It doesn't look like it does, because there should be a 
+     * checkpoint that sets the value to InvalidTransactionId at end of 
+     * recovery; and so any chance of injecting new transactions without 
+     * CommitTs values would occur after the oldestCommitTsXid has been set to 
+     * Invalid temporarily. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a> <span class='Operator'>== </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a> <span class='Operator'>= 
+</span>            <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN129"><span class='Ref_to_Member'>newestCommitTsXid</span></a> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN178"><span class='Ref_to_Proto'>ReadNewTransactionId</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Create the current segment file, if necessary */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/slru.h.html#LN154"><span class='Ref_to_Proto'>SimpleLruDoesPhysicalPageExist</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN635"><span class='Ref_To_Local'>pageno</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN680"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="commit_ts.c.html#LN680"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN110"><span class='Ref_to_Proto'>ZeroCommitTsPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN635"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/slru.h.html#LN151"><span class='Ref_to_Proto'>SimpleLruWritePage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN680"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_dirty<span class='Delimiter'>[</span><a href="commit_ts.c.html#LN680"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Change the activation status in shared memory. */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ActivateCommitTs &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Deactivate this module. 
+ * 
+ * This must be called when the track_commit_timestamp parameter is turned off. 
+ * This happens during postmaster or standalone-backend startup, or during WAL 
+ * replay. 
+ * 
+ * Resets CommitTs into invalid state to make sure we don't hand back 
+ * possibly-invalid data; also removes segments of old data. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN706"></a><span class='Declare_Function'>DeactivateCommitTs</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Cleanup the status in the shared memory. 
+     * 
+     * We reset everything in the commitTsShared record to prevent user from 
+     * getting confusing data about last committed transaction on the standby 
+     * when the module was activated repeatedly on the primary. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN93"><span class='Ref_to_Member'>xidLastCommit</span></a> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/datatype/timestamp.h.html#LN111"><span class='Ref_to_Macro'>TIMESTAMP_NOBEGIN</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN58"><span class='Ref_to_Member'>time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN94"><span class='Ref_to_Member'>dataLastCommit</span></a><span class='Operator'>.</span><a href="commit_ts.c.html#LN59"><span class='Ref_to_Member'>nodeid</span></a> <span class='Operator'>= </span><a href="../../../include/replication/origin.h.html#LN33"><span class='Ref_to_Const'>InvalidRepOriginId</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span>    <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN129"><span class='Ref_to_Member'>newestCommitTsXid</span></a> <span class='Operator'>= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Remove *all* files.  This is necessary so that there are no leftover 
+     * files; in the case where this feature is later enabled after running 
+     * with it disabled for some time there may be a gap in the file sequence. 
+     * (We can probably tolerate out-of-sequence files, as they are going to 
+     * be overwritten anyway when we wrap around, but it seems better to be 
+     * tidy.) 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="../../../include/access/slru.h.html#LN158"><span class='Ref_to_Proto'>SlruScanDirectory</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="../../../include/access/slru.h.html#LN164"><span class='Ref_to_Proto'>SlruScanDirCbDeleteAll</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end DeactivateCommitTs &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * This must be called ONCE during postmaster or standalone-backend shutdown 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN744"></a><span class='Declare_Function'>ShutdownCommitTs</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Flush dirty CommitTs pages to disk */ 
+</span>    <a href="../../../include/access/slru.h.html#LN152"><span class='Ref_to_Proto'>SimpleLruFlush</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * fsync pg_commit_ts to ensure that any files flushed previously are 
+     * durably on disk. 
+     */ 
+</span>    <a href="../../../include/common/file_utils.h.html#LN17"><span class='Ref_to_Proto'>fsync_fname</span></a><span class='Parentheses'>(</span><span class='String'>"pg_commit_ts"</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Perform a checkpoint --- either during shutdown, or on-the-fly 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN760"></a><span class='Declare_Function'>CheckPointCommitTs</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Flush dirty CommitTs pages to disk */ 
+</span>    <a href="../../../include/access/slru.h.html#LN152"><span class='Ref_to_Proto'>SimpleLruFlush</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * fsync pg_commit_ts to ensure that any files flushed previously are 
+     * durably on disk. 
+     */ 
+</span>    <a href="../../../include/common/file_utils.h.html#LN17"><span class='Ref_to_Proto'>fsync_fname</span></a><span class='Parentheses'>(</span><span class='String'>"pg_commit_ts"</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Make sure that CommitTs has room for a newly-allocated XID. 
+ * 
+ * NB: this is called while holding XidGenLock.  We want it to be very fast 
+ * most of the time; even when it's not so fast, no actual I/O need happen 
+ * unless we're forced to write out a dirty CommitTs or xlog page to make room 
+ * in shared memory. 
+ * 
+ * NB: the current implementation relies on track_commit_timestamp being 
+ * PGC_POSTMASTER. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN784"></a><span class='Declare_Function'>ExtendCommitTs</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>newestXact</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN786"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Nothing to do if module not enabled.  Note we do an unlocked read of 
+     * the flag here, which is okay because this routine is only called from 
+     * GetNewTransactionId, which is never called in a standby. 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="xlog.c.html#LN191"><span class='Ref_to_Global_Var'>InRecovery</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN98"><span class='Ref_to_Global_Var'>commitTsShared</span></a><span class='Operator'>-&GT;</span><a href="commit_ts.c.html#LN95"><span class='Ref_to_Member'>commitTsActive</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * No work except at first XID of a page.  But beware: just after 
+     * wraparound, the first XID of page zero is FirstNormalTransactionId. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN70"><span class='Ref_to_Macro'>TransactionIdToCTsEntry</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN784"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>        <span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN42"><span class='Ref_to_Macro'>TransactionIdEquals</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN784"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Delimiter'>, </span><a href="../../../include/access/transam.h.html#LN33"><span class='Ref_to_Const'>FirstNormalTransactionId</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN786"><span class='Ref_To_Local'>pageno</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN68"><span class='Ref_to_Macro'>TransactionIdToCTsPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN784"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Zero the page and make an XLOG entry about it */ 
+</span>    <a href="commit_ts.c.html#LN110"><span class='Ref_to_Proto'>ZeroCommitTsPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN786"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><span class='Operator'>!</span><a href="xlog.c.html#LN191"><span class='Ref_to_Global_Var'>InRecovery</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExtendCommitTs &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Remove all CommitTs segments before the one holding the passed 
+ * transaction ID. 
+ * 
+ * Note that we don't need to flush XLOG here. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN822"></a><span class='Declare_Function'>TruncateCommitTs</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestXact</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN824"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>cutoffPage</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The cutoff point is the start of the segment containing oldestXact. We 
+     * pass the *page* containing oldestXact to SimpleLruTruncate. 
+     */ 
+</span>    <a href="commit_ts.c.html#LN824"><span class='Ref_To_Local'>cutoffPage</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN68"><span class='Ref_to_Macro'>TransactionIdToCTsPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN822"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Check to see if there's any files that could be removed */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/slru.h.html#LN158"><span class='Ref_to_Proto'>SlruScanDirectory</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="../../../include/access/slru.h.html#LN162"><span class='Ref_to_Proto'>SlruScanDirCbReportPresence</span></a><span class='Delimiter'>, 
+</span>                           <span class='Operator'>&</span><a href="commit_ts.c.html#LN824"><span class='Ref_To_Local'>cutoffPage</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>;</span>                 <span class='Comment_Single_Line'>/* nothing to remove */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* Write XLOG record */ 
+</span>    <a href="clog.c.html#LN85"><span class='Ref_to_Proto'>WriteTruncateXlogRec</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN824"><span class='Ref_To_Local'>cutoffPage</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN822"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now we can remove the old CommitTs segment(s) */ 
+</span>    <a href="../../../include/access/slru.h.html#LN153"><span class='Ref_to_Proto'>SimpleLruTruncate</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN824"><span class='Ref_To_Local'>cutoffPage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TruncateCommitTs &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Set the limit values between which commit TS can be consulted. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN848"></a><span class='Declare_Function'>SetCommitTsLimit</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestXact</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>newestXact</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Be careful not to overwrite values that are either further into the 
+     * "future" or signal a disabled committs. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a> <span class='Operator'>!= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN848"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Parentheses'>))</span> 
+            <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN848"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN848"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Delimiter'>, </span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN129"><span class='Ref_to_Member'>newestCommitTsXid</span></a><span class='Parentheses'>))</span> 
+            <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN129"><span class='Ref_to_Member'>newestCommitTsXid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN848"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN129"><span class='Ref_to_Member'>newestCommitTsXid</span></a> <span class='Operator'>== </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN848"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Delimiter'>; 
+</span>        <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN129"><span class='Ref_to_Member'>newestCommitTsXid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN848"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SetCommitTsLimit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Move forwards the oldest commitTS value that can be consulted 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN875"></a><span class='Declare_Function'>AdvanceOldestCommitTsXid</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestXact</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a> <span class='Operator'>!= </span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a> <span class='Operator'>&& 
+</span>    <a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN875"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Parentheses'>))</span> 
+        <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN128"><span class='Ref_to_Member'>oldestCommitTsXid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN875"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Decide which of two CLOG page numbers is "older" for truncation purposes. 
+ * 
+ * We need to use comparison of TransactionIds here in order to do the right 
+ * thing with wraparound XID arithmetic.  However, if we are asked about 
+ * page number zero, we don't want to hand InvalidTransactionId to 
+ * TransactionIdPrecedes: it'll get weird about permanent xact IDs.  So, 
+ * offset both xids by FirstNormalTransactionId to avoid that. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN895"></a><span class='Declare_Function'>CommitTsPagePrecedes</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>page1</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>page2</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN897"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid1</span><span class='Delimiter'>; 
+</span><a name="LN898"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid2</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN897"><span class='Ref_To_Local'>xid1</span></a> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="commit_ts.c.html#LN895"><span class='Ref_to_Parameter'>page1</span></a><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="commit_ts.c.html#LN65"><span class='Ref_to_Const'>COMMIT_TS_XACTS_PER_PAGE</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN897"><span class='Ref_To_Local'>xid1</span></a> <span class='Operator'>+= </span><a href="../../../include/access/transam.h.html#LN33"><span class='Ref_to_Const'>FirstNormalTransactionId</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN898"><span class='Ref_To_Local'>xid2</span></a> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="commit_ts.c.html#LN895"><span class='Ref_to_Parameter'>page2</span></a><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="commit_ts.c.html#LN65"><span class='Ref_to_Const'>COMMIT_TS_XACTS_PER_PAGE</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN898"><span class='Ref_To_Local'>xid2</span></a> <span class='Operator'>+= </span><a href="../../../include/access/transam.h.html#LN33"><span class='Ref_to_Const'>FirstNormalTransactionId</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN897"><span class='Ref_To_Local'>xid1</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN898"><span class='Ref_To_Local'>xid2</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Write a ZEROPAGE xlog record 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN913"></a><span class='Declare_Function'>WriteZeroPageXlogRec</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) (</span><span class='Operator'>&</span><a href="commit_ts.c.html#LN913"><span class='Ref_to_Parameter'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_COMMIT_TS_ID<span class='Delimiter'>, </span><a href="../../../include/access/commit_ts.h.html#LN48"><span class='Ref_to_Const'>COMMIT_TS_ZEROPAGE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Write a TRUNCATE xlog record 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN924"></a><span class='Declare_Function'>WriteTruncateXlogRec</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestXid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN926"></a>    <a href="../../../include/access/commit_ts.h.html#LN63"><span class='Ref_to_Struct'>xl_commit_ts_truncate</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN926"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/commit_ts.h.html#LN65"><span class='Ref_to_Member'>pageno</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN924"><span class='Ref_to_Parameter'>pageno</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN926"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/commit_ts.h.html#LN66"><span class='Ref_to_Member'>oldestXid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN924"><span class='Ref_to_Parameter'>oldestXid</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) (</span><span class='Operator'>&</span><a href="commit_ts.c.html#LN926"><span class='Ref_To_Local'>xlrec</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../../include/access/commit_ts.h.html#LN69"><span class='Ref_to_Const'>SizeOfCommitTsTruncate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_COMMIT_TS_ID<span class='Delimiter'>, </span><a href="../../../include/access/commit_ts.h.html#LN49"><span class='Ref_to_Const'>COMMIT_TS_TRUNCATE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Write a SETTS xlog record 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN940"></a><span class='Declare_Function'>WriteSetTimestampXlogRec</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>mainxid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, 
+</span><a name="LN941"></a>                         <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>timestamp</span><span class='Delimiter'>, 
+</span><a name="LN942"></a>                         <a href="../../../include/access/xlogdefs.h.html#LN50"><span class='Ref_to_Typedef'>RepOriginId</span></a> <span class='Declare_Parameter'>nodeid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN944"></a>    <a href="../../../include/access/commit_ts.h.html#LN52"><span class='Ref_to_Struct'>xl_commit_ts_set</span></a> <span class='Declare_Local'>record</span><span class='Delimiter'>; 
+</span> 
+    <a href="commit_ts.c.html#LN944"><span class='Ref_To_Local'>record</span></a><span class='Operator'>.</span><a href="../../../include/access/commit_ts.h.html#LN54"><span class='Ref_to_Member'>timestamp</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN941"><span class='Ref_to_Parameter'>timestamp</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN944"><span class='Ref_To_Local'>record</span></a><span class='Operator'>.</span><a href="../../../include/access/commit_ts.h.html#LN55"><span class='Ref_to_Member'>nodeid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN942"><span class='Ref_to_Parameter'>nodeid</span></a><span class='Delimiter'>; 
+</span>    <a href="commit_ts.c.html#LN944"><span class='Ref_To_Local'>record</span></a><span class='Operator'>.</span><a href="../../../include/access/commit_ts.h.html#LN56"><span class='Ref_to_Member'>mainxid</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN940"><span class='Ref_to_Parameter'>mainxid</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="commit_ts.c.html#LN944"><span class='Ref_To_Local'>record</span></a><span class='Delimiter'>, 
+</span>                     <a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../../include/access/commit_ts.h.html#LN52"><span class='Ref_to_Struct'>xl_commit_ts_set</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN940"><span class='Ref_to_Parameter'>mainxid</span></a><span class='Parentheses'>) </span><span class='Operator'>+ 
+</span>                     <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="commit_ts.c.html#LN941"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN940"><span class='Ref_to_Parameter'>nsubxids</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_COMMIT_TS_ID<span class='Delimiter'>, </span><a href="../../../include/access/commit_ts.h.html#LN50"><span class='Ref_to_Const'>COMMIT_TS_SETTS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * CommitTS resource manager's routines 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN962"></a><span class='Declare_Function'>commit_ts_redo</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN68"><span class='Ref_to_Struct'>XLogReaderState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>record</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN964"></a>    <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>info</span> <span class='Operator'>= </span><a href="../../../include/access/xlogreader.h.html#LN215"><span class='Ref_to_Macro'>XLogRecGetInfo</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN962"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>) </span><span class='Operator'>& ~</span><a href="../../../include/access/xlogrecord.h.html#LN61"><span class='Ref_to_Const'>XLR_INFO_MASK</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Backup blocks are not used in commit_ts records */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xlogreader.h.html#LN221"><span class='Ref_to_Macro'>XLogRecHasAnyBlockRefs</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN962"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN964"><span class='Ref_To_Local'>info</span></a> <span class='Operator'>== </span><a href="../../../include/access/commit_ts.h.html#LN48"><span class='Ref_to_Const'>COMMIT_TS_ZEROPAGE</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN971"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span><span class='Delimiter'>; 
+</span><a name="LN972"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span> 
+        memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="commit_ts.c.html#LN971"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlogreader.h.html#LN219"><span class='Ref_to_Macro'>XLogRecGetData</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN962"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="commit_ts.c.html#LN972"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="commit_ts.c.html#LN110"><span class='Ref_to_Proto'>ZeroCommitTsPage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN971"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/slru.h.html#LN151"><span class='Ref_to_Proto'>SimpleLruWritePage</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN972"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_dirty<span class='Delimiter'>[</span><a href="commit_ts.c.html#LN972"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CommitTsControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN964"><span class='Ref_To_Local'>info</span></a> <span class='Operator'>== </span><a href="../../../include/access/commit_ts.h.html#LN49"><span class='Ref_to_Const'>COMMIT_TS_TRUNCATE</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN986"></a>        <a href="../../../include/access/commit_ts.h.html#LN63"><span class='Ref_to_Struct'>xl_commit_ts_truncate</span></a> <span class='Operator'>*</span><span class='Declare_Local'>trunc</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/commit_ts.h.html#LN63"><span class='Ref_to_Struct'>xl_commit_ts_truncate</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/access/xlogreader.h.html#LN219"><span class='Ref_to_Macro'>XLogRecGetData</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN962"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/commit_ts.h.html#LN45"><span class='Ref_to_Proto'>AdvanceOldestCommitTsXid</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN986"><span class='Ref_To_Local'>trunc</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/commit_ts.h.html#LN66"><span class='Ref_to_Member'>oldestXid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * During XLOG replay, latest_page_number isn't set up yet; insert a 
+         * suitable value to bypass the sanity test in SimpleLruTruncate. 
+         */ 
+</span>        <a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>latest_page_number <span class='Operator'>= </span><a href="commit_ts.c.html#LN986"><span class='Ref_To_Local'>trunc</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/commit_ts.h.html#LN65"><span class='Ref_to_Member'>pageno</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/slru.h.html#LN153"><span class='Ref_to_Proto'>SimpleLruTruncate</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN78"><span class='Ref_to_Const'>CommitTsCtl</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN986"><span class='Ref_To_Local'>trunc</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/commit_ts.h.html#LN65"><span class='Ref_to_Member'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN964"><span class='Ref_To_Local'>info</span></a> <span class='Operator'>== </span><a href="../../../include/access/commit_ts.h.html#LN50"><span class='Ref_to_Const'>COMMIT_TS_SETTS</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN1000"></a>        <a href="../../../include/access/commit_ts.h.html#LN52"><span class='Ref_to_Struct'>xl_commit_ts_set</span></a> <span class='Operator'>*</span><span class='Declare_Local'>setts</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/commit_ts.h.html#LN52"><span class='Ref_to_Struct'>xl_commit_ts_set</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/access/xlogreader.h.html#LN219"><span class='Ref_to_Macro'>XLogRecGetData</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN962"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN1001"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>nsubxids</span><span class='Delimiter'>; 
+</span><a name="LN1002"></a>        <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Local'>subxids</span><span class='Delimiter'>; 
+</span> 
+        <a href="commit_ts.c.html#LN1001"><span class='Ref_To_Local'>nsubxids</span></a> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/access/xlogreader.h.html#LN220"><span class='Ref_to_Macro'>XLogRecGetDataLen</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN962"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>) </span><span class='Operator'>- </span><a href="../../../include/access/commit_ts.h.html#LN60"><span class='Ref_to_Const'>SizeOfCommitTsSet</span></a><span class='Parentheses'>)</span> <span class='Operator'>/ 
+</span>                    <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN1001"><span class='Ref_To_Local'>nsubxids</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="commit_ts.c.html#LN1002"><span class='Ref_To_Local'>subxids</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="commit_ts.c.html#LN1001"><span class='Ref_To_Local'>nsubxids</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            memcpy<span class='Parentheses'>(</span><a href="commit_ts.c.html#LN1002"><span class='Ref_To_Local'>subxids</span></a><span class='Delimiter'>, 
+</span>                   <a href="../../../include/access/xlogreader.h.html#LN219"><span class='Ref_to_Macro'>XLogRecGetData</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN962"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><a href="../../../include/access/commit_ts.h.html#LN60"><span class='Ref_to_Const'>SizeOfCommitTsSet</span></a><span class='Delimiter'>, 
+</span>                   <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="commit_ts.c.html#LN1001"><span class='Ref_To_Local'>nsubxids</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+            <a href="commit_ts.c.html#LN1002"><span class='Ref_To_Local'>subxids</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/commit_ts.h.html#LN24"><span class='Ref_to_Proto'>TransactionTreeSetCommitTsData</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN1000"><span class='Ref_To_Local'>setts</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/commit_ts.h.html#LN56"><span class='Ref_to_Member'>mainxid</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN1001"><span class='Ref_To_Local'>nsubxids</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN1002"><span class='Ref_To_Local'>subxids</span></a><span class='Delimiter'>, 
+</span>                                       <a href="commit_ts.c.html#LN1000"><span class='Ref_To_Local'>setts</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/commit_ts.h.html#LN54"><span class='Ref_to_Member'>timestamp</span></a><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN1000"><span class='Ref_To_Local'>setts</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/commit_ts.h.html#LN55"><span class='Ref_to_Member'>nodeid</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="commit_ts.c.html#LN1002"><span class='Ref_To_Local'>subxids</span></a><span class='Parentheses'>) 
+</span>            <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="commit_ts.c.html#LN1002"><span class='Ref_To_Local'>subxids</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if info==COMMIT_TS_SETTS &raquo; </span> 
+    <span class='Control'>else</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"commit_ts_redo: unknown op code %u"</span><span class='Delimiter'>, </span><a href="commit_ts.c.html#LN964"><span class='Ref_To_Local'>info</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end commit_ts_redo &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

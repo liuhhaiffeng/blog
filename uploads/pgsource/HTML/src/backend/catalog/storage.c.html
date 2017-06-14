@@ -1,0 +1,575 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\catalog\storage.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\catalog\storage.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:33 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * storage.c 
+ *    code to create and destroy physical storage for relations 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/catalog/storage.c 
+ * 
+ * NOTES 
+ *    Some of this code used to be in storage/smgr/smgr.c, and the 
+ *    function names still reflect that. 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/visibilitymap.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xloginsert.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlogutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/catalog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/storage.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/storage_xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/freespace.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/smgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/rel.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * We keep a list of all relations (represented as RelFileNode values) 
+ * that have been created or deleted in the current transaction.  When 
+ * a relation is created, we create the physical file immediately, but 
+ * remember it so that we can delete the file again if the current 
+ * transaction is aborted.  Conversely, a deletion request is NOT 
+ * executed immediately, but is just entered in the list.  When and if 
+ * the transaction commits, we can delete the physical file. 
+ * 
+ * To handle subtransactions, every entry is marked with its transaction 
+ * nesting level.  At subtransaction commit, we reassign the subtransaction's 
+ * entries to the parent nesting level.  At subtransaction abort, we can 
+ * immediately execute the abort-time actions for all entries of the current 
+ * nesting level. 
+ * 
+ * NOTE: the list is kept in TopMemoryContext to be sure it won't disappear 
+ * unbetimes.  It'd probably be OK to keep it in TopTransactionContext, 
+ * but I'm being paranoid. 
+ */ 
+</span> 
+<a name="LN54"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>PendingRelDelete</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN56"></a>    <a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Member'>relnode</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* relation that may need to be deleted */ 
+</span><a name="LN57"></a>    <a href="../../include/storage/backendid.h.html#LN20"><span class='Ref_to_Typedef'>BackendId</span></a>   <span class='Declare_Member'>backend</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* InvalidBackendId if not a temp rel */ 
+</span><a name="LN58"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>atCommit</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* T=delete at commit; F=delete at abort */ 
+</span><a name="LN59"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>nestLevel</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* xact nesting level of request */ 
+</span><a name="LN60"></a>    <span class='Control'>struct</span> <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Member'>next</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* linked-list link */ 
+</span><a name="LN61"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>PendingRelDelete</span><span class='Delimiter'>; 
+</span> 
+<a name="LN63"></a><span class='Keyword'>static </span><a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Var'>pendingDeletes</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* head of linked list */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RelationCreateStorage 
+ *      Create physical storage for a relation. 
+ * 
+ * Create the underlying disk file storage for the relation. This only 
+ * creates the main fork; additional forks are created lazily by the 
+ * modules that need them. 
+ * 
+ * This function is transactional. The creation is WAL-logged, and if the 
+ * transaction aborts later on, the storage will be destroyed. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN77"></a><span class='Declare_Function'>RelationCreateStorage</span><span class='Parentheses'>(</span><a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Declare_Parameter'>relpersistence</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN79"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pending</span><span class='Delimiter'>; 
+</span><a name="LN80"></a>    <a href="../../include/storage/smgr.h.html#LN77"><span class='Ref_to_Typedef'>SMgrRelation</span></a> <span class='Declare_Local'>srel</span><span class='Delimiter'>; 
+</span><a name="LN81"></a>    <a href="../../include/storage/backendid.h.html#LN20"><span class='Ref_to_Typedef'>BackendId</span></a>   <span class='Declare_Local'>backend</span><span class='Delimiter'>; 
+</span><a name="LN82"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>needs_wal</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN77"><span class='Ref_to_Parameter'>relpersistence</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="../../include/catalog/pg_class.h.html#LN171"><span class='Ref_to_Const'>RELPERSISTENCE_TEMP</span></a><span class='Operator'>: 
+</span>            <a href="storage.c.html#LN81"><span class='Ref_To_Local'>backend</span></a> <span class='Operator'>= </span><a href="../../include/storage/backendid.h.html#LN33"><span class='Ref_to_Macro'>BackendIdForTempRelations</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="storage.c.html#LN82"><span class='Ref_To_Local'>needs_wal</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/catalog/pg_class.h.html#LN170"><span class='Ref_to_Const'>RELPERSISTENCE_UNLOGGED</span></a><span class='Operator'>: 
+</span>            <a href="storage.c.html#LN81"><span class='Ref_To_Local'>backend</span></a> <span class='Operator'>= </span><a href="../../include/storage/backendid.h.html#LN22"><span class='Ref_to_Const'>InvalidBackendId</span></a><span class='Delimiter'>; 
+</span>            <a href="storage.c.html#LN82"><span class='Ref_To_Local'>needs_wal</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/catalog/pg_class.h.html#LN169"><span class='Ref_to_Const'>RELPERSISTENCE_PERMANENT</span></a><span class='Operator'>: 
+</span>            <a href="storage.c.html#LN81"><span class='Ref_To_Local'>backend</span></a> <span class='Operator'>= </span><a href="../../include/storage/backendid.h.html#LN22"><span class='Ref_to_Const'>InvalidBackendId</span></a><span class='Delimiter'>; 
+</span>            <a href="storage.c.html#LN82"><span class='Ref_To_Local'>needs_wal</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"invalid relpersistence: %c"</span><span class='Delimiter'>, </span><a href="storage.c.html#LN77"><span class='Ref_to_Parameter'>relpersistence</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span><span class='Delimiter'>;</span>             <span class='Comment_Single_Line'>/* placate compiler */ 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="storage.c.html#LN80"><span class='Ref_To_Local'>srel</span></a> <span class='Operator'>= </span><a href="../../include/storage/smgr.h.html#LN83"><span class='Ref_to_Proto'>smgropen</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN77"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN81"><span class='Ref_To_Local'>backend</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/smgr.h.html#LN90"><span class='Ref_to_Proto'>smgrcreate</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN80"><span class='Ref_To_Local'>srel</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN26"><span class='Ref_to_EnumConst'>MAIN_FORKNUM</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN82"><span class='Ref_To_Local'>needs_wal</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/catalog/storage_xlog.h.html#LN52"><span class='Ref_to_Proto'>log_smgrcreate</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="storage.c.html#LN80"><span class='Ref_To_Local'>srel</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/smgr.h.html#LN42"><span class='Ref_to_Member'>smgr_rnode</span></a><span class='Operator'>.</span><a href="../../include/storage/relfilenode.h.html#LN73"><span class='Ref_to_Member'>node</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN26"><span class='Ref_to_EnumConst'>MAIN_FORKNUM</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Add the relation to the list of stuff to delete at abort */ 
+</span>    <a href="storage.c.html#LN79"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/palloc.h.html#LN70"><span class='Ref_to_Proto'>MemoryContextAlloc</span></a><span class='Parentheses'>(</span><a href="../utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN79"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN56"><span class='Ref_to_Member'>relnode</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN77"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN79"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN57"><span class='Ref_to_Member'>backend</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN81"><span class='Ref_To_Local'>backend</span></a><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN79"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN58"><span class='Ref_to_Member'>atCommit</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>;</span>  <span class='Comment_Single_Line'>/* delete if abort */ 
+</span>    <a href="storage.c.html#LN79"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN59"><span class='Ref_to_Member'>nestLevel</span></a> <span class='Operator'>= </span><a href="../../include/access/xact.h.html#LN344"><span class='Ref_to_Proto'>GetCurrentTransactionNestLevel</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN79"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN79"><span class='Ref_To_Local'>pending</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RelationCreateStorage &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Perform XLogInsert of an XLOG_SMGR_CREATE record to WAL. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN124"></a><span class='Declare_Function'>log_smgrcreate</span><span class='Parentheses'>(</span><a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forkNum</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN126"></a>    <a href="../../include/catalog/storage_xlog.h.html#LN32"><span class='Ref_to_Struct'>xl_smgr_create</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Make an XLOG entry reporting the file creation. 
+     */ 
+</span>    <a href="storage.c.html#LN126"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../include/catalog/storage_xlog.h.html#LN34"><span class='Ref_to_Member'>rnode</span></a> <span class='Operator'>= *</span><a href="storage.c.html#LN124"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN126"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../include/catalog/storage_xlog.h.html#LN35"><span class='Ref_to_Member'>forkNum</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN124"><span class='Ref_to_Parameter'>forkNum</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="storage.c.html#LN126"><span class='Ref_To_Local'>xlrec</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="storage.c.html#LN126"><span class='Ref_To_Local'>xlrec</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_SMGR_ID<span class='Delimiter'>, </span><a href="../../include/catalog/storage_xlog.h.html#LN29"><span class='Ref_to_Const'>XLOG_SMGR_CREATE</span></a> <span class='Operator'>| </span><a href="../../include/access/xlogrecord.h.html#LN70"><span class='Ref_to_Const'>XLR_SPECIAL_REL_UPDATE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RelationDropStorage 
+ *      Schedule unlinking of physical storage at transaction commit. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN144"></a><span class='Declare_Function'>RelationDropStorage</span><span class='Parentheses'>(</span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN146"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pending</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Add the relation to the list of stuff to delete at commit */ 
+</span>    <a href="storage.c.html#LN146"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/palloc.h.html#LN70"><span class='Ref_to_Proto'>MemoryContextAlloc</span></a><span class='Parentheses'>(</span><a href="../utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN146"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN56"><span class='Ref_to_Member'>relnode</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN144"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN84"><span class='Ref_to_Member'>rd_node</span></a><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN146"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN57"><span class='Ref_to_Member'>backend</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN144"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN88"><span class='Ref_to_Member'>rd_backend</span></a><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN146"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN58"><span class='Ref_to_Member'>atCommit</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* delete if commit */ 
+</span>    <a href="storage.c.html#LN146"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN59"><span class='Ref_to_Member'>nestLevel</span></a> <span class='Operator'>= </span><a href="../../include/access/xact.h.html#LN344"><span class='Ref_to_Proto'>GetCurrentTransactionNestLevel</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN146"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN146"><span class='Ref_To_Local'>pending</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * NOTE: if the relation was created in this transaction, it will now be 
+     * present in the pending-delete list twice, once with atCommit true and 
+     * once with atCommit false.  Hence, it will be physically deleted at end 
+     * of xact in either case (and the other entry will be ignored by 
+     * smgrDoPendingDeletes, so no error will occur).  We could instead remove 
+     * the existing list entry and delete the physical file immediately, but 
+     * for now I'll keep the logic simple. 
+     */ 
+</span> 
+    <a href="../../include/utils/rel.h.html#LN472"><span class='Ref_to_Macro'>RelationCloseSmgr</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN144"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RelationDropStorage &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * RelationPreserveStorage 
+ *      Mark a relation as not to be deleted after all. 
+ * 
+ * We need this function because relation mapping changes are committed 
+ * separately from commit of the whole transaction, so it's still possible 
+ * for the transaction to abort after the mapping update is done. 
+ * When a new physical relation is installed in the map, it would be 
+ * scheduled for delete-on-abort, so we'd delete it, and be in trouble. 
+ * The relation mapper fixes this by telling us to not delete such relations 
+ * after all as part of its commit. 
+ * 
+ * We also use this to reuse an old build of an index during ALTER TABLE, this 
+ * time removing the delete-at-commit entry. 
+ * 
+ * No-op if the relation is not among those scheduled for deletion. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN189"></a><span class='Declare_Function'>RelationPreserveStorage</span><span class='Parentheses'>(</span><a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>atCommit</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN191"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pending</span><span class='Delimiter'>; 
+</span><a name="LN192"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>prev</span><span class='Delimiter'>; 
+</span><a name="LN193"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>next</span><span class='Delimiter'>; 
+</span> 
+    <a href="storage.c.html#LN192"><span class='Ref_To_Local'>prev</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN191"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a><span class='Delimiter'>; </span><a href="storage.c.html#LN191"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="storage.c.html#LN191"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN193"><span class='Ref_To_Local'>next</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="storage.c.html#LN193"><span class='Ref_To_Local'>next</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN191"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/storage/relfilenode.h.html#LN87"><span class='Ref_to_Macro'>RelFileNodeEquals</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN189"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN191"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN56"><span class='Ref_to_Member'>relnode</span></a><span class='Parentheses'>) 
+</span>            <span class='Operator'>&& </span><a href="storage.c.html#LN191"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN58"><span class='Ref_to_Member'>atCommit</span></a> <span class='Operator'>== </span><a href="storage.c.html#LN189"><span class='Ref_to_Parameter'>atCommit</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* unlink and delete list entry */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN192"><span class='Ref_To_Local'>prev</span></a><span class='Parentheses'>) 
+</span>                <a href="storage.c.html#LN192"><span class='Ref_To_Local'>prev</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN193"><span class='Ref_To_Local'>next</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN193"><span class='Ref_To_Local'>next</span></a><span class='Delimiter'>; 
+</span>            <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN191"><span class='Ref_To_Local'>pending</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* prev does not change */ 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* unrelated entry, don't touch it */ 
+</span>            <a href="storage.c.html#LN192"><span class='Ref_To_Local'>prev</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN191"><span class='Ref_To_Local'>pending</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for pending=pendingDelete... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end RelationPreserveStorage &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * RelationTruncate 
+ *      Physically truncate a relation to the specified number of blocks. 
+ * 
+ * This includes getting rid of any buffers for the blocks that are to be 
+ * dropped. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN226"></a><span class='Declare_Function'>RelationTruncate</span><span class='Parentheses'>(</span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>nblocks</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN228"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>fsm</span><span class='Delimiter'>; 
+</span><a name="LN229"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>vm</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Open it at the smgr level if not already done */ 
+</span>    <a href="../../include/utils/rel.h.html#LN460"><span class='Ref_to_Macro'>RelationOpenSmgr</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Make sure smgr_targblock etc aren't pointing somewhere past new end 
+     */ 
+</span>    <a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/smgr.h.html#LN54"><span class='Ref_to_Member'>smgr_targblock</span></a> <span class='Operator'>= </span><a href="../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/smgr.h.html#LN55"><span class='Ref_to_Member'>smgr_fsm_nblocks</span></a> <span class='Operator'>= </span><a href="../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>; 
+</span>    <a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/smgr.h.html#LN56"><span class='Ref_to_Member'>smgr_vm_nblocks</span></a> <span class='Operator'>= </span><a href="../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Truncate the FSM first if it exists */ 
+</span>    <a href="storage.c.html#LN228"><span class='Ref_To_Local'>fsm</span></a> <span class='Operator'>= </span><a href="../../include/storage/smgr.h.html#LN84"><span class='Ref_to_Proto'>smgrexists</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN228"><span class='Ref_To_Local'>fsm</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/storage/freespace.h.html#LN32"><span class='Ref_to_Proto'>FreeSpaceMapTruncateRel</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>nblocks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Truncate the visibility map too if it exists. */ 
+</span>    <a href="storage.c.html#LN229"><span class='Ref_To_Local'>vm</span></a> <span class='Operator'>= </span><a href="../../include/storage/smgr.h.html#LN84"><span class='Ref_to_Proto'>smgrexists</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN28"><span class='Ref_to_EnumConst'>VISIBILITYMAP_FORKNUM</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN229"><span class='Ref_To_Local'>vm</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/access/visibilitymap.h.html#LN46"><span class='Ref_to_Proto'>visibilitymap_truncate</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>nblocks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We WAL-log the truncation before actually truncating, which means 
+     * trouble if the truncation fails. If we then crash, the WAL replay 
+     * likely isn't going to succeed in the truncation either, and cause a 
+     * PANIC. It's tempting to put a critical section here, but that cure 
+     * would be worse than the disease. It would turn a usually harmless 
+     * failure to truncate, that might spell trouble at WAL replay, into a 
+     * certain PANIC. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/utils/rel.h.html#LN505"><span class='Ref_to_Macro'>RelationNeedsWAL</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Make an XLOG entry reporting the file truncation. 
+         */ 
+</span><a name="LN265"></a>        <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>lsn</span><span class='Delimiter'>; 
+</span><a name="LN266"></a>        <a href="../../include/catalog/storage_xlog.h.html#LN45"><span class='Ref_to_Struct'>xl_smgr_truncate</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span> 
+        <a href="storage.c.html#LN266"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../include/catalog/storage_xlog.h.html#LN47"><span class='Ref_to_Member'>blkno</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>nblocks</span></a><span class='Delimiter'>; 
+</span>        <a href="storage.c.html#LN266"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../include/catalog/storage_xlog.h.html#LN48"><span class='Ref_to_Member'>rnode</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN84"><span class='Ref_to_Member'>rd_node</span></a><span class='Delimiter'>; 
+</span>        <a href="storage.c.html#LN266"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../include/catalog/storage_xlog.h.html#LN49"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>= </span><a href="../../include/catalog/storage_xlog.h.html#LN42"><span class='Ref_to_Const'>SMGR_TRUNCATE_ALL</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><span class='Operator'>&</span><a href="storage.c.html#LN266"><span class='Ref_To_Local'>xlrec</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="storage.c.html#LN266"><span class='Ref_To_Local'>xlrec</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="storage.c.html#LN265"><span class='Ref_To_Local'>lsn</span></a> <span class='Operator'>= </span><a href="../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_SMGR_ID<span class='Delimiter'>, 
+</span>                         <a href="../../include/catalog/storage_xlog.h.html#LN30"><span class='Ref_to_Const'>XLOG_SMGR_TRUNCATE</span></a> <span class='Operator'>| </span><a href="../../include/access/xlogrecord.h.html#LN70"><span class='Ref_to_Const'>XLR_SPECIAL_REL_UPDATE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Flush, because otherwise the truncation of the main relation might 
+         * hit the disk before the WAL record, and the truncation of the FSM 
+         * or visibility map. If we crashed during that window, we'd be left 
+         * with a truncated heap, but the FSM or visibility map would still 
+         * contain entries for the non-existent heap pages. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN228"><span class='Ref_To_Local'>fsm</span></a> <span class='Operator'>|| </span><a href="storage.c.html#LN229"><span class='Ref_To_Local'>vm</span></a><span class='Parentheses'>) 
+</span>            <a href="../../include/access/xlog.h.html#LN225"><span class='Ref_to_Proto'>XLogFlush</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN265"><span class='Ref_To_Local'>lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if RelationNeedsWAL(rel) &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Do the real work */ 
+</span>    <a href="../../include/storage/smgr.h.html#LN105"><span class='Ref_to_Proto'>smgrtruncate</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN86"><span class='Ref_to_Member'>rd_smgr</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN26"><span class='Ref_to_EnumConst'>MAIN_FORKNUM</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN226"><span class='Ref_to_Parameter'>nblocks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RelationTruncate &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ *  smgrDoPendingDeletes() -- Take care of relation deletes at end of xact. 
+ * 
+ * This also runs when aborting a subxact; we want to clean up a failed 
+ * subxact immediately. 
+ * 
+ * Note: It's possible that we're being asked to remove a relation that has 
+ * no physical storage in any fork. In particular, it's possible that we're 
+ * cleaning up an old temporary relation for which RemovePgTempFiles has 
+ * already recovered the physical storage. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN305"></a><span class='Declare_Function'>smgrDoPendingDeletes</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>isCommit</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN307"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nestLevel</span> <span class='Operator'>= </span><a href="../../include/access/xact.h.html#LN344"><span class='Ref_to_Proto'>GetCurrentTransactionNestLevel</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN308"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pending</span><span class='Delimiter'>; 
+</span><a name="LN309"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>prev</span><span class='Delimiter'>; 
+</span><a name="LN310"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>next</span><span class='Delimiter'>; 
+</span><a name="LN311"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nrels</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span><a name="LN312"></a>                <span class='Declare_Local'>i</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span><a name="LN313"></a>                <span class='Declare_Local'>maxrels</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN314"></a>    <a href="../../include/storage/smgr.h.html#LN77"><span class='Ref_to_Typedef'>SMgrRelation</span></a> <span class='Operator'>*</span><span class='Declare_Local'>srels</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <a href="storage.c.html#LN309"><span class='Ref_To_Local'>prev</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a><span class='Delimiter'>; </span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN310"><span class='Ref_To_Local'>next</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="storage.c.html#LN310"><span class='Ref_To_Local'>next</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN59"><span class='Ref_to_Member'>nestLevel</span></a> <span class='Operator'>&LT; </span><a href="storage.c.html#LN307"><span class='Ref_To_Local'>nestLevel</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* outer-level entries should not be processed yet */ 
+</span>            <a href="storage.c.html#LN309"><span class='Ref_To_Local'>prev</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* unlink list entry first, so we don't retry on failure */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN309"><span class='Ref_To_Local'>prev</span></a><span class='Parentheses'>) 
+</span>                <a href="storage.c.html#LN309"><span class='Ref_To_Local'>prev</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN310"><span class='Ref_To_Local'>next</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN310"><span class='Ref_To_Local'>next</span></a><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* do deletion if called for */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN58"><span class='Ref_to_Member'>atCommit</span></a> <span class='Operator'>== </span><a href="storage.c.html#LN305"><span class='Ref_to_Parameter'>isCommit</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN335"></a>                <a href="../../include/storage/smgr.h.html#LN77"><span class='Ref_to_Typedef'>SMgrRelation</span></a> <span class='Declare_Local'>srel</span><span class='Delimiter'>; 
+</span> 
+                <a href="storage.c.html#LN335"><span class='Ref_To_Local'>srel</span></a> <span class='Operator'>= </span><a href="../../include/storage/smgr.h.html#LN83"><span class='Ref_to_Proto'>smgropen</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN56"><span class='Ref_to_Member'>relnode</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN57"><span class='Ref_to_Member'>backend</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* allocate the initial array, or extend it, if needed */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN313"><span class='Ref_To_Local'>maxrels</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="storage.c.html#LN313"><span class='Ref_To_Local'>maxrels</span></a> <span class='Operator'>= </span><span class='Number'>8</span><span class='Delimiter'>; 
+</span>                    <a href="storage.c.html#LN314"><span class='Ref_To_Local'>srels</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/smgr.h.html#LN77"><span class='Ref_to_Typedef'>SMgrRelation</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="storage.c.html#LN313"><span class='Ref_To_Local'>maxrels</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>                <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN313"><span class='Ref_To_Local'>maxrels</span></a> <span class='Operator'>&LT;= </span><a href="storage.c.html#LN311"><span class='Ref_To_Local'>nrels</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="storage.c.html#LN313"><span class='Ref_To_Local'>maxrels</span></a> <span class='Operator'>*= </span><span class='Number'>2</span><span class='Delimiter'>; 
+</span>                    <a href="storage.c.html#LN314"><span class='Ref_To_Local'>srels</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN36"><span class='Ref_to_Proto'>repalloc</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN314"><span class='Ref_To_Local'>srels</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/smgr.h.html#LN77"><span class='Ref_to_Typedef'>SMgrRelation</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="storage.c.html#LN313"><span class='Ref_To_Local'>maxrels</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span> 
+                <a href="storage.c.html#LN314"><span class='Ref_To_Local'>srels</span></a><span class='Delimiter'>[</span><a href="storage.c.html#LN311"><span class='Ref_To_Local'>nrels</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="storage.c.html#LN335"><span class='Ref_To_Local'>srel</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if pending-&GT;atCommit==is... &raquo; </span> 
+            <span class='Comment_Multi_Line'>/* must explicitly free the list entry */ 
+</span>            <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN308"><span class='Ref_To_Local'>pending</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* prev does not change */ 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for pending=pendingDelete... &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN311"><span class='Ref_To_Local'>nrels</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/storage/smgr.h.html#LN92"><span class='Ref_to_Proto'>smgrdounlinkall</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN314"><span class='Ref_To_Local'>srels</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN311"><span class='Ref_To_Local'>nrels</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN312"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="storage.c.html#LN312"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="storage.c.html#LN311"><span class='Ref_To_Local'>nrels</span></a><span class='Delimiter'>; </span><a href="storage.c.html#LN312"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>            <a href="../../include/storage/smgr.h.html#LN87"><span class='Ref_to_Proto'>smgrclose</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN314"><span class='Ref_To_Local'>srels</span></a><span class='Delimiter'>[</span><a href="storage.c.html#LN312"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN314"><span class='Ref_To_Local'>srels</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end smgrDoPendingDeletes &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * smgrGetPendingDeletes() -- Get a list of non-temp relations to be deleted. 
+ * 
+ * The return value is the number of relations scheduled for termination. 
+ * *ptr is set to point to a freshly-palloc'd array of RelFileNodes. 
+ * If there are no relations to be deleted, *ptr is set to NULL. 
+ * 
+ * Only non-temporary relations are included in the returned list.  This is OK 
+ * because the list is used only in contexts where temporary relations don't 
+ * matter: we're either writing to the two-phase state file (and transactions 
+ * that have touched temp tables can't be prepared) or we're writing to xlog 
+ * (and all temporary files will be zapped if we restart anyway, so no need 
+ * for redo to do it also). 
+ * 
+ * Note that the list does not include anything scheduled for termination 
+ * by upper-level transactions. 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN388"></a><span class='Declare_Function'>smgrGetPendingDeletes</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>forCommit</span><span class='Delimiter'>, </span><a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Operator'>**</span><span class='Declare_Parameter'>ptr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN390"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nestLevel</span> <span class='Operator'>= </span><a href="../../include/access/xact.h.html#LN344"><span class='Ref_to_Proto'>GetCurrentTransactionNestLevel</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN391"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nrels</span><span class='Delimiter'>; 
+</span><a name="LN392"></a>    <a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rptr</span><span class='Delimiter'>; 
+</span><a name="LN393"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pending</span><span class='Delimiter'>; 
+</span> 
+    <a href="storage.c.html#LN391"><span class='Ref_To_Local'>nrels</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a><span class='Delimiter'>; </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN59"><span class='Ref_to_Member'>nestLevel</span></a> <span class='Operator'>&GT;= </span><a href="storage.c.html#LN390"><span class='Ref_To_Local'>nestLevel</span></a> <span class='Operator'>&& </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN58"><span class='Ref_to_Member'>atCommit</span></a> <span class='Operator'>== </span><a href="storage.c.html#LN388"><span class='Ref_to_Parameter'>forCommit</span></a> 
+            <span class='Operator'>&& </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN57"><span class='Ref_to_Member'>backend</span></a> <span class='Operator'>== </span><a href="../../include/storage/backendid.h.html#LN22"><span class='Ref_to_Const'>InvalidBackendId</span></a><span class='Parentheses'>) 
+</span>            <a href="storage.c.html#LN391"><span class='Ref_To_Local'>nrels</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN391"><span class='Ref_To_Local'>nrels</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><a href="storage.c.html#LN388"><span class='Ref_to_Parameter'>ptr</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="storage.c.html#LN392"><span class='Ref_To_Local'>rptr</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN391"><span class='Ref_To_Local'>nrels</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="storage.c.html#LN388"><span class='Ref_to_Parameter'>ptr</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN392"><span class='Ref_To_Local'>rptr</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a><span class='Delimiter'>; </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN59"><span class='Ref_to_Member'>nestLevel</span></a> <span class='Operator'>&GT;= </span><a href="storage.c.html#LN390"><span class='Ref_To_Local'>nestLevel</span></a> <span class='Operator'>&& </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN58"><span class='Ref_to_Member'>atCommit</span></a> <span class='Operator'>== </span><a href="storage.c.html#LN388"><span class='Ref_to_Parameter'>forCommit</span></a> 
+            <span class='Operator'>&& </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN57"><span class='Ref_to_Member'>backend</span></a> <span class='Operator'>== </span><a href="../../include/storage/backendid.h.html#LN22"><span class='Ref_to_Const'>InvalidBackendId</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Operator'>*</span><a href="storage.c.html#LN392"><span class='Ref_To_Local'>rptr</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN393"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN56"><span class='Ref_to_Member'>relnode</span></a><span class='Delimiter'>; 
+</span>            <a href="storage.c.html#LN392"><span class='Ref_To_Local'>rptr</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <a href="storage.c.html#LN391"><span class='Ref_To_Local'>nrels</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end smgrGetPendingDeletes &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ *  PostPrepare_smgr -- Clean up after a successful PREPARE 
+ * 
+ * What we have to do here is throw away the in-memory state about pending 
+ * relation deletes.  It's all been recorded in the 2PC state file and 
+ * it's no longer smgr's job to worry about it. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN429"></a><span class='Declare_Function'>PostPrepare_smgr</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN431"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pending</span><span class='Delimiter'>; 
+</span><a name="LN432"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>next</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN431"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a><span class='Delimiter'>; </span><a href="storage.c.html#LN431"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="storage.c.html#LN431"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN432"><span class='Ref_To_Local'>next</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="storage.c.html#LN432"><span class='Ref_To_Local'>next</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN431"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; 
+</span>        <a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN432"><span class='Ref_To_Local'>next</span></a><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* must explicitly free the list entry */ 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN431"><span class='Ref_To_Local'>pending</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * AtSubCommit_smgr() --- Take care of subtransaction commit. 
+ * 
+ * Reassign all items in the pending-deletes list to the parent transaction. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN450"></a><span class='Declare_Function'>AtSubCommit_smgr</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN452"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nestLevel</span> <span class='Operator'>= </span><a href="../../include/access/xact.h.html#LN344"><span class='Ref_to_Proto'>GetCurrentTransactionNestLevel</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN453"></a>    <a href="storage.c.html#LN54"><span class='Ref_to_Struct'>PendingRelDelete</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pending</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN453"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN63"><span class='Ref_to_Global_Var'>pendingDeletes</span></a><span class='Delimiter'>; </span><a href="storage.c.html#LN453"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="storage.c.html#LN453"><span class='Ref_To_Local'>pending</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN453"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN60"><span class='Ref_to_Member'>next</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN453"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN59"><span class='Ref_to_Member'>nestLevel</span></a> <span class='Operator'>&GT;= </span><a href="storage.c.html#LN452"><span class='Ref_To_Local'>nestLevel</span></a><span class='Parentheses'>) 
+</span>            <a href="storage.c.html#LN453"><span class='Ref_To_Local'>pending</span></a><span class='Operator'>-&GT;</span><a href="storage.c.html#LN59"><span class='Ref_to_Member'>nestLevel</span></a> <span class='Operator'>= </span><a href="storage.c.html#LN452"><span class='Ref_To_Local'>nestLevel</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * AtSubAbort_smgr() --- Take care of subtransaction abort. 
+ * 
+ * Delete created relations and forget about deleted relations. 
+ * We can execute these operations immediately because we know this 
+ * subtransaction will not commit. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN470"></a><span class='Declare_Function'>AtSubAbort_smgr</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../include/catalog/storage.h.html#LN29"><span class='Ref_to_Proto'>smgrDoPendingDeletes</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>void 
+</span><a name="LN476"></a><span class='Declare_Function'>smgr_redo</span><span class='Parentheses'>(</span><a href="../../include/access/xlogreader.h.html#LN68"><span class='Ref_to_Struct'>XLogReaderState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>record</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN478"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>lsn</span> <span class='Operator'>= </span><a href="storage.c.html#LN476"><span class='Ref_to_Parameter'>record</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/xlogreader.h.html#LN114"><span class='Ref_to_Member'>EndRecPtr</span></a><span class='Delimiter'>; 
+</span><a name="LN479"></a>    <a href="../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>info</span> <span class='Operator'>= </span><a href="../../include/access/xlogreader.h.html#LN215"><span class='Ref_to_Macro'>XLogRecGetInfo</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN476"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>) </span><span class='Operator'>& ~</span><a href="../../include/access/xlogrecord.h.html#LN61"><span class='Ref_to_Const'>XLR_INFO_MASK</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Backup blocks are not used in smgr records */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/access/xlogreader.h.html#LN221"><span class='Ref_to_Macro'>XLogRecHasAnyBlockRefs</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN476"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN479"><span class='Ref_To_Local'>info</span></a> <span class='Operator'>== </span><a href="../../include/catalog/storage_xlog.h.html#LN29"><span class='Ref_to_Const'>XLOG_SMGR_CREATE</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN486"></a>        <a href="../../include/catalog/storage_xlog.h.html#LN32"><span class='Ref_to_Struct'>xl_smgr_create</span></a> <span class='Operator'>*</span><span class='Declare_Local'>xlrec</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/catalog/storage_xlog.h.html#LN32"><span class='Ref_to_Struct'>xl_smgr_create</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/access/xlogreader.h.html#LN219"><span class='Ref_to_Macro'>XLogRecGetData</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN476"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN487"></a>        <a href="../../include/storage/smgr.h.html#LN77"><span class='Ref_to_Typedef'>SMgrRelation</span></a> <span class='Declare_Local'>reln</span><span class='Delimiter'>; 
+</span> 
+        <a href="storage.c.html#LN487"><span class='Ref_To_Local'>reln</span></a> <span class='Operator'>= </span><a href="../../include/storage/smgr.h.html#LN83"><span class='Ref_to_Proto'>smgropen</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN486"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN34"><span class='Ref_to_Member'>rnode</span></a><span class='Delimiter'>, </span><a href="../../include/storage/backendid.h.html#LN22"><span class='Ref_to_Const'>InvalidBackendId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/smgr.h.html#LN90"><span class='Ref_to_Proto'>smgrcreate</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN487"><span class='Ref_To_Local'>reln</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN486"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN35"><span class='Ref_to_Member'>forkNum</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="storage.c.html#LN479"><span class='Ref_To_Local'>info</span></a> <span class='Operator'>== </span><a href="../../include/catalog/storage_xlog.h.html#LN30"><span class='Ref_to_Const'>XLOG_SMGR_TRUNCATE</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN494"></a>        <a href="../../include/catalog/storage_xlog.h.html#LN45"><span class='Ref_to_Struct'>xl_smgr_truncate</span></a> <span class='Operator'>*</span><span class='Declare_Local'>xlrec</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/catalog/storage_xlog.h.html#LN45"><span class='Ref_to_Struct'>xl_smgr_truncate</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/access/xlogreader.h.html#LN219"><span class='Ref_to_Macro'>XLogRecGetData</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN476"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN495"></a>        <a href="../../include/storage/smgr.h.html#LN77"><span class='Ref_to_Typedef'>SMgrRelation</span></a> <span class='Declare_Local'>reln</span><span class='Delimiter'>; 
+</span><a name="LN496"></a>        <a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>rel</span><span class='Delimiter'>; 
+</span> 
+        <a href="storage.c.html#LN495"><span class='Ref_To_Local'>reln</span></a> <span class='Operator'>= </span><a href="../../include/storage/smgr.h.html#LN83"><span class='Ref_to_Proto'>smgropen</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN48"><span class='Ref_to_Member'>rnode</span></a><span class='Delimiter'>, </span><a href="../../include/storage/backendid.h.html#LN22"><span class='Ref_to_Const'>InvalidBackendId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Forcibly create relation if it doesn't exist (which suggests that 
+         * it was dropped somewhere later in the WAL sequence).  As in 
+         * XLogReadBufferForRedo, we prefer to recreate the rel and replay the 
+         * log as best we can until the drop is seen. 
+         */ 
+</span>        <a href="../../include/storage/smgr.h.html#LN90"><span class='Ref_to_Proto'>smgrcreate</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN495"><span class='Ref_To_Local'>reln</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN26"><span class='Ref_to_EnumConst'>MAIN_FORKNUM</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Before we perform the truncation, update minimum recovery point to 
+         * cover this WAL record. Once the relation is truncated, there's no 
+         * going back. The buffer manager enforces the WAL-first rule for 
+         * normal updates to relation files, so that the minimum recovery 
+         * point is always updated before the corresponding change in the data 
+         * file is flushed to disk. We have to do the same manually here. 
+         * 
+         * Doing this before the truncation means that if the truncation fails 
+         * for some reason, you cannot start up the system even after restart, 
+         * until you fix the underlying situation so that the truncation will 
+         * succeed. Alternatively, we could update the minimum recovery point 
+         * after truncation, but that would leave a small window where the 
+         * WAL-first rule could be violated. 
+         */ 
+</span>        <a href="../../include/access/xlog.h.html#LN225"><span class='Ref_to_Proto'>XLogFlush</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN478"><span class='Ref_To_Local'>lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN49"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../include/catalog/storage_xlog.h.html#LN39"><span class='Ref_to_Const'>SMGR_TRUNCATE_HEAP</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../include/storage/smgr.h.html#LN105"><span class='Ref_to_Proto'>smgrtruncate</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN495"><span class='Ref_To_Local'>reln</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN26"><span class='Ref_to_EnumConst'>MAIN_FORKNUM</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN47"><span class='Ref_to_Member'>blkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Also tell xlogutils.c about it */ 
+</span>            <a href="../../include/access/xlogutils.h.html#LN22"><span class='Ref_to_Proto'>XLogTruncateRelation</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN48"><span class='Ref_to_Member'>rnode</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN26"><span class='Ref_to_EnumConst'>MAIN_FORKNUM</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN47"><span class='Ref_to_Member'>blkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Truncate FSM and VM too */ 
+</span>        <a href="storage.c.html#LN496"><span class='Ref_To_Local'>rel</span></a> <span class='Operator'>= </span><a href="../../include/access/xlogutils.h.html#LN46"><span class='Ref_to_Proto'>CreateFakeRelcacheEntry</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN48"><span class='Ref_to_Member'>rnode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN49"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../include/catalog/storage_xlog.h.html#LN41"><span class='Ref_to_Const'>SMGR_TRUNCATE_FSM</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>            <a href="../../include/storage/smgr.h.html#LN84"><span class='Ref_to_Proto'>smgrexists</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN495"><span class='Ref_To_Local'>reln</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN27"><span class='Ref_to_EnumConst'>FSM_FORKNUM</span></a><span class='Parentheses'>))</span> 
+            <a href="../../include/storage/freespace.h.html#LN32"><span class='Ref_to_Proto'>FreeSpaceMapTruncateRel</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN496"><span class='Ref_To_Local'>rel</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN47"><span class='Ref_to_Member'>blkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN49"><span class='Ref_to_Member'>flags</span></a> <span class='Operator'>& </span><a href="../../include/catalog/storage_xlog.h.html#LN40"><span class='Ref_to_Const'>SMGR_TRUNCATE_VM</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>            <a href="../../include/storage/smgr.h.html#LN84"><span class='Ref_to_Proto'>smgrexists</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN495"><span class='Ref_To_Local'>reln</span></a><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN28"><span class='Ref_to_EnumConst'>VISIBILITYMAP_FORKNUM</span></a><span class='Parentheses'>))</span> 
+            <a href="../../include/access/visibilitymap.h.html#LN46"><span class='Ref_to_Proto'>visibilitymap_truncate</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN496"><span class='Ref_To_Local'>rel</span></a><span class='Delimiter'>, </span><a href="storage.c.html#LN494"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../include/catalog/storage_xlog.h.html#LN47"><span class='Ref_to_Member'>blkno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/access/xlogutils.h.html#LN47"><span class='Ref_to_Proto'>FreeFakeRelcacheEntry</span></a><span class='Parentheses'>(</span><a href="storage.c.html#LN496"><span class='Ref_To_Local'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if info==XLOG_SMGR_TRUNC... &raquo; </span> 
+    <span class='Control'>else</span> 
+        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"smgr_redo: unknown op code %u"</span><span class='Delimiter'>, </span><a href="storage.c.html#LN479"><span class='Ref_To_Local'>info</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end smgr_redo &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

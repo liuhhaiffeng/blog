@@ -1,0 +1,976 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\utils\cache\relmapper.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\utils\cache\relmapper.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:56 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * relmapper.c 
+ *    Catalog-to-filenode mapping 
+ * 
+ * For most tables, the physical file underlying the table is specified by 
+ * pg_class.relfilenode.  However, that obviously won't work for pg_class 
+ * itself, nor for the other "nailed" catalogs for which we have to be able 
+ * to set up working Relation entries without access to pg_class.  It also 
+ * does not work for shared catalogs, since there is no practical way to 
+ * update other databases' pg_class entries when relocating a shared catalog. 
+ * Therefore, for these special catalogs (henceforth referred to as "mapped 
+ * catalogs") we rely on a separately maintained file that shows the mapping 
+ * from catalog OIDs to filenode numbers.  Each database has a map file for 
+ * its local mapped catalogs, and there is a separate map file for shared 
+ * catalogs.  Mapped catalogs have zero in their pg_class.relfilenode entries. 
+ * 
+ * Relocation of a normal table is committed (ie, the new physical file becomes 
+ * authoritative) when the pg_class row update commits.  For mapped catalogs, 
+ * the act of updating the map file is effectively commit of the relocation. 
+ * We postpone the file update till just before commit of the transaction 
+ * doing the rewrite, but there is necessarily a window between.  Therefore 
+ * mapped catalogs can only be relocated by operations such as VACUUM FULL 
+ * and CLUSTER, which make no transactionally-significant changes: it must be 
+ * safe for the new file to replace the old, even if the transaction itself 
+ * aborts.  An important factor here is that the indexes and toast table of 
+ * a mapped catalog must also be mapped, so that the rewrites/relocations of 
+ * all these files commit in a single map file update rather than being tied 
+ * to transaction commit. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/utils/cache/relmapper.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;fcntl.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/stat.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xloginsert.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/catalog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_tablespace.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/storage.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/fd.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/inval.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/relmapper.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The map file is critical data: we have no automatic method for recovering 
+ * from loss or corruption of it.  We use a CRC so that we can detect 
+ * corruption.  To minimize the risk of failed updates, the map file should 
+ * be kept to no more than one standard-size disk sector (ie 512 bytes), 
+ * and we use overwrite-in-place rather than playing renaming games. 
+ * The struct layout below is designed to occupy exactly 512 bytes, which 
+ * might make filesystem updates a bit more efficient. 
+ * 
+ * Entries in the mappings[] array are in no particular order.  We could 
+ * speed searching by insisting on OID order, but it really shouldn't be 
+ * worth the trouble given the intended size of the mapping sets. 
+ */ 
+</span><a name="LN72"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>RELMAPPER_FILENAME</span>      <span class='String'>"pg_filenode.map"</span> 
+ 
+<a name="LN74"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>RELMAPPER_FILEMAGIC</span>     <span class='Number'>0x592717</span>        <span class='Comment_Single_Line'>/* version ID value */ 
+</span> 
+<a name="LN76"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MAX_MAPPINGS</span>            <span class='Number'>62</span>      <span class='Comment_Single_Line'>/* 62 * 8 + 16 = 512 */ 
+</span> 
+<a name="LN78"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>RelMapping</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN80"></a>    <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Member'>mapoid</span><span class='Delimiter'>;</span>         <span class='Comment_Single_Line'>/* OID of a catalog */ 
+</span><a name="LN81"></a>    <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Member'>mapfilenode</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* its filenode number */ 
+</span><a name="LN82"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>RelMapping</span><span class='Delimiter'>; 
+</span> 
+<a name="LN84"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>RelMapFile</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN86"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Member'>magic</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* always RELMAPPER_FILEMAGIC */ 
+</span><a name="LN87"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Member'>num_mappings</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* number of valid RelMapping entries */ 
+</span><a name="LN88"></a>    <a href="relmapper.c.html#LN78"><span class='Ref_to_Struct'>RelMapping</span></a>  <span class='Declare_Member'>mappings</span><span class='Delimiter'>[</span><a href="relmapper.c.html#LN76"><span class='Ref_to_Const'>MAX_MAPPINGS</span></a><span class='Delimiter'>]; 
+</span><a name="LN89"></a>    <a href="../../../include/port/pg_crc32c.h.html#LN37"><span class='Ref_to_Typedef'>pg_crc32c</span></a>   <span class='Declare_Member'>crc</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* CRC of all above */ 
+</span><a name="LN90"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Member'>pad</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* to make the struct size be 512 exactly */ 
+</span><a name="LN91"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>RelMapFile</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * The currently known contents of the shared map file and our database's 
+ * local map file are stored here.  These can be reloaded from disk 
+ * immediately whenever we receive an update sinval message. 
+ */ 
+</span><a name="LN98"></a><span class='Keyword'>static </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Declare_Var'>shared_map</span><span class='Delimiter'>; 
+</span><a name="LN99"></a><span class='Keyword'>static </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Declare_Var'>local_map</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * We use the same RelMapFile data structure to track uncommitted local 
+ * changes in the mappings (but note the magic and crc fields are not made 
+ * valid in these variables).  Currently, map updates are not allowed within 
+ * subtransactions, so one set of transaction-level changes is sufficient. 
+ * 
+ * The active_xxx variables contain updates that are valid in our transaction 
+ * and should be honored by RelationMapOidToFilenode.  The pending_xxx 
+ * variables contain updates we have been told about that aren't active yet; 
+ * they will become active at the next CommandCounterIncrement.  This setup 
+ * lets map updates act similarly to updates of pg_class rows, ie, they 
+ * become visible only at the next CommandCounterIncrement boundary. 
+ */ 
+</span><a name="LN114"></a><span class='Keyword'>static </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Declare_Var'>active_shared_updates</span><span class='Delimiter'>; 
+</span><a name="LN115"></a><span class='Keyword'>static </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Declare_Var'>active_local_updates</span><span class='Delimiter'>; 
+</span><a name="LN116"></a><span class='Keyword'>static </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Declare_Var'>pending_shared_updates</span><span class='Delimiter'>; 
+</span><a name="LN117"></a><span class='Keyword'>static </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Declare_Var'>pending_local_updates</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* non-export function prototypes */ 
+</span><a name="LN121"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>apply_map_update</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>map</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relationId</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>fileNode</span><span class='Delimiter'>, 
+</span><a name="LN122"></a>                 <span class='Keyword'>bool </span><span class='Declare_Parameter'>add_okay</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN123"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>merge_map_updates</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>map</span><span class='Delimiter'>, </span><span class='Keyword'>const </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>updates</span><span class='Delimiter'>, 
+</span><a name="LN124"></a>                  <span class='Keyword'>bool </span><span class='Declare_Parameter'>add_okay</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN125"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>load_relmap_file</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN126"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>write_relmap_file</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Delimiter'>, </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>newmap</span><span class='Delimiter'>, 
+</span><a name="LN127"></a>                  <span class='Keyword'>bool </span><span class='Declare_Parameter'>write_wal</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>send_sinval</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>preserve_files</span><span class='Delimiter'>, 
+</span><a name="LN128"></a>                  <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>dbid</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>tsid</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>dbpath</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN129"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>perform_relmap_update</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Delimiter'>, </span><span class='Keyword'>const </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>updates</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapOidToFilenode 
+ * 
+ * The raison d' etre ... given a relation OID, look up its filenode. 
+ * 
+ * Although shared and local relation OIDs should never overlap, the caller 
+ * always knows which we need --- so pass that information to avoid useless 
+ * searching. 
+ * 
+ * Returns InvalidOid if the OID is not known (which should never happen, 
+ * but the caller is in a better position to report a meaningful error). 
+ */ 
+</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> 
+<a name="LN145"></a><span class='Declare_Function'>RelationMapOidToFilenode</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relationId</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN147"></a>    <span class='Keyword'>const </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Local'>map</span><span class='Delimiter'>; 
+</span><a name="LN148"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If there are active updates, believe those over the main maps */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN145"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN145"><span class='Ref_to_Parameter'>relationId</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN145"><span class='Ref_to_Parameter'>relationId</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN145"><span class='Ref_to_Parameter'>relationId</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN145"><span class='Ref_to_Parameter'>relationId</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="relmapper.c.html#LN147"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN148"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RelationMapOidToFilenode &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapFilenodeToOid 
+ * 
+ * Do the reverse of the normal direction of mapping done in 
+ * RelationMapOidToFilenode. 
+ * 
+ * This is not supposed to be used during normal running but rather for 
+ * information purposes when looking at the filesystem or xlog. 
+ * 
+ * Returns InvalidOid if the OID is not known; this can easily happen if the 
+ * relfilenode doesn't pertain to a mapped relation. 
+ */ 
+</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> 
+<a name="LN198"></a><span class='Declare_Function'>RelationMapFilenodeToOid</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>filenode</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN200"></a>    <span class='Keyword'>const </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Local'>map</span><span class='Delimiter'>; 
+</span><a name="LN201"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If there are active updates, believe those over the main maps */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN198"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN198"><span class='Ref_to_Parameter'>filenode</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN198"><span class='Ref_to_Parameter'>filenode</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN198"><span class='Ref_to_Parameter'>filenode</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN198"><span class='Ref_to_Parameter'>filenode</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <a href="relmapper.c.html#LN200"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN201"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RelationMapFilenodeToOid &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapUpdateMap 
+ * 
+ * Install a new relfilenode mapping for the specified relation. 
+ * 
+ * If immediate is true (or we're bootstrapping), the mapping is activated 
+ * immediately.  Otherwise it is made pending until CommandCounterIncrement. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN247"></a><span class='Declare_Function'>RelationMapUpdateMap</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relationId</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>fileNode</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Delimiter'>, 
+</span><a name="LN248"></a>                     <span class='Keyword'>bool </span><span class='Declare_Parameter'>immediate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN250"></a>    <a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Local'>map</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/miscadmin.h.html#LN369"><span class='Ref_to_Macro'>IsBootstrapProcessingMode</span></a><span class='Parentheses'>())</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * In bootstrap mode, the mapping gets installed in permanent map. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN247"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>) 
+</span>            <a href="relmapper.c.html#LN250"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="relmapper.c.html#LN250"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * We don't currently support map changes within subtransactions. This 
+         * could be done with more bookkeeping infrastructure, but it doesn't 
+         * presently seem worth it. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/xact.h.html#LN344"><span class='Ref_to_Proto'>GetCurrentTransactionNestLevel</span></a><span class='Parentheses'>() </span><span class='Operator'>&GT; </span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"cannot change relation mapping within subtransaction"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN248"><span class='Ref_to_Parameter'>immediate</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Make it active, but only locally */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN247"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>) 
+</span>                <a href="relmapper.c.html#LN250"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="relmapper.c.html#LN250"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Make it pending */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN247"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>) 
+</span>                <a href="relmapper.c.html#LN250"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN116"><span class='Ref_to_Global_Var'>pending_shared_updates</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="relmapper.c.html#LN250"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN117"><span class='Ref_to_Global_Var'>pending_local_updates</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+    <a href="relmapper.c.html#LN121"><span class='Ref_to_Proto'>apply_map_update</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN250"><span class='Ref_To_Local'>map</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN247"><span class='Ref_to_Parameter'>relationId</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN247"><span class='Ref_to_Parameter'>fileNode</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end RelationMapUpdateMap &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * apply_map_update 
+ * 
+ * Insert a new mapping into the given map variable, replacing any existing 
+ * mapping for the same relation. 
+ * 
+ * In some cases the caller knows there must be an existing mapping; pass 
+ * add_okay = false to draw an error if not. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN302"></a><span class='Declare_Function'>apply_map_update</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>map</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relationId</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>fileNode</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>add_okay</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN304"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Replace any existing mapping */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN304"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN304"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN304"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>relationId</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN304"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN304"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a> <span class='Operator'>= </span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>fileNode</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Nope, need to add a new mapping */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>add_okay</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"attempt to apply a mapping to unmapped relation %u"</span><span class='Delimiter'>, 
+</span>             <a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>relationId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>&GT;= </span><a href="relmapper.c.html#LN76"><span class='Ref_to_Const'>MAX_MAPPINGS</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"ran out of space in relation map"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a> <span class='Operator'>= </span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>relationId</span></a><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a> <span class='Operator'>= </span><a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>fileNode</span></a><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN302"><span class='Ref_to_Parameter'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end apply_map_update &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * merge_map_updates 
+ * 
+ * Merge all the updates in the given pending-update map into the target map. 
+ * This is just a bulk form of apply_map_update. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN334"></a><span class='Declare_Function'>merge_map_updates</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>map</span><span class='Delimiter'>, </span><span class='Keyword'>const </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>updates</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>add_okay</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN336"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN336"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN336"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN334"><span class='Ref_to_Parameter'>updates</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN336"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="relmapper.c.html#LN121"><span class='Ref_to_Proto'>apply_map_update</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN334"><span class='Ref_to_Parameter'>map</span></a><span class='Delimiter'>, 
+</span>                         <a href="relmapper.c.html#LN334"><span class='Ref_to_Parameter'>updates</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN336"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Delimiter'>, 
+</span>                         <a href="relmapper.c.html#LN334"><span class='Ref_to_Parameter'>updates</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN336"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Delimiter'>, 
+</span>                         <a href="relmapper.c.html#LN334"><span class='Ref_to_Parameter'>add_okay</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapRemoveMapping 
+ * 
+ * Remove a relation's entry in the map.  This is only allowed for "active" 
+ * (but not committed) local mappings.  We need it so we can back out the 
+ * entry for the transient target file when doing VACUUM FULL/CLUSTER on 
+ * a mapped relation. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN356"></a><span class='Declare_Function'>RelationMapRemoveMapping</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relationId</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN358"></a>    <a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Local'>map</span> <span class='Operator'>= &</span><a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Delimiter'>; 
+</span><a name="LN359"></a>    <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN359"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN359"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN358"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN359"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN356"><span class='Ref_to_Parameter'>relationId</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN358"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN359"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN80"><span class='Ref_to_Member'>mapoid</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Found it, collapse it out */ 
+</span>            <a href="relmapper.c.html#LN358"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN359"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="relmapper.c.html#LN358"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN358"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span>            <a href="relmapper.c.html#LN358"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"could not find temporary mapping for relation %u"</span><span class='Delimiter'>, 
+</span>         <a href="relmapper.c.html#LN356"><span class='Ref_to_Parameter'>relationId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapInvalidate 
+ * 
+ * This routine is invoked for SI cache flush messages.  We must re-read 
+ * the indicated map file.  However, we might receive a SI message in a 
+ * process that hasn't yet, and might never, load the mapping files; 
+ * for example the autovacuum launcher, which *must not* try to read 
+ * a local map since it is attached to no particular database. 
+ * So, re-read only if the map is valid now. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN386"></a><span class='Declare_Function'>RelationMapInvalidate</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN386"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN86"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN74"><span class='Ref_to_Const'>RELMAPPER_FILEMAGIC</span></a><span class='Parentheses'>) 
+</span>            <a href="relmapper.c.html#LN125"><span class='Ref_to_Proto'>load_relmap_file</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN86"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN74"><span class='Ref_to_Const'>RELMAPPER_FILEMAGIC</span></a><span class='Parentheses'>) 
+</span>            <a href="relmapper.c.html#LN125"><span class='Ref_to_Proto'>load_relmap_file</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapInvalidateAll 
+ * 
+ * Reload all map files.  This is used to recover from SI message buffer 
+ * overflow: we can't be sure if we missed an inval message. 
+ * Again, reload only currently-valid maps. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN408"></a><span class='Declare_Function'>RelationMapInvalidateAll</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN86"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN74"><span class='Ref_to_Const'>RELMAPPER_FILEMAGIC</span></a><span class='Parentheses'>) 
+</span>        <a href="relmapper.c.html#LN125"><span class='Ref_to_Proto'>load_relmap_file</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN86"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>== </span><a href="relmapper.c.html#LN74"><span class='Ref_to_Const'>RELMAPPER_FILEMAGIC</span></a><span class='Parentheses'>) 
+</span>        <a href="relmapper.c.html#LN125"><span class='Ref_to_Proto'>load_relmap_file</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * AtCCI_RelationMap 
+ * 
+ * Activate any "pending" relation map updates at CommandCounterIncrement time. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN422"></a><span class='Declare_Function'>AtCCI_RelationMap</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN116"><span class='Ref_to_Global_Var'>pending_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="relmapper.c.html#LN123"><span class='Ref_to_Proto'>merge_map_updates</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Delimiter'>, 
+</span>                          <span class='Operator'>&</span><a href="relmapper.c.html#LN116"><span class='Ref_to_Global_Var'>pending_shared_updates</span></a><span class='Delimiter'>, 
+</span>                          <span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN116"><span class='Ref_to_Global_Var'>pending_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN117"><span class='Ref_to_Global_Var'>pending_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="relmapper.c.html#LN123"><span class='Ref_to_Proto'>merge_map_updates</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Delimiter'>, 
+</span>                          <span class='Operator'>&</span><a href="relmapper.c.html#LN117"><span class='Ref_to_Global_Var'>pending_local_updates</span></a><span class='Delimiter'>, 
+</span>                          <span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN117"><span class='Ref_to_Global_Var'>pending_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * AtEOXact_RelationMap 
+ * 
+ * Handle relation mapping at main-transaction commit or abort. 
+ * 
+ * During commit, this must be called as late as possible before the actual 
+ * transaction commit, so as to minimize the window where the transaction 
+ * could still roll back after committing map changes.  Although nothing 
+ * critically bad happens in such a case, we still would prefer that it 
+ * not happen, since we'd possibly be losing useful updates to the relations' 
+ * pg_class row(s). 
+ * 
+ * During abort, we just have to throw away any pending map changes. 
+ * Normal post-abort cleanup will take care of fixing relcache entries. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN456"></a><span class='Declare_Function'>AtEOXact_RelationMap</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>isCommit</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN456"><span class='Ref_to_Parameter'>isCommit</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * We should not get here with any "pending" updates.  (We could 
+         * logically choose to treat such as committed, but in the current 
+         * code this should never happen.) 
+         */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN116"><span class='Ref_to_Global_Var'>pending_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN117"><span class='Ref_to_Global_Var'>pending_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Write any active updates to the actual map files, then reset them. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="relmapper.c.html#LN129"><span class='Ref_to_Proto'>perform_relmap_update</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="relmapper.c.html#LN129"><span class='Ref_to_Proto'>perform_relmap_update</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if isCommit &raquo; </span> 
+    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Abort --- drop all local and pending updates */ 
+</span>        <a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN116"><span class='Ref_to_Global_Var'>pending_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN117"><span class='Ref_to_Global_Var'>pending_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end AtEOXact_RelationMap &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * AtPrepare_RelationMap 
+ * 
+ * Handle relation mapping at PREPARE. 
+ * 
+ * Currently, we don't support preparing any transaction that changes the map. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN500"></a><span class='Declare_Function'>AtPrepare_RelationMap</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>        <a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>        <a href="relmapper.c.html#LN116"><span class='Ref_to_Global_Var'>pending_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>        <a href="relmapper.c.html#LN117"><span class='Ref_to_Global_Var'>pending_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"cannot PREPARE a transaction that modified relation mapping"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * CheckPointRelationMap 
+ * 
+ * This is called during a checkpoint.  It must ensure that any relation map 
+ * updates that were WAL-logged before the start of the checkpoint are 
+ * securely flushed to disk and will not need to be replayed later.  This 
+ * seems unlikely to be a performance-critical issue, so we use a simple 
+ * method: we just take and release the RelationMappingLock.  This ensures 
+ * that any already-logged map update is complete, because write_relmap_file 
+ * will fsync the map file before the lock is released. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN523"></a><span class='Declare_Function'>CheckPointRelationMap</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>RelationMappingLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>RelationMappingLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapFinishBootstrap 
+ * 
+ * Write out the initial relation mapping files at the completion of 
+ * bootstrap.  All the mapped files should have been made known to us 
+ * via RelationMapUpdateMap calls. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN537"></a><span class='Declare_Function'>RelationMapFinishBootstrap</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/miscadmin.h.html#LN369"><span class='Ref_to_Macro'>IsBootstrapProcessingMode</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Shouldn't be anything "pending" ... */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN116"><span class='Ref_to_Global_Var'>pending_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN117"><span class='Ref_to_Global_Var'>pending_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Write the files; no WAL or sinval needed */ 
+</span>    <a href="relmapper.c.html#LN126"><span class='Ref_to_Proto'>write_relmap_file</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, 
+</span>                      <a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>, </span><a href="../../../include/catalog/pg_tablespace.h.html#LN63"><span class='Ref_to_Const'>GLOBALTABLESPACE_OID</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN126"><span class='Ref_to_Proto'>write_relmap_file</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, 
+</span>                      <a href="../init/globals.c.html#LN76"><span class='Ref_to_Global_Var'>MyDatabaseId</span></a><span class='Delimiter'>, </span><a href="../init/globals.c.html#LN78"><span class='Ref_to_Global_Var'>MyDatabaseTableSpace</span></a><span class='Delimiter'>, </span><a href="../init/globals.c.html#LN84"><span class='Ref_to_Global_Var'>DatabasePath</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapInitialize 
+ * 
+ * This initializes the mapper module at process startup.  We can't access the 
+ * database yet, so just make sure the maps are empty. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN561"></a><span class='Declare_Function'>RelationMapInitialize</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* The static variables should initialize to zeroes, but let's be sure */ 
+</span>    <a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN86"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* mark it not loaded */ 
+</span>    <a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN86"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN114"><span class='Ref_to_Global_Var'>active_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN115"><span class='Ref_to_Global_Var'>active_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN116"><span class='Ref_to_Global_Var'>pending_shared_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="relmapper.c.html#LN117"><span class='Ref_to_Global_Var'>pending_local_updates</span></a><span class='Operator'>.</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapInitializePhase2 
+ * 
+ * This is called to prepare for access to pg_database during startup. 
+ * We should be able to read the shared map file now. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN581"></a><span class='Declare_Function'>RelationMapInitializePhase2</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * In bootstrap mode, the map file isn't there yet, so do nothing. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/miscadmin.h.html#LN369"><span class='Ref_to_Macro'>IsBootstrapProcessingMode</span></a><span class='Parentheses'>())</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Load the shared map file, die on error. 
+     */ 
+</span>    <a href="relmapper.c.html#LN125"><span class='Ref_to_Proto'>load_relmap_file</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * RelationMapInitializePhase3 
+ * 
+ * This is called as soon as we have determined MyDatabaseId and set up 
+ * DatabasePath.  At this point we should be able to read the local map file. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN602"></a><span class='Declare_Function'>RelationMapInitializePhase3</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * In bootstrap mode, the map file isn't there yet, so do nothing. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/miscadmin.h.html#LN369"><span class='Ref_to_Macro'>IsBootstrapProcessingMode</span></a><span class='Parentheses'>())</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Load the local map file, die on error. 
+     */ 
+</span>    <a href="relmapper.c.html#LN125"><span class='Ref_to_Proto'>load_relmap_file</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * load_relmap_file -- load data from the shared or local map file 
+ * 
+ * Because the map file is essential for access to core system catalogs, 
+ * failure to read it is a fatal error. 
+ * 
+ * Note that the local case requires DatabasePath to be set up. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN625"></a><span class='Declare_Function'>load_relmap_file</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN627"></a>    <a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Local'>map</span><span class='Delimiter'>; 
+</span><a name="LN628"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>mapfilename</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN629"></a>    <a href="../../../include/port/pg_crc32c.h.html#LN37"><span class='Ref_to_Typedef'>pg_crc32c</span></a>   <span class='Declare_Local'>crc</span><span class='Delimiter'>; 
+</span><a name="LN630"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>fd</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN625"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN628"><span class='Ref_To_Local'>mapfilename</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN628"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"global/%s"</span><span class='Delimiter'>, 
+</span>                 <a href="relmapper.c.html#LN72"><span class='Ref_to_Const'>RELMAPPER_FILENAME</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN627"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN628"><span class='Ref_To_Local'>mapfilename</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN628"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"%s/%s"</span><span class='Delimiter'>, 
+</span>                 <a href="../init/globals.c.html#LN84"><span class='Ref_to_Global_Var'>DatabasePath</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN72"><span class='Ref_to_Const'>RELMAPPER_FILENAME</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN627"><span class='Ref_To_Local'>map</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Read data ... */ 
+</span>    <a href="relmapper.c.html#LN630"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN96"><span class='Ref_to_Proto'>OpenTransientFile</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN628"><span class='Ref_To_Local'>mapfilename</span></a><span class='Delimiter'>, 
+</span>                           O_RDONLY <span class='Operator'>| </span><a href="../../../include/c.h.html#LN1032"><span class='Ref_to_Const'>PG_BINARY</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32.h.html#LN424"><span class='Ref_to_Const'>S_IRUSR</span></a> <span class='Operator'>| </span><a href="../../../include/port/win32.h.html#LN425"><span class='Ref_to_Const'>S_IWUSR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN630"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not open relation mapping file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="relmapper.c.html#LN628"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Note: we could take RelationMappingLock in shared mode here, but it 
+     * seems unnecessary since our read() should be atomic against any 
+     * concurrent updater's write().  If the file is updated shortly after we 
+     * look, the sinval signaling mechanism will make us re-read it before we 
+     * are able to access any relation that's affected by the change. 
+     */ 
+</span>    <a href="../../../include/pgstat.h.html#LN1206"><span class='Ref_to_Func'>pgstat_report_wait_start</span></a><span class='Parentheses'>(</span><a href="../../../include/pgstat.h.html#LN869"><span class='Ref_to_EnumConst'>WAIT_EVENT_RELATION_MAP_READ</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../interfaces/libpq/win32.h.html#LN12"><span class='Ref_to_Macro'>read</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN630"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN627"><span class='Ref_To_Local'>map</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not read relation mapping file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="relmapper.c.html#LN628"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/pgstat.h.html#LN1230"><span class='Ref_to_Func'>pgstat_report_wait_end</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/fd.h.html#LN97"><span class='Ref_to_Proto'>CloseTransientFile</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN630"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* check for correct magic number, etc */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN627"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN86"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>!= </span><a href="relmapper.c.html#LN74"><span class='Ref_to_Const'>RELMAPPER_FILEMAGIC</span></a> <span class='Operator'>|| 
+</span>        <a href="relmapper.c.html#LN627"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>        <a href="relmapper.c.html#LN627"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>&GT; </span><a href="relmapper.c.html#LN76"><span class='Ref_to_Const'>MAX_MAPPINGS</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"relation mapping file \"%s\" contains invalid data"</span><span class='Delimiter'>, 
+</span>                        <a href="relmapper.c.html#LN628"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* verify the CRC */ 
+</span>    <a href="../../../include/port/pg_crc32c.h.html#LN40"><span class='Ref_to_Macro'>INIT_CRC32C</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN629"><span class='Ref_To_Local'>crc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port/pg_crc32c.h.html#LN45"><span class='Ref_to_Macro'>COMP_CRC32C</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN629"><span class='Ref_To_Local'>crc</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="relmapper.c.html#LN627"><span class='Ref_To_Local'>map</span></a><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN629"><span class='Ref_To_Local'>crc</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port/pg_crc32c.h.html#LN47"><span class='Ref_to_Macro'>FIN_CRC32C</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN629"><span class='Ref_To_Local'>crc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/port/pg_crc32c.h.html#LN41"><span class='Ref_to_Macro'>EQ_CRC32C</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN629"><span class='Ref_To_Local'>crc</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN627"><span class='Ref_To_Local'>map</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN89"><span class='Ref_to_Member'>crc</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a><span class='Delimiter'>, 
+</span>          <span class='Parentheses'>(</span><a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"relation mapping file \"%s\" contains incorrect checksum"</span><span class='Delimiter'>, 
+</span>                  <a href="relmapper.c.html#LN628"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end load_relmap_file &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Write out a new shared or local map file with the given contents. 
+ * 
+ * The magic number and CRC are automatically updated in *newmap.  On 
+ * success, we copy the data to the appropriate permanent static variable. 
+ * 
+ * If write_wal is TRUE then an appropriate WAL message is emitted. 
+ * (It will be false for bootstrap and WAL replay cases.) 
+ * 
+ * If send_sinval is TRUE then a SI invalidation message is sent. 
+ * (This should be true except in bootstrap case.) 
+ * 
+ * If preserve_files is TRUE then the storage manager is warned not to 
+ * delete the files listed in the map. 
+ * 
+ * Because this may be called during WAL replay when MyDatabaseId, 
+ * DatabasePath, etc aren't valid, we require the caller to pass in suitable 
+ * values.  The caller is also responsible for being sure no concurrent 
+ * map update could be happening. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN711"></a><span class='Declare_Function'>write_relmap_file</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Delimiter'>, </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>newmap</span><span class='Delimiter'>, 
+</span><a name="LN712"></a>                  <span class='Keyword'>bool </span><span class='Declare_Parameter'>write_wal</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>send_sinval</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>preserve_files</span><span class='Delimiter'>, 
+</span><a name="LN713"></a>                  <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>dbid</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>tsid</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>dbpath</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN715"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>fd</span><span class='Delimiter'>; 
+</span><a name="LN716"></a>    <a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Local'>realmap</span><span class='Delimiter'>; 
+</span><a name="LN717"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>mapfilename</span><span class='Delimiter'>[</span><a href="../../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Fill in the overhead fields and update CRC. 
+     */ 
+</span>    <a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN86"><span class='Ref_to_Member'>magic</span></a> <span class='Operator'>= </span><a href="relmapper.c.html#LN74"><span class='Ref_to_Const'>RELMAPPER_FILEMAGIC</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a> <span class='Operator'>&GT; </span><a href="relmapper.c.html#LN76"><span class='Ref_to_Const'>MAX_MAPPINGS</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"attempt to write bogus relation mapping"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/port/pg_crc32c.h.html#LN40"><span class='Ref_to_Macro'>INIT_CRC32C</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN89"><span class='Ref_to_Member'>crc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port/pg_crc32c.h.html#LN45"><span class='Ref_to_Macro'>COMP_CRC32C</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN89"><span class='Ref_to_Member'>crc</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Delimiter'>, </span>crc<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/port/pg_crc32c.h.html#LN47"><span class='Ref_to_Macro'>FIN_CRC32C</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN89"><span class='Ref_to_Member'>crc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Open the target file.  We prefer to do this before entering the 
+     * critical section, so that an open() failure need not force PANIC. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN717"><span class='Ref_To_Local'>mapfilename</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN717"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"global/%s"</span><span class='Delimiter'>, 
+</span>                 <a href="relmapper.c.html#LN72"><span class='Ref_to_Const'>RELMAPPER_FILENAME</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN716"><span class='Ref_To_Local'>realmap</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN717"><span class='Ref_To_Local'>mapfilename</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN717"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"%s/%s"</span><span class='Delimiter'>, 
+</span>                 <a href="relmapper.c.html#LN713"><span class='Ref_to_Parameter'>dbpath</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN72"><span class='Ref_to_Const'>RELMAPPER_FILENAME</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN716"><span class='Ref_To_Local'>realmap</span></a> <span class='Operator'>= &</span><a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="relmapper.c.html#LN715"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>= </span><a href="../../../include/storage/fd.h.html#LN96"><span class='Ref_to_Proto'>OpenTransientFile</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN717"><span class='Ref_To_Local'>mapfilename</span></a><span class='Delimiter'>, 
+</span>                           O_WRONLY <span class='Operator'>| </span>O_CREAT <span class='Operator'>| </span><a href="../../../include/c.h.html#LN1032"><span class='Ref_to_Const'>PG_BINARY</span></a><span class='Delimiter'>, 
+</span>                           <a href="../../../include/port/win32.h.html#LN424"><span class='Ref_to_Const'>S_IRUSR</span></a> <span class='Operator'>| </span><a href="../../../include/port/win32.h.html#LN425"><span class='Ref_to_Const'>S_IWUSR</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN715"><span class='Ref_To_Local'>fd</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not open relation mapping file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="relmapper.c.html#LN717"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN712"><span class='Ref_to_Parameter'>write_wal</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN758"></a>        <a href="../../../include/utils/relmapper.h.html#LN26"><span class='Ref_to_Struct'>xl_relmap_update</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span><a name="LN759"></a>        <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>lsn</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* now errors are fatal ... */ 
+</span>        <a href="../../../include/miscadmin.h.html#LN132"><span class='Ref_to_Macro'>START_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="relmapper.c.html#LN758"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/utils/relmapper.h.html#LN28"><span class='Ref_to_Member'>dbid</span></a> <span class='Operator'>= </span><a href="relmapper.c.html#LN713"><span class='Ref_to_Parameter'>dbid</span></a><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN758"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/utils/relmapper.h.html#LN29"><span class='Ref_to_Member'>tsid</span></a> <span class='Operator'>= </span><a href="relmapper.c.html#LN713"><span class='Ref_to_Parameter'>tsid</span></a><span class='Delimiter'>; 
+</span>        <a href="relmapper.c.html#LN758"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/utils/relmapper.h.html#LN30"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) (</span><span class='Operator'>&</span><a href="relmapper.c.html#LN758"><span class='Ref_To_Local'>xlrec</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../../include/utils/relmapper.h.html#LN34"><span class='Ref_to_Const'>MinSizeOfRelmapUpdate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="relmapper.c.html#LN759"><span class='Ref_To_Local'>lsn</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_RELMAP_ID<span class='Delimiter'>, </span><a href="../../../include/utils/relmapper.h.html#LN24"><span class='Ref_to_Const'>XLOG_RELMAP_UPDATE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* As always, WAL must hit the disk before the data update does */ 
+</span>        <a href="../../../include/access/xlog.h.html#LN225"><span class='Ref_to_Proto'>XLogFlush</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN759"><span class='Ref_To_Local'>lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if write_wal &raquo; </span> 
+ 
+    errno <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/pgstat.h.html#LN1206"><span class='Ref_to_Func'>pgstat_report_wait_start</span></a><span class='Parentheses'>(</span><a href="../../../include/pgstat.h.html#LN871"><span class='Ref_to_EnumConst'>WAIT_EVENT_RELATION_MAP_WRITE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../interfaces/libpq/win32.h.html#LN13"><span class='Ref_to_Macro'>write</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN715"><span class='Ref_To_Local'>fd</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* if write didn't set errno, assume problem is no disk space */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>errno <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            errno <span class='Operator'>= </span>ENOSPC<span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not write to relation mapping file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="relmapper.c.html#LN717"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../../include/pgstat.h.html#LN1230"><span class='Ref_to_Func'>pgstat_report_wait_end</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We choose to fsync the data to disk before considering the task done. 
+     * It would be possible to relax this if it turns out to be a performance 
+     * issue, but it would complicate checkpointing --- see notes for 
+     * CheckPointRelationMap. 
+     */ 
+</span>    <a href="../../../include/pgstat.h.html#LN1206"><span class='Ref_to_Func'>pgstat_report_wait_start</span></a><span class='Parentheses'>(</span><a href="../../../include/pgstat.h.html#LN870"><span class='Ref_to_EnumConst'>WAIT_EVENT_RELATION_MAP_SYNC</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN114"><span class='Ref_to_Proto'>pg_fsync</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN715"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not fsync relation mapping file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="relmapper.c.html#LN717"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/pgstat.h.html#LN1230"><span class='Ref_to_Func'>pgstat_report_wait_end</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/fd.h.html#LN97"><span class='Ref_to_Proto'>CloseTransientFile</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN715"><span class='Ref_To_Local'>fd</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not close relation mapping file \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="relmapper.c.html#LN717"><span class='Ref_To_Local'>mapfilename</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Now that the file is safely on disk, send sinval message to let other 
+     * backends know to re-read it.  We must do this inside the critical 
+     * section: if for some reason we fail to send the message, we have to 
+     * force a database-wide PANIC.  Otherwise other backends might continue 
+     * execution with stale mapping information, which would be catastrophic 
+     * as soon as others began to use the now-committed data. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN712"><span class='Ref_to_Parameter'>send_sinval</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/inval.h.html#LN53"><span class='Ref_to_Proto'>CacheInvalidateRelmap</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN713"><span class='Ref_to_Parameter'>dbid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Make sure that the files listed in the map are not deleted if the outer 
+     * transaction aborts.  This had better be within the critical section 
+     * too: it's not likely to fail, but if it did, we'd arrive at transaction 
+     * abort with the files still vulnerable.  PANICing will leave things in a 
+     * good state on-disk. 
+     * 
+     * Note: we're cheating a little bit here by assuming that mapped files 
+     * are either in pg_global or the database's default tablespace. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN712"><span class='Ref_to_Parameter'>preserve_files</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN835"></a>        <a href="../../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a>       <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN835"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="relmapper.c.html#LN835"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN87"><span class='Ref_to_Member'>num_mappings</span></a><span class='Delimiter'>; </span><a href="relmapper.c.html#LN835"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN839"></a>            <a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Local'>rnode</span><span class='Delimiter'>; 
+</span> 
+            <a href="relmapper.c.html#LN839"><span class='Ref_To_Local'>rnode</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN58"><span class='Ref_to_Member'>spcNode</span></a> <span class='Operator'>= </span><a href="relmapper.c.html#LN713"><span class='Ref_to_Parameter'>tsid</span></a><span class='Delimiter'>; 
+</span>            <a href="relmapper.c.html#LN839"><span class='Ref_To_Local'>rnode</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN59"><span class='Ref_to_Member'>dbNode</span></a> <span class='Operator'>= </span><a href="relmapper.c.html#LN713"><span class='Ref_to_Parameter'>dbid</span></a><span class='Delimiter'>; 
+</span>            <a href="relmapper.c.html#LN839"><span class='Ref_To_Local'>rnode</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN60"><span class='Ref_to_Member'>relNode</span></a> <span class='Operator'>= </span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Operator'>-&GT;</span><a href="relmapper.c.html#LN88"><span class='Ref_to_Member'>mappings</span></a><span class='Delimiter'>[</span><a href="relmapper.c.html#LN835"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="relmapper.c.html#LN81"><span class='Ref_to_Member'>mapfilenode</span></a><span class='Delimiter'>; 
+</span>            <a href="../../../include/catalog/storage.h.html#LN22"><span class='Ref_to_Proto'>RelationPreserveStorage</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN839"><span class='Ref_To_Local'>rnode</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Success, update permanent copy */ 
+</span>    memcpy<span class='Parentheses'>(</span><a href="relmapper.c.html#LN716"><span class='Ref_To_Local'>realmap</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN711"><span class='Ref_to_Parameter'>newmap</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Critical section done */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN712"><span class='Ref_to_Parameter'>write_wal</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/miscadmin.h.html#LN134"><span class='Ref_to_Macro'>END_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end write_relmap_file &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Merge the specified updates into the appropriate "real" map, 
+ * and write out the changes.  This function must be used for committing 
+ * updates during normal multiuser operation. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN862"></a><span class='Declare_Function'>perform_relmap_update</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>shared</span><span class='Delimiter'>, </span><span class='Keyword'>const </span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>updates</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN864"></a>    <a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a>  <span class='Declare_Local'>newmap</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Anyone updating a relation's mapping info should take exclusive lock on 
+     * that rel and hold it until commit.  This ensures that there will not be 
+     * concurrent updates on the same mapping value; but there could easily be 
+     * concurrent updates on different values in the same file. We cover that 
+     * by acquiring the RelationMappingLock, re-reading the target file to 
+     * ensure it's up to date, applying the updates, and writing the data 
+     * before releasing RelationMappingLock. 
+     * 
+     * There is only one RelationMappingLock.  In principle we could try to 
+     * have one per mapping file, but it seems unlikely to be worth the 
+     * trouble. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>RelationMappingLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Be certain we see any other updates just made */ 
+</span>    <a href="relmapper.c.html#LN125"><span class='Ref_to_Proto'>load_relmap_file</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN862"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Prepare updated data in a local variable */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN862"><span class='Ref_to_Parameter'>shared</span></a><span class='Parentheses'>) 
+</span>        memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="relmapper.c.html#LN864"><span class='Ref_To_Local'>newmap</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="relmapper.c.html#LN98"><span class='Ref_to_Global_Var'>shared_map</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="relmapper.c.html#LN864"><span class='Ref_To_Local'>newmap</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="relmapper.c.html#LN99"><span class='Ref_to_Global_Var'>local_map</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Apply the updates to newmap.  No new mappings should appear, unless 
+     * somebody is adding indexes to system catalogs. 
+     */ 
+</span>    <a href="relmapper.c.html#LN123"><span class='Ref_to_Proto'>merge_map_updates</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="relmapper.c.html#LN864"><span class='Ref_To_Local'>newmap</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN862"><span class='Ref_to_Parameter'>updates</span></a><span class='Delimiter'>, </span><a href="../init/globals.c.html#LN111"><span class='Ref_to_Global_Var'>allowSystemTableMods</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Write out the updated map and do other necessary tasks */ 
+</span>    <a href="relmapper.c.html#LN126"><span class='Ref_to_Proto'>write_relmap_file</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN862"><span class='Ref_to_Parameter'>shared</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="relmapper.c.html#LN864"><span class='Ref_To_Local'>newmap</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, 
+</span>                      <span class='Parentheses'>(</span><a href="relmapper.c.html#LN862"><span class='Ref_to_Parameter'>shared</span></a> <span class='Operator'>? </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a> <span class='Operator'>: </span><a href="../init/globals.c.html#LN76"><span class='Ref_to_Global_Var'>MyDatabaseId</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                      <span class='Parentheses'>(</span><a href="relmapper.c.html#LN862"><span class='Ref_to_Parameter'>shared</span></a> <span class='Operator'>? </span><a href="../../../include/catalog/pg_tablespace.h.html#LN63"><span class='Ref_to_Const'>GLOBALTABLESPACE_OID</span></a> <span class='Operator'>: </span><a href="../init/globals.c.html#LN78"><span class='Ref_to_Global_Var'>MyDatabaseTableSpace</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                      <a href="../init/globals.c.html#LN84"><span class='Ref_to_Global_Var'>DatabasePath</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now we can release the lock */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>RelationMappingLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end perform_relmap_update &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * RELMAP resource manager's routines 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN910"></a><span class='Declare_Function'>relmap_redo</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN68"><span class='Ref_to_Struct'>XLogReaderState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>record</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN912"></a>    <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>info</span> <span class='Operator'>= </span><a href="../../../include/access/xlogreader.h.html#LN215"><span class='Ref_to_Macro'>XLogRecGetInfo</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN910"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>) </span><span class='Operator'>& ~</span><a href="../../../include/access/xlogrecord.h.html#LN61"><span class='Ref_to_Const'>XLR_INFO_MASK</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Backup blocks are not used in relmap records */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xlogreader.h.html#LN221"><span class='Ref_to_Macro'>XLogRecHasAnyBlockRefs</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN910"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN912"><span class='Ref_To_Local'>info</span></a> <span class='Operator'>== </span><a href="../../../include/utils/relmapper.h.html#LN24"><span class='Ref_to_Const'>XLOG_RELMAP_UPDATE</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN919"></a>        <a href="../../../include/utils/relmapper.h.html#LN26"><span class='Ref_to_Struct'>xl_relmap_update</span></a> <span class='Operator'>*</span><span class='Declare_Local'>xlrec</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/utils/relmapper.h.html#LN26"><span class='Ref_to_Struct'>xl_relmap_update</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/access/xlogreader.h.html#LN219"><span class='Ref_to_Macro'>XLogRecGetData</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN910"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN920"></a>        <a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a>  <span class='Declare_Local'>newmap</span><span class='Delimiter'>; 
+</span><a name="LN921"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>dbpath</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="relmapper.c.html#LN919"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/relmapper.h.html#LN30"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>!= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN84"><span class='Ref_to_Struct'>RelMapFile</span></a><span class='Parentheses'>))</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"relmap_redo: wrong size %u in relmap update record"</span><span class='Delimiter'>, 
+</span>                 <a href="relmapper.c.html#LN919"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/relmapper.h.html#LN30"><span class='Ref_to_Member'>nbytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="relmapper.c.html#LN920"><span class='Ref_To_Local'>newmap</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN919"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/relmapper.h.html#LN31"><span class='Ref_to_Member'>data</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="relmapper.c.html#LN920"><span class='Ref_To_Local'>newmap</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* We need to construct the pathname for this database */ 
+</span>        <a href="relmapper.c.html#LN921"><span class='Ref_To_Local'>dbpath</span></a> <span class='Operator'>= </span><a href="../../../include/common/relpath.h.html#LN50"><span class='Ref_to_Proto'>GetDatabasePath</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN919"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/relmapper.h.html#LN28"><span class='Ref_to_Member'>dbid</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN919"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/relmapper.h.html#LN29"><span class='Ref_to_Member'>tsid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Write out the new map and send sinval, but of course don't write a 
+         * new WAL entry.  There's no surrounding transaction to tell to 
+         * preserve files, either. 
+         * 
+         * There shouldn't be anyone else updating relmaps during WAL replay, 
+         * so we don't bother to take the RelationMappingLock.  We would need 
+         * to do so if load_relmap_file needed to interlock against writers. 
+         */ 
+</span>        <a href="relmapper.c.html#LN126"><span class='Ref_to_Proto'>write_relmap_file</span></a><span class='Parentheses'>((</span><a href="relmapper.c.html#LN919"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/relmapper.h.html#LN28"><span class='Ref_to_Member'>dbid</span></a> <span class='Operator'>== </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="relmapper.c.html#LN920"><span class='Ref_To_Local'>newmap</span></a><span class='Delimiter'>, 
+</span>                          <span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, 
+</span>                          <a href="relmapper.c.html#LN919"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/relmapper.h.html#LN28"><span class='Ref_to_Member'>dbid</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN919"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/relmapper.h.html#LN29"><span class='Ref_to_Member'>tsid</span></a><span class='Delimiter'>, </span><a href="relmapper.c.html#LN921"><span class='Ref_To_Local'>dbpath</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="relmapper.c.html#LN921"><span class='Ref_To_Local'>dbpath</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if info==XLOG_RELMAP_UPD... &raquo; </span> 
+    <span class='Control'>else</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"relmap_redo: unknown op code %u"</span><span class='Delimiter'>, </span><a href="relmapper.c.html#LN912"><span class='Ref_To_Local'>info</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end relmap_redo &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

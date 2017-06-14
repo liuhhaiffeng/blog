@@ -1,0 +1,928 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\executor\execIndexing.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\executor\execIndexing.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:38 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * execIndexing.c 
+ *    routines for inserting index tuples and enforcing unique and 
+ *    exclusion constraints. 
+ * 
+ * ExecInsertIndexTuples() is the main entry point.  It's called after 
+ * inserting a tuple to the heap, and it inserts corresponding index tuples 
+ * into all indexes.  At the same time, it enforces any unique and 
+ * exclusion constraints: 
+ * 
+ * Unique Indexes 
+ * -------------- 
+ * 
+ * Enforcing a unique constraint is straightforward.  When the index AM 
+ * inserts the tuple to the index, it also checks that there are no 
+ * conflicting tuples in the index already.  It does so atomically, so that 
+ * even if two backends try to insert the same key concurrently, only one 
+ * of them will succeed.  All the logic to ensure atomicity, and to wait 
+ * for in-progress transactions to finish, is handled by the index AM. 
+ * 
+ * If a unique constraint is deferred, we request the index AM to not 
+ * throw an error if a conflict is found.  Instead, we make note that there 
+ * was a conflict and return the list of indexes with conflicts to the 
+ * caller.  The caller must re-check them later, by calling index_insert() 
+ * with the UNIQUE_CHECK_EXISTING option. 
+ * 
+ * Exclusion Constraints 
+ * --------------------- 
+ * 
+ * Exclusion constraints are different from unique indexes in that when the 
+ * tuple is inserted to the index, the index AM does not check for 
+ * duplicate keys at the same time.  After the insertion, we perform a 
+ * separate scan on the index to check for conflicting tuples, and if one 
+ * is found, we throw an error and the transaction is aborted.  If the 
+ * conflicting tuple's inserter or deleter is in-progress, we wait for it 
+ * to finish first. 
+ * 
+ * There is a chance of deadlock, if two backends insert a tuple at the 
+ * same time, and then perform the scan to check for conflicts.  They will 
+ * find each other's tuple, and both try to wait for each other.  The 
+ * deadlock detector will detect that, and abort one of the transactions. 
+ * That's fairly harmless, as one of them was bound to abort with a 
+ * "duplicate key error" anyway, although you get a different error 
+ * message. 
+ * 
+ * If an exclusion constraint is deferred, we still perform the conflict 
+ * checking scan immediately after inserting the index tuple.  But instead 
+ * of throwing an error if a conflict is found, we return that information 
+ * to the caller.  The caller must re-check them later by calling 
+ * check_exclusion_constraint(). 
+ * 
+ * Speculative insertion 
+ * --------------------- 
+ * 
+ * Speculative insertion is a two-phase mechanism used to implement 
+ * INSERT ... ON CONFLICT DO UPDATE/NOTHING.  The tuple is first inserted 
+ * to the heap and update the indexes as usual, but if a constraint is 
+ * violated, we can still back out the insertion without aborting the whole 
+ * transaction.  In an INSERT ... ON CONFLICT statement, if a conflict is 
+ * detected, the inserted tuple is backed out and the ON CONFLICT action is 
+ * executed instead. 
+ * 
+ * Insertion to a unique index works as usual: the index AM checks for 
+ * duplicate keys atomically with the insertion.  But instead of throwing 
+ * an error on a conflict, the speculatively inserted heap tuple is backed 
+ * out. 
+ * 
+ * Exclusion constraints are slightly more complicated.  As mentioned 
+ * earlier, there is a risk of deadlock when two backends insert the same 
+ * key concurrently.  That was not a problem for regular insertions, when 
+ * one of the transactions has to be aborted anyway, but with a speculative 
+ * insertion we cannot let a deadlock happen, because we only want to back 
+ * out the speculatively inserted tuple on conflict, not abort the whole 
+ * transaction. 
+ * 
+ * When a backend detects that the speculative insertion conflicts with 
+ * another in-progress tuple, it has two options: 
+ * 
+ * 1. back out the speculatively inserted tuple, then wait for the other 
+ *    transaction, and retry. Or, 
+ * 2. wait for the other transaction, with the speculatively inserted tuple 
+ *    still in place. 
+ * 
+ * If two backends insert at the same time, and both try to wait for each 
+ * other, they will deadlock.  So option 2 is not acceptable.  Option 1 
+ * avoids the deadlock, but it is prone to a livelock instead.  Both 
+ * transactions will wake up immediately as the other transaction backs 
+ * out.  Then they both retry, and conflict with each other again, lather, 
+ * rinse, repeat. 
+ * 
+ * To avoid the livelock, one of the backends must back out first, and then 
+ * wait, while the other one waits without backing out.  It doesn't matter 
+ * which one backs out, so we employ an arbitrary rule that the transaction 
+ * with the higher XID backs out. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/executor/execIndexing.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/relscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/index.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/executor.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"nodes/nodeFuncs.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/tqual.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* waitMode argument to check_exclusion_or_unique_constraint() */ 
+</span><span class='Control'>typedef</span> <span class='Control'>enum</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN119"></a>    <span class='Declare_Enum_Const'>CEOUC_WAIT</span><span class='Delimiter'>, 
+</span><a name="LN120"></a>    <span class='Declare_Enum_Const'>CEOUC_NOWAIT</span><span class='Delimiter'>, 
+</span><a name="LN121"></a>    <span class='Declare_Enum_Const'>CEOUC_LIVELOCK_PREVENTING_WAIT</span> 
+<a name="LN122"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>CEOUC_WAIT_MODE</span><span class='Delimiter'>; 
+</span> 
+<a name="LN124"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>check_exclusion_or_unique_constraint</span><span class='Parentheses'>(</span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>heap</span><span class='Delimiter'>, </span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>index</span><span class='Delimiter'>, 
+</span><a name="LN125"></a>                                     <a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>indexInfo</span><span class='Delimiter'>, 
+</span><a name="LN126"></a>                                     <a href="../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>tupleid</span><span class='Delimiter'>, 
+</span><a name="LN127"></a>                                     <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>values</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>isnull</span><span class='Delimiter'>, 
+</span><a name="LN128"></a>                                     <a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>newIndex</span><span class='Delimiter'>, 
+</span><a name="LN129"></a>                                     <a href="execIndexing.c.html#LN117"><span class='Ref_to_Typedef'>CEOUC_WAIT_MODE</span></a> <span class='Declare_Parameter'>waitMode</span><span class='Delimiter'>, 
+</span><a name="LN130"></a>                                     <span class='Keyword'>bool </span><span class='Declare_Parameter'>errorOK</span><span class='Delimiter'>, 
+</span><a name="LN131"></a>                                     <a href="../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>conflictTid</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN133"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>index_recheck_constraint</span><span class='Parentheses'>(</span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>index</span><span class='Delimiter'>, </span><a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>constr_procs</span><span class='Delimiter'>, 
+</span><a name="LN134"></a>                         <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>existing_values</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>existing_isnull</span><span class='Delimiter'>, 
+</span><a name="LN135"></a>                         <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>new_values</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecOpenIndices 
+ * 
+ *      Find the indices associated with a result relation, open them, 
+ *      and save information about them in the result ResultRelInfo. 
+ * 
+ *      At entry, caller has already opened and locked 
+ *      resultRelInfo-&GT;ri_RelationDesc. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN148"></a><span class='Declare_Function'>ExecOpenIndices</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN369"><span class='Ref_to_Struct'>ResultRelInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>resultRelInfo</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>speculative</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN150"></a>    <a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>resultRelation</span> <span class='Operator'>= </span><a href="execIndexing.c.html#LN148"><span class='Ref_to_Parameter'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN373"><span class='Ref_to_Member'>ri_RelationDesc</span></a><span class='Delimiter'>; 
+</span><a name="LN151"></a>    <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>indexoidlist</span><span class='Delimiter'>; 
+</span><a name="LN152"></a>    <a href="../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>l</span><span class='Delimiter'>; 
+</span><a name="LN153"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>len</span><span class='Delimiter'>, 
+</span><a name="LN154"></a>                <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN155"></a>    <a href="../../include/utils/relcache.h.html#LN28"><span class='Ref_to_Typedef'>RelationPtr</span></a> <span class='Declare_Local'>relationDescs</span><span class='Delimiter'>; 
+</span><a name="LN156"></a>    <a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a> <span class='Operator'>**</span><span class='Declare_Local'>indexInfoArray</span><span class='Delimiter'>; 
+</span> 
+    <a href="execIndexing.c.html#LN148"><span class='Ref_to_Parameter'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN374"><span class='Ref_to_Member'>ri_NumIndices</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* fast path if no indexes */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/utils/rel.h.html#LN410"><span class='Ref_to_Macro'>RelationGetForm</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN150"><span class='Ref_To_Local'>resultRelation</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>relhasindex<span class='Parentheses'>)</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Get cached list of index OIDs 
+     */ 
+</span>    <a href="execIndexing.c.html#LN151"><span class='Ref_To_Local'>indexoidlist</span></a> <span class='Operator'>= </span><a href="../../include/utils/relcache.h.html#LN40"><span class='Ref_to_Proto'>RelationGetIndexList</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN150"><span class='Ref_To_Local'>resultRelation</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN153"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN151"><span class='Ref_To_Local'>indexoidlist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN153"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * allocate space for result arrays 
+     */ 
+</span>    <a href="execIndexing.c.html#LN155"><span class='Ref_To_Local'>relationDescs</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/utils/relcache.h.html#LN28"><span class='Ref_to_Typedef'>RelationPtr</span></a><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN153"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN156"><span class='Ref_To_Local'>indexInfoArray</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a> <span class='Operator'>**</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN153"><span class='Ref_To_Local'>len</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a> <span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="execIndexing.c.html#LN148"><span class='Ref_to_Parameter'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN374"><span class='Ref_to_Member'>ri_NumIndices</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN153"><span class='Ref_To_Local'>len</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN148"><span class='Ref_to_Parameter'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN375"><span class='Ref_to_Member'>ri_IndexRelationDescs</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN155"><span class='Ref_To_Local'>relationDescs</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN148"><span class='Ref_to_Parameter'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN376"><span class='Ref_to_Member'>ri_IndexRelationInfo</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN156"><span class='Ref_To_Local'>indexInfoArray</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * For each index, open the index relation and save pg_index info. We 
+     * acquire RowExclusiveLock, signifying we will update the index. 
+     * 
+     * Note: we do this even if the index is not IndexIsReady; it's not worth 
+     * the trouble to optimize for the case where it isn't. 
+     */ 
+</span>    <a href="execIndexing.c.html#LN154"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN152"><span class='Ref_To_Local'>l</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN151"><span class='Ref_To_Local'>indexoidlist</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN192"></a>        <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>indexOid</span> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN107"><span class='Ref_to_Macro'>lfirst_oid</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN152"><span class='Ref_To_Local'>l</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN193"></a>        <a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>indexDesc</span><span class='Delimiter'>; 
+</span><a name="LN194"></a>        <a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>ii</span><span class='Delimiter'>; 
+</span> 
+        <a href="execIndexing.c.html#LN193"><span class='Ref_To_Local'>indexDesc</span></a> <span class='Operator'>= </span><a href="../../include/access/genam.h.html#LN129"><span class='Ref_to_Proto'>index_open</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN192"><span class='Ref_To_Local'>indexOid</span></a><span class='Delimiter'>, </span><a href="../../include/storage/lockdefs.h.html#LN37"><span class='Ref_to_Const'>RowExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* extract index key information from the index's pg_index info */ 
+</span>        <a href="execIndexing.c.html#LN194"><span class='Ref_To_Local'>ii</span></a> <span class='Operator'>= </span><a href="../../include/catalog/index.h.html#LN81"><span class='Ref_to_Proto'>BuildIndexInfo</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN193"><span class='Ref_To_Local'>indexDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If the indexes are to be used for speculative insertion, add extra 
+         * information required by unique index entries. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN148"><span class='Ref_to_Parameter'>speculative</span></a> <span class='Operator'>&& </span><a href="execIndexing.c.html#LN194"><span class='Ref_To_Local'>ii</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN145"><span class='Ref_to_Member'>ii_Unique</span></a><span class='Parentheses'>) 
+</span>            <a href="../../include/catalog/index.h.html#LN83"><span class='Ref_to_Proto'>BuildSpeculativeIndexInfo</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN193"><span class='Ref_To_Local'>indexDesc</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN194"><span class='Ref_To_Local'>ii</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="execIndexing.c.html#LN155"><span class='Ref_To_Local'>relationDescs</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN154"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="execIndexing.c.html#LN193"><span class='Ref_To_Local'>indexDesc</span></a><span class='Delimiter'>; 
+</span>        <a href="execIndexing.c.html#LN156"><span class='Ref_To_Local'>indexInfoArray</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN154"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="execIndexing.c.html#LN194"><span class='Ref_To_Local'>ii</span></a><span class='Delimiter'>; 
+</span>        <a href="execIndexing.c.html#LN154"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../include/nodes/pg_list.h.html#LN265"><span class='Ref_to_Proto'>list_free</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN151"><span class='Ref_To_Local'>indexoidlist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecOpenIndices &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecCloseIndices 
+ * 
+ *      Close the index relations stored in resultRelInfo 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN223"></a><span class='Declare_Function'>ExecCloseIndices</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN369"><span class='Ref_to_Struct'>ResultRelInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>resultRelInfo</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN225"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN226"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>numIndices</span><span class='Delimiter'>; 
+</span><a name="LN227"></a>    <a href="../../include/utils/relcache.h.html#LN28"><span class='Ref_to_Typedef'>RelationPtr</span></a> <span class='Declare_Local'>indexDescs</span><span class='Delimiter'>; 
+</span> 
+    <a href="execIndexing.c.html#LN226"><span class='Ref_To_Local'>numIndices</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN223"><span class='Ref_to_Parameter'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN374"><span class='Ref_to_Member'>ri_NumIndices</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN227"><span class='Ref_To_Local'>indexDescs</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN223"><span class='Ref_to_Parameter'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN375"><span class='Ref_to_Member'>ri_IndexRelationDescs</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN225"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN225"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execIndexing.c.html#LN226"><span class='Ref_To_Local'>numIndices</span></a><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN225"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN227"><span class='Ref_To_Local'>indexDescs</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN225"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* shouldn't happen? */ 
+</span> 
+        <span class='Comment_Multi_Line'>/* Drop lock acquired by ExecOpenIndices */ 
+</span>        <a href="../../include/access/genam.h.html#LN130"><span class='Ref_to_Proto'>index_close</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN227"><span class='Ref_To_Local'>indexDescs</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN225"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], </span><a href="../../include/storage/lockdefs.h.html#LN37"><span class='Ref_to_Const'>RowExclusiveLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * XXX should free indexInfo array here too?  Currently we assume that 
+     * such stuff will be cleaned up automatically in FreeExecutorState. 
+     */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end ExecCloseIndices &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecInsertIndexTuples 
+ * 
+ *      This routine takes care of inserting index tuples 
+ *      into all the relations indexing the result relation 
+ *      when a heap tuple is inserted into the result relation. 
+ * 
+ *      Unique and exclusion constraints are enforced at the same 
+ *      time.  This returns a list of index OIDs for any unique or 
+ *      exclusion constraints that are deferred and that had 
+ *      potential (unconfirmed) conflicts.  (if noDupErr == true, 
+ *      the same is done for non-deferred constraints, but report 
+ *      if conflict was speculative or deferred conflict to caller) 
+ * 
+ *      If 'arbiterIndexes' is nonempty, noDupErr applies only to 
+ *      those indexes.  NIL means noDupErr applies to all indexes. 
+ * 
+ *      CAUTION: this must not be called for a HOT update. 
+ *      We can't defend against that here for lack of info. 
+ *      Should we change the API to make it safer? 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN270"></a><span class='Declare_Function'>ExecInsertIndexTuples</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Delimiter'>, 
+</span><a name="LN271"></a>                      <a href="../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>tupleid</span><span class='Delimiter'>, 
+</span><a name="LN272"></a>                      <a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, 
+</span><a name="LN273"></a>                      <span class='Keyword'>bool </span><span class='Declare_Parameter'>noDupErr</span><span class='Delimiter'>, 
+</span><a name="LN274"></a>                      <span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>specConflict</span><span class='Delimiter'>, 
+</span><a name="LN275"></a>                      <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>arbiterIndexes</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN277"></a>    <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>result</span> <span class='Operator'>= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN278"></a>    <a href="../../include/nodes/execnodes.h.html#LN369"><span class='Ref_to_Struct'>ResultRelInfo</span></a> <span class='Operator'>*</span><span class='Declare_Local'>resultRelInfo</span><span class='Delimiter'>; 
+</span><a name="LN279"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN280"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>numIndices</span><span class='Delimiter'>; 
+</span><a name="LN281"></a>    <a href="../../include/utils/relcache.h.html#LN28"><span class='Ref_to_Typedef'>RelationPtr</span></a> <span class='Declare_Local'>relationDescs</span><span class='Delimiter'>; 
+</span><a name="LN282"></a>    <a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>heapRelation</span><span class='Delimiter'>; 
+</span><a name="LN283"></a>    <a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a> <span class='Operator'>**</span><span class='Declare_Local'>indexInfoArray</span><span class='Delimiter'>; 
+</span><a name="LN284"></a>    <a href="../../include/nodes/execnodes.h.html#LN191"><span class='Ref_to_Struct'>ExprContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>econtext</span><span class='Delimiter'>; 
+</span><a name="LN285"></a>    <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Local'>values</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN45"><span class='Ref_to_Const'>INDEX_MAX_KEYS</span></a><span class='Delimiter'>]; 
+</span><a name="LN286"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>isnull</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN45"><span class='Ref_to_Const'>INDEX_MAX_KEYS</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Get information from the result relation info structure. 
+     */ 
+</span>    <a href="execIndexing.c.html#LN278"><span class='Ref_To_Local'>resultRelInfo</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN272"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN422"><span class='Ref_to_Member'>es_result_relation_info</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN280"><span class='Ref_To_Local'>numIndices</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN278"><span class='Ref_To_Local'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN374"><span class='Ref_to_Member'>ri_NumIndices</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN281"><span class='Ref_To_Local'>relationDescs</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN278"><span class='Ref_To_Local'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN375"><span class='Ref_to_Member'>ri_IndexRelationDescs</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN283"><span class='Ref_To_Local'>indexInfoArray</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN278"><span class='Ref_To_Local'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN376"><span class='Ref_to_Member'>ri_IndexRelationInfo</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN282"><span class='Ref_To_Local'>heapRelation</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN278"><span class='Ref_To_Local'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN373"><span class='Ref_to_Member'>ri_RelationDesc</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We will use the EState's per-tuple context for evaluating predicates 
+     * and index expressions (creating it if it's not already there). 
+     */ 
+</span>    <a href="execIndexing.c.html#LN284"><span class='Ref_To_Local'>econtext</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN455"><span class='Ref_to_Macro'>GetPerTupleExprContext</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN272"><span class='Ref_to_Parameter'>estate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Arrange for econtext's scan tuple to be the tuple under test */ 
+</span>    <a href="execIndexing.c.html#LN284"><span class='Ref_To_Local'>econtext</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN196"><span class='Ref_to_Member'>ecxt_scantuple</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN270"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * for each index, form and insert the index tuple 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN279"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN279"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execIndexing.c.html#LN280"><span class='Ref_To_Local'>numIndices</span></a><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN279"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN311"></a>        <a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>indexRelation</span> <span class='Operator'>= </span><a href="execIndexing.c.html#LN281"><span class='Ref_To_Local'>relationDescs</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN279"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span><a name="LN312"></a>        <a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>indexInfo</span><span class='Delimiter'>; 
+</span><a name="LN313"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>applyNoDupErr</span><span class='Delimiter'>; 
+</span><a name="LN314"></a>        <a href="../../include/access/genam.h.html#LN110"><span class='Ref_to_Enum'>IndexUniqueCheck</span></a> <span class='Declare_Local'>checkUnique</span><span class='Delimiter'>; 
+</span><a name="LN315"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>satisfiesConstraint</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN311"><span class='Ref_To_Local'>indexRelation</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN283"><span class='Ref_To_Local'>indexInfoArray</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN279"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If the index is marked as read-only, ignore it */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN146"><span class='Ref_to_Member'>ii_ReadyForInserts</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Check for partial index */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN137"><span class='Ref_to_Member'>ii_Predicate</span></a> <span class='Operator'>!= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN329"></a>            <a href="../../include/nodes/execnodes.h.html#LN52"><span class='Ref_to_Struct'>ExprState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>predicate</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * If predicate state not set up yet, create it (in the estate's 
+             * per-query context) 
+             */ 
+</span>            <a href="execIndexing.c.html#LN329"><span class='Ref_To_Local'>predicate</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN138"><span class='Ref_to_Member'>ii_PredicateState</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN329"><span class='Ref_To_Local'>predicate</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="execIndexing.c.html#LN329"><span class='Ref_To_Local'>predicate</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN247"><span class='Ref_to_Proto'>ExecPrepareQual</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN137"><span class='Ref_to_Member'>ii_Predicate</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN272"><span class='Ref_to_Parameter'>estate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN138"><span class='Ref_to_Member'>ii_PredicateState</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN329"><span class='Ref_To_Local'>predicate</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* Skip this index-update if the predicate isn't satisfied */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/executor/executor.h.html#LN344"><span class='Ref_to_Func'>ExecQual</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN329"><span class='Ref_To_Local'>predicate</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN284"><span class='Ref_To_Local'>econtext</span></a><span class='Parentheses'>))</span> 
+                <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * FormIndexDatum fills in its values and isnull parameters with the 
+         * appropriate values for the column(s) of the index. 
+         */ 
+</span>        <a href="../../include/catalog/index.h.html#LN85"><span class='Ref_to_Proto'>FormIndexDatum</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Delimiter'>, 
+</span>                       <a href="execIndexing.c.html#LN270"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>, 
+</span>                       <a href="execIndexing.c.html#LN272"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, 
+</span>                       <a href="execIndexing.c.html#LN285"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>, 
+</span>                       <a href="execIndexing.c.html#LN286"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Check whether to apply noDupErr to this index */ 
+</span>        <a href="execIndexing.c.html#LN313"><span class='Ref_To_Local'>applyNoDupErr</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN273"><span class='Ref_to_Parameter'>noDupErr</span></a> <span class='Operator'>&& 
+</span>            <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN275"><span class='Ref_to_Parameter'>arbiterIndexes</span></a> <span class='Operator'>== </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a> <span class='Operator'>|| 
+</span>             <a href="../../include/nodes/pg_list.h.html#LN231"><span class='Ref_to_Proto'>list_member_oid</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN275"><span class='Ref_to_Parameter'>arbiterIndexes</span></a><span class='Delimiter'>, 
+</span>                             <a href="execIndexing.c.html#LN311"><span class='Ref_To_Local'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN158"><span class='Ref_to_Member'>rd_index</span></a><span class='Operator'>-&GT;</span>indexrelid<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * The index AM does the actual insertion, plus uniqueness checking. 
+         * 
+         * For an immediate-mode unique index, we just tell the index AM to 
+         * throw error if not unique. 
+         * 
+         * For a deferrable unique index, we tell the index AM to just detect 
+         * possible non-uniqueness, and we add the index OID to the result 
+         * list if further checking is needed. 
+         * 
+         * For a speculative insertion (used by INSERT ... ON CONFLICT), do 
+         * the same as for a deferrable unique index. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execIndexing.c.html#LN311"><span class='Ref_To_Local'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN158"><span class='Ref_to_Member'>rd_index</span></a><span class='Operator'>-&GT;</span>indisunique<span class='Parentheses'>) 
+</span>            <a href="execIndexing.c.html#LN314"><span class='Ref_To_Local'>checkUnique</span></a> <span class='Operator'>= </span><a href="../../include/access/genam.h.html#LN112"><span class='Ref_to_EnumConst'>UNIQUE_CHECK_NO</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN313"><span class='Ref_To_Local'>applyNoDupErr</span></a><span class='Parentheses'>) 
+</span>            <a href="execIndexing.c.html#LN314"><span class='Ref_To_Local'>checkUnique</span></a> <span class='Operator'>= </span><a href="../../include/access/genam.h.html#LN114"><span class='Ref_to_EnumConst'>UNIQUE_CHECK_PARTIAL</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN311"><span class='Ref_To_Local'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN158"><span class='Ref_to_Member'>rd_index</span></a><span class='Operator'>-&GT;</span>indimmediate<span class='Parentheses'>) 
+</span>            <a href="execIndexing.c.html#LN314"><span class='Ref_To_Local'>checkUnique</span></a> <span class='Operator'>= </span><a href="../../include/access/genam.h.html#LN113"><span class='Ref_to_EnumConst'>UNIQUE_CHECK_YES</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="execIndexing.c.html#LN314"><span class='Ref_To_Local'>checkUnique</span></a> <span class='Operator'>= </span><a href="../../include/access/genam.h.html#LN114"><span class='Ref_to_EnumConst'>UNIQUE_CHECK_PARTIAL</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="execIndexing.c.html#LN315"><span class='Ref_To_Local'>satisfiesConstraint</span></a> <span class='Operator'>= 
+</span>            <a href="../../include/access/genam.h.html#LN132"><span class='Ref_to_Proto'>index_insert</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN311"><span class='Ref_To_Local'>indexRelation</span></a><span class='Delimiter'>, </span><span class='Comment_Single_Line'>/* index relation */ 
+</span>                         <a href="execIndexing.c.html#LN285"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>,</span>    <span class='Comment_Single_Line'>/* array of index Datums */ 
+</span>                         <a href="execIndexing.c.html#LN286"><span class='Ref_To_Local'>isnull</span></a><span class='Delimiter'>,</span>    <span class='Comment_Single_Line'>/* null flags */ 
+</span>                         <a href="execIndexing.c.html#LN271"><span class='Ref_to_Parameter'>tupleid</span></a><span class='Delimiter'>,</span>       <span class='Comment_Single_Line'>/* tid of heap tuple */ 
+</span>                         <a href="execIndexing.c.html#LN282"><span class='Ref_To_Local'>heapRelation</span></a><span class='Delimiter'>,</span>  <span class='Comment_Single_Line'>/* heap relation */ 
+</span>                         <a href="execIndexing.c.html#LN314"><span class='Ref_To_Local'>checkUnique</span></a><span class='Delimiter'>,</span>   <span class='Comment_Single_Line'>/* type of uniqueness check to do */ 
+</span>                         <a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* index AM may need this */ 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If the index has an associated exclusion constraint, check that. 
+         * This is simpler than the process for uniqueness checks since we 
+         * always insert first and then check.  If the constraint is deferred, 
+         * we check now anyway, but don't throw error on violation or wait for 
+         * a conclusive outcome from a concurrent insertion; instead we'll 
+         * queue a recheck event.  Similarly, noDupErr callers (speculative 
+         * inserters) will recheck later, and wait for a conclusive outcome 
+         * then. 
+         * 
+         * An index for an exclusion constraint can't also be UNIQUE (not an 
+         * essential property, we just don't allow it in the grammar), so no 
+         * need to preserve the prior state of satisfiesConstraint. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN139"><span class='Ref_to_Member'>ii_ExclusionOps</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN410"></a>            <span class='Keyword'>bool</span>        <span class='Declare_Local'>violationOK</span><span class='Delimiter'>; 
+</span><a name="LN411"></a>            <a href="execIndexing.c.html#LN117"><span class='Ref_to_Typedef'>CEOUC_WAIT_MODE</span></a> <span class='Declare_Local'>waitMode</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN313"><span class='Ref_To_Local'>applyNoDupErr</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="execIndexing.c.html#LN410"><span class='Ref_To_Local'>violationOK</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                <a href="execIndexing.c.html#LN411"><span class='Ref_To_Local'>waitMode</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN121"><span class='Ref_to_EnumConst'>CEOUC_LIVELOCK_PREVENTING_WAIT</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execIndexing.c.html#LN311"><span class='Ref_To_Local'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN158"><span class='Ref_to_Member'>rd_index</span></a><span class='Operator'>-&GT;</span>indimmediate<span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="execIndexing.c.html#LN410"><span class='Ref_To_Local'>violationOK</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                <a href="execIndexing.c.html#LN411"><span class='Ref_To_Local'>waitMode</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN120"><span class='Ref_to_EnumConst'>CEOUC_NOWAIT</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="execIndexing.c.html#LN410"><span class='Ref_To_Local'>violationOK</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                <a href="execIndexing.c.html#LN411"><span class='Ref_To_Local'>waitMode</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN119"><span class='Ref_to_EnumConst'>CEOUC_WAIT</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <a href="execIndexing.c.html#LN315"><span class='Ref_To_Local'>satisfiesConstraint</span></a> <span class='Operator'>= 
+</span>                <a href="execIndexing.c.html#LN124"><span class='Ref_to_Proto'>check_exclusion_or_unique_constraint</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN282"><span class='Ref_To_Local'>heapRelation</span></a><span class='Delimiter'>, 
+</span>                                                     <a href="execIndexing.c.html#LN311"><span class='Ref_To_Local'>indexRelation</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Delimiter'>, 
+</span>                                                     <a href="execIndexing.c.html#LN271"><span class='Ref_to_Parameter'>tupleid</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN285"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN286"><span class='Ref_To_Local'>isnull</span></a><span class='Delimiter'>, 
+</span>                                                     <a href="execIndexing.c.html#LN272"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, 
+</span>                                                <a href="execIndexing.c.html#LN411"><span class='Ref_To_Local'>waitMode</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN410"><span class='Ref_To_Local'>violationOK</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if indexInfo-&GT;ii_Exclusi... &raquo; </span> 
+ 
+        <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="execIndexing.c.html#LN314"><span class='Ref_To_Local'>checkUnique</span></a> <span class='Operator'>== </span><a href="../../include/access/genam.h.html#LN114"><span class='Ref_to_EnumConst'>UNIQUE_CHECK_PARTIAL</span></a> <span class='Operator'>|| 
+</span>             <a href="execIndexing.c.html#LN312"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN139"><span class='Ref_to_Member'>ii_ExclusionOps</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) </span><span class='Operator'>&& 
+</span>            <span class='Operator'>!</span><a href="execIndexing.c.html#LN315"><span class='Ref_To_Local'>satisfiesConstraint</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * The tuple potentially violates the uniqueness or exclusion 
+             * constraint, so make a note of the index so that we can re-check 
+             * it later.  Speculative inserters are told if there was a 
+             * speculative conflict, since that always requires a restart. 
+             */ 
+</span>            <a href="execIndexing.c.html#LN277"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../nodes/list.c.html#LN162"><span class='Ref_to_Func'>lappend_oid</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN277"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><a href="../../include/utils/rel.h.html#LN416"><span class='Ref_to_Macro'>RelationGetRelid</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN311"><span class='Ref_To_Local'>indexRelation</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN311"><span class='Ref_To_Local'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN158"><span class='Ref_to_Member'>rd_index</span></a><span class='Operator'>-&GT;</span>indimmediate <span class='Operator'>&& </span><a href="execIndexing.c.html#LN274"><span class='Ref_to_Parameter'>specConflict</span></a><span class='Parentheses'>) 
+</span>                <span class='Operator'>*</span><a href="execIndexing.c.html#LN274"><span class='Ref_to_Parameter'>specConflict</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;numIndices;i++ &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="execIndexing.c.html#LN277"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecInsertIndexTuples &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecCheckIndexConstraints 
+ * 
+ *      This routine checks if a tuple violates any unique or 
+ *      exclusion constraints.  Returns true if there is no conflict. 
+ *      Otherwise returns false, and the TID of the conflicting 
+ *      tuple is returned in *conflictTid. 
+ * 
+ *      If 'arbiterIndexes' is given, only those indexes are checked. 
+ *      NIL means all indexes. 
+ * 
+ *      Note that this doesn't lock the values in any way, so it's 
+ *      possible that a conflicting tuple is inserted immediately 
+ *      after this returns.  But this can be used for a pre-check 
+ *      before insertion. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN474"></a><span class='Declare_Function'>ExecCheckIndexConstraints</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>slot</span><span class='Delimiter'>, 
+</span><a name="LN475"></a>                          <a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><a href="../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>conflictTid</span><span class='Delimiter'>, 
+</span><a name="LN476"></a>                          <a href="../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>arbiterIndexes</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN478"></a>    <a href="../../include/nodes/execnodes.h.html#LN369"><span class='Ref_to_Struct'>ResultRelInfo</span></a> <span class='Operator'>*</span><span class='Declare_Local'>resultRelInfo</span><span class='Delimiter'>; 
+</span><a name="LN479"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN480"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>numIndices</span><span class='Delimiter'>; 
+</span><a name="LN481"></a>    <a href="../../include/utils/relcache.h.html#LN28"><span class='Ref_to_Typedef'>RelationPtr</span></a> <span class='Declare_Local'>relationDescs</span><span class='Delimiter'>; 
+</span><a name="LN482"></a>    <a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>heapRelation</span><span class='Delimiter'>; 
+</span><a name="LN483"></a>    <a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a> <span class='Operator'>**</span><span class='Declare_Local'>indexInfoArray</span><span class='Delimiter'>; 
+</span><a name="LN484"></a>    <a href="../../include/nodes/execnodes.h.html#LN191"><span class='Ref_to_Struct'>ExprContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>econtext</span><span class='Delimiter'>; 
+</span><a name="LN485"></a>    <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Local'>values</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN45"><span class='Ref_to_Const'>INDEX_MAX_KEYS</span></a><span class='Delimiter'>]; 
+</span><a name="LN486"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>isnull</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN45"><span class='Ref_to_Const'>INDEX_MAX_KEYS</span></a><span class='Delimiter'>]; 
+</span><a name="LN487"></a>    <a href="../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Declare_Local'>invalidItemPtr</span><span class='Delimiter'>; 
+</span><a name="LN488"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>checkedIndex</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/itemptr.h.html#LN148"><span class='Ref_to_Macro'>ItemPointerSetInvalid</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN475"><span class='Ref_to_Parameter'>conflictTid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/itemptr.h.html#LN148"><span class='Ref_to_Macro'>ItemPointerSetInvalid</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execIndexing.c.html#LN487"><span class='Ref_To_Local'>invalidItemPtr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Get information from the result relation info structure. 
+     */ 
+</span>    <a href="execIndexing.c.html#LN478"><span class='Ref_To_Local'>resultRelInfo</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN475"><span class='Ref_to_Parameter'>estate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN422"><span class='Ref_to_Member'>es_result_relation_info</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN480"><span class='Ref_To_Local'>numIndices</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN478"><span class='Ref_To_Local'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN374"><span class='Ref_to_Member'>ri_NumIndices</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN481"><span class='Ref_To_Local'>relationDescs</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN478"><span class='Ref_To_Local'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN375"><span class='Ref_to_Member'>ri_IndexRelationDescs</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN483"><span class='Ref_To_Local'>indexInfoArray</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN478"><span class='Ref_To_Local'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN376"><span class='Ref_to_Member'>ri_IndexRelationInfo</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN482"><span class='Ref_To_Local'>heapRelation</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN478"><span class='Ref_To_Local'>resultRelInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN373"><span class='Ref_to_Member'>ri_RelationDesc</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We will use the EState's per-tuple context for evaluating predicates 
+     * and index expressions (creating it if it's not already there). 
+     */ 
+</span>    <a href="execIndexing.c.html#LN484"><span class='Ref_To_Local'>econtext</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN455"><span class='Ref_to_Macro'>GetPerTupleExprContext</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN475"><span class='Ref_to_Parameter'>estate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Arrange for econtext's scan tuple to be the tuple under test */ 
+</span>    <a href="execIndexing.c.html#LN484"><span class='Ref_To_Local'>econtext</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN196"><span class='Ref_to_Member'>ecxt_scantuple</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN474"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * For each index, form index tuple and check if it satisfies the 
+     * constraint. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN479"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN479"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execIndexing.c.html#LN480"><span class='Ref_To_Local'>numIndices</span></a><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN479"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN517"></a>        <a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>indexRelation</span> <span class='Operator'>= </span><a href="execIndexing.c.html#LN481"><span class='Ref_To_Local'>relationDescs</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN479"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span><a name="LN518"></a>        <a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>indexInfo</span><span class='Delimiter'>; 
+</span><a name="LN519"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>satisfiesConstraint</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN517"><span class='Ref_To_Local'>indexRelation</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN483"><span class='Ref_To_Local'>indexInfoArray</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN479"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN145"><span class='Ref_to_Member'>ii_Unique</span></a> <span class='Operator'>&& !</span><a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN139"><span class='Ref_to_Member'>ii_ExclusionOps</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If the index is marked as read-only, ignore it */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN146"><span class='Ref_to_Member'>ii_ReadyForInserts</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* When specific arbiter indexes requested, only examine them */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN476"><span class='Ref_to_Parameter'>arbiterIndexes</span></a> <span class='Operator'>!= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a> <span class='Operator'>&& 
+</span>            <span class='Operator'>!</span><a href="../../include/nodes/pg_list.h.html#LN231"><span class='Ref_to_Proto'>list_member_oid</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN476"><span class='Ref_to_Parameter'>arbiterIndexes</span></a><span class='Delimiter'>, 
+</span>                             <a href="execIndexing.c.html#LN517"><span class='Ref_To_Local'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN158"><span class='Ref_to_Member'>rd_index</span></a><span class='Operator'>-&GT;</span>indexrelid<span class='Parentheses'>))</span> 
+            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execIndexing.c.html#LN517"><span class='Ref_To_Local'>indexRelation</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN158"><span class='Ref_to_Member'>rd_index</span></a><span class='Operator'>-&GT;</span>indimmediate<span class='Parentheses'>) 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../../include/utils/relcache.h.html#LN79"><span class='Ref_to_Proto'>errtableconstraint</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN482"><span class='Ref_To_Local'>heapRelation</span></a><span class='Delimiter'>, 
+</span>                                   <a href="../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN517"><span class='Ref_To_Local'>indexRelation</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span> 
+        <a href="execIndexing.c.html#LN488"><span class='Ref_To_Local'>checkedIndex</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Check for partial index */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN137"><span class='Ref_to_Member'>ii_Predicate</span></a> <span class='Operator'>!= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN551"></a>            <a href="../../include/nodes/execnodes.h.html#LN52"><span class='Ref_to_Struct'>ExprState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>predicate</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * If predicate state not set up yet, create it (in the estate's 
+             * per-query context) 
+             */ 
+</span>            <a href="execIndexing.c.html#LN551"><span class='Ref_To_Local'>predicate</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN138"><span class='Ref_to_Member'>ii_PredicateState</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN551"><span class='Ref_To_Local'>predicate</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="execIndexing.c.html#LN551"><span class='Ref_To_Local'>predicate</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN247"><span class='Ref_to_Proto'>ExecPrepareQual</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN137"><span class='Ref_to_Member'>ii_Predicate</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN475"><span class='Ref_to_Parameter'>estate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN138"><span class='Ref_to_Member'>ii_PredicateState</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN551"><span class='Ref_To_Local'>predicate</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* Skip this index-update if the predicate isn't satisfied */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/executor/executor.h.html#LN344"><span class='Ref_to_Func'>ExecQual</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN551"><span class='Ref_To_Local'>predicate</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN484"><span class='Ref_To_Local'>econtext</span></a><span class='Parentheses'>))</span> 
+                <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * FormIndexDatum fills in its values and isnull parameters with the 
+         * appropriate values for the column(s) of the index. 
+         */ 
+</span>        <a href="../../include/catalog/index.h.html#LN85"><span class='Ref_to_Proto'>FormIndexDatum</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a><span class='Delimiter'>, 
+</span>                       <a href="execIndexing.c.html#LN474"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>, 
+</span>                       <a href="execIndexing.c.html#LN475"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, 
+</span>                       <a href="execIndexing.c.html#LN485"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>, 
+</span>                       <a href="execIndexing.c.html#LN486"><span class='Ref_To_Local'>isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="execIndexing.c.html#LN519"><span class='Ref_To_Local'>satisfiesConstraint</span></a> <span class='Operator'>= 
+</span>            <a href="execIndexing.c.html#LN124"><span class='Ref_to_Proto'>check_exclusion_or_unique_constraint</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN482"><span class='Ref_To_Local'>heapRelation</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN517"><span class='Ref_To_Local'>indexRelation</span></a><span class='Delimiter'>, 
+</span>                                                 <a href="execIndexing.c.html#LN518"><span class='Ref_To_Local'>indexInfo</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execIndexing.c.html#LN487"><span class='Ref_To_Local'>invalidItemPtr</span></a><span class='Delimiter'>, 
+</span>                                               <a href="execIndexing.c.html#LN485"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN486"><span class='Ref_To_Local'>isnull</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN475"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, 
+</span>                                                 <a href="execIndexing.c.html#LN119"><span class='Ref_to_EnumConst'>CEOUC_WAIT</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, 
+</span>                                                 <a href="execIndexing.c.html#LN475"><span class='Ref_to_Parameter'>conflictTid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execIndexing.c.html#LN519"><span class='Ref_To_Local'>satisfiesConstraint</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;numIndices;i++ &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN476"><span class='Ref_to_Parameter'>arbiterIndexes</span></a> <span class='Operator'>!= </span><a href="../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a> <span class='Operator'>&& !</span><a href="execIndexing.c.html#LN488"><span class='Ref_To_Local'>checkedIndex</span></a><span class='Parentheses'>) 
+</span>        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unexpected failure to find arbiter index"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecCheckIndexConstraints &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Check for violation of an exclusion or unique constraint 
+ * 
+ * heap: the table containing the new tuple 
+ * index: the index supporting the constraint 
+ * indexInfo: info about the index, including the exclusion properties 
+ * tupleid: heap TID of the new tuple we have just inserted (invalid if we 
+ *      haven't inserted a new tuple yet) 
+ * values, isnull: the *index* column values computed for the new tuple 
+ * estate: an EState we can do evaluation in 
+ * newIndex: if true, we are trying to build a new index (this affects 
+ *      only the wording of error messages) 
+ * waitMode: whether to wait for concurrent inserters/deleters 
+ * violationOK: if true, don't throw error for violation 
+ * conflictTid: if not-NULL, the TID of the conflicting tuple is returned here 
+ * 
+ * Returns true if OK, false if actual or potential violation 
+ * 
+ * 'waitMode' determines what happens if a conflict is detected with a tuple 
+ * that was inserted or deleted by a transaction that's still running. 
+ * CEOUC_WAIT means that we wait for the transaction to commit, before 
+ * throwing an error or returning.  CEOUC_NOWAIT means that we report the 
+ * violation immediately; so the violation is only potential, and the caller 
+ * must recheck sometime later.  This behavior is convenient for deferred 
+ * exclusion checks; we need not bother queuing a deferred event if there is 
+ * definitely no conflict at insertion time. 
+ * 
+ * CEOUC_LIVELOCK_PREVENTING_WAIT is like CEOUC_NOWAIT, but we will sometimes 
+ * wait anyway, to prevent livelocking if two transactions try inserting at 
+ * the same time.  This is used with speculative insertions, for INSERT ON 
+ * CONFLICT statements. (See notes in file header) 
+ * 
+ * If violationOK is true, we just report the potential or actual violation to 
+ * the caller by returning 'false'.  Otherwise we throw a descriptive error 
+ * message here.  When violationOK is false, a false result is impossible. 
+ * 
+ * Note: The indexam is normally responsible for checking unique constraints, 
+ * so this normally only needs to be used for exclusion constraints.  But this 
+ * function is also called when doing a "pre-check" for conflicts on a unique 
+ * constraint, when doing speculative insertion.  Caller may use the returned 
+ * conflict TID to take further steps. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN638"></a><span class='Declare_Function'>check_exclusion_or_unique_constraint</span><span class='Parentheses'>(</span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>heap</span><span class='Delimiter'>, </span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>index</span><span class='Delimiter'>, 
+</span><a name="LN639"></a>                                     <a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>indexInfo</span><span class='Delimiter'>, 
+</span><a name="LN640"></a>                                     <a href="../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>tupleid</span><span class='Delimiter'>, 
+</span><a name="LN641"></a>                                     <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>values</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>isnull</span><span class='Delimiter'>, 
+</span><a name="LN642"></a>                                     <a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>newIndex</span><span class='Delimiter'>, 
+</span><a name="LN643"></a>                                     <a href="execIndexing.c.html#LN117"><span class='Ref_to_Typedef'>CEOUC_WAIT_MODE</span></a> <span class='Declare_Parameter'>waitMode</span><span class='Delimiter'>, 
+</span><a name="LN644"></a>                                     <span class='Keyword'>bool </span><span class='Declare_Parameter'>violationOK</span><span class='Delimiter'>, 
+</span><a name="LN645"></a>                                     <a href="../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>conflictTid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN647"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>        <span class='Operator'>*</span><span class='Declare_Local'>constr_procs</span><span class='Delimiter'>; 
+</span><a name="LN648"></a>    <a href="../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>constr_strats</span><span class='Delimiter'>; 
+</span><a name="LN649"></a>    <a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>        <span class='Operator'>*</span><span class='Declare_Local'>index_collations</span> <span class='Operator'>= </span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN192"><span class='Ref_to_Member'>rd_indcollation</span></a><span class='Delimiter'>; 
+</span><a name="LN650"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>index_natts</span> <span class='Operator'>= </span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN158"><span class='Ref_to_Member'>rd_index</span></a><span class='Operator'>-&GT;</span>indnatts<span class='Delimiter'>; 
+</span><a name="LN651"></a>    <a href="../../include/access/genam.h.html#LN85"><span class='Ref_to_Typedef'>IndexScanDesc</span></a> <span class='Declare_Local'>index_scan</span><span class='Delimiter'>; 
+</span><a name="LN652"></a>    <a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>tup</span><span class='Delimiter'>; 
+</span><a name="LN653"></a>    <a href="../../include/access/skey.h.html#LN63"><span class='Ref_to_Struct'>ScanKeyData</span></a> <span class='Declare_Local'>scankeys</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN45"><span class='Ref_to_Const'>INDEX_MAX_KEYS</span></a><span class='Delimiter'>]; 
+</span><a name="LN654"></a>    <a href="../../include/utils/snapshot.h.html#LN51"><span class='Ref_to_Struct'>SnapshotData</span></a> <span class='Declare_Local'>DirtySnapshot</span><span class='Delimiter'>; 
+</span><a name="LN655"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN656"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>conflict</span><span class='Delimiter'>; 
+</span><a name="LN657"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found_self</span><span class='Delimiter'>; 
+</span><a name="LN658"></a>    <a href="../../include/nodes/execnodes.h.html#LN191"><span class='Ref_to_Struct'>ExprContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>econtext</span><span class='Delimiter'>; 
+</span><a name="LN659"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>existing_slot</span><span class='Delimiter'>; 
+</span><a name="LN660"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>save_scantuple</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN639"><span class='Ref_to_Parameter'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN139"><span class='Ref_to_Member'>ii_ExclusionOps</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="execIndexing.c.html#LN647"><span class='Ref_To_Local'>constr_procs</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN639"><span class='Ref_to_Parameter'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN140"><span class='Ref_to_Member'>ii_ExclusionProcs</span></a><span class='Delimiter'>; 
+</span>        <a href="execIndexing.c.html#LN648"><span class='Ref_To_Local'>constr_strats</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN639"><span class='Ref_to_Parameter'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN141"><span class='Ref_to_Member'>ii_ExclusionStrats</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="execIndexing.c.html#LN647"><span class='Ref_To_Local'>constr_procs</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN639"><span class='Ref_to_Parameter'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN143"><span class='Ref_to_Member'>ii_UniqueProcs</span></a><span class='Delimiter'>; 
+</span>        <a href="execIndexing.c.html#LN648"><span class='Ref_To_Local'>constr_strats</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN639"><span class='Ref_to_Parameter'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN144"><span class='Ref_to_Member'>ii_UniqueStrats</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If any of the input values are NULL, the constraint check is assumed to 
+     * pass (i.e., we assume the operators are strict). 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execIndexing.c.html#LN650"><span class='Ref_To_Local'>index_natts</span></a><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN641"><span class='Ref_to_Parameter'>isnull</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Search the tuples that are in the index for any violations, including 
+     * tuples that aren't visible yet. 
+     */ 
+</span>    <a href="../../include/utils/tqual.h.html#LN99"><span class='Ref_to_Macro'>InitDirtySnapshot</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN654"><span class='Ref_To_Local'>DirtySnapshot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execIndexing.c.html#LN650"><span class='Ref_To_Local'>index_natts</span></a><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../access/common/scankey.c.html#LN30"><span class='Ref_to_Func'>ScanKeyEntryInitialize</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="execIndexing.c.html#LN653"><span class='Ref_To_Local'>scankeys</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                               <span class='Number'>0</span><span class='Delimiter'>, 
+</span>                               <a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>, 
+</span>                               <a href="execIndexing.c.html#LN648"><span class='Ref_To_Local'>constr_strats</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                               <a href="../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>, 
+</span>                               <a href="execIndexing.c.html#LN649"><span class='Ref_To_Local'>index_collations</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                               <a href="execIndexing.c.html#LN647"><span class='Ref_To_Local'>constr_procs</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                               <a href="execIndexing.c.html#LN641"><span class='Ref_to_Parameter'>values</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN655"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Need a TupleTableSlot to put existing tuples in. 
+     * 
+     * To use FormIndexDatum, we have to make the econtext's scantuple point 
+     * to this slot.  Be sure to save and restore caller's value for 
+     * scantuple. 
+     */ 
+</span>    <a href="execIndexing.c.html#LN659"><span class='Ref_To_Local'>existing_slot</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN144"><span class='Ref_to_Proto'>MakeSingleTupleTableSlot</span></a><span class='Parentheses'>(</span><a href="../../include/utils/rel.h.html#LN428"><span class='Ref_to_Macro'>RelationGetDescr</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>heap</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="execIndexing.c.html#LN658"><span class='Ref_To_Local'>econtext</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN455"><span class='Ref_to_Macro'>GetPerTupleExprContext</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN642"><span class='Ref_to_Parameter'>estate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN660"><span class='Ref_To_Local'>save_scantuple</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN658"><span class='Ref_To_Local'>econtext</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN196"><span class='Ref_to_Member'>ecxt_scantuple</span></a><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN658"><span class='Ref_To_Local'>econtext</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN196"><span class='Ref_to_Member'>ecxt_scantuple</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN659"><span class='Ref_To_Local'>existing_slot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * May have to restart scan from this point if a potential conflict is 
+     * found. 
+     */ 
+</span><a name="LN718"></a><span class='Label'>retry</span><span class='Operator'>: 
+</span>    <a href="execIndexing.c.html#LN656"><span class='Ref_To_Local'>conflict</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN657"><span class='Ref_To_Local'>found_self</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="execIndexing.c.html#LN651"><span class='Ref_To_Local'>index_scan</span></a> <span class='Operator'>= </span><a href="../../include/access/genam.h.html#LN139"><span class='Ref_to_Proto'>index_beginscan</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>heap</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execIndexing.c.html#LN654"><span class='Ref_To_Local'>DirtySnapshot</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN650"><span class='Ref_To_Local'>index_natts</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/access/genam.h.html#LN146"><span class='Ref_to_Proto'>index_rescan</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN651"><span class='Ref_To_Local'>index_scan</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN653"><span class='Ref_To_Local'>scankeys</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN650"><span class='Ref_To_Local'>index_natts</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="execIndexing.c.html#LN652"><span class='Ref_To_Local'>tup</span></a> <span class='Operator'>= </span><a href="../../include/access/genam.h.html#LN162"><span class='Ref_to_Proto'>index_getnext</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN651"><span class='Ref_To_Local'>index_scan</span></a><span class='Delimiter'>, 
+</span>                                <a href="../../include/access/sdir.h.html#LN25"><span class='Ref_to_EnumConst'>ForwardScanDirection</span></a><span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN727"></a>        <a href="../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xwait</span><span class='Delimiter'>; 
+</span><a name="LN728"></a>        <a href="../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Declare_Local'>ctid_wait</span><span class='Delimiter'>; 
+</span><a name="LN729"></a>        <a href="../../include/storage/lmgr.h.html#LN23"><span class='Ref_to_Enum'>XLTW_Oper</span></a>   <span class='Declare_Local'>reason_wait</span><span class='Delimiter'>; 
+</span><a name="LN730"></a>        <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Local'>existing_values</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN45"><span class='Ref_to_Const'>INDEX_MAX_KEYS</span></a><span class='Delimiter'>]; 
+</span><a name="LN731"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>existing_isnull</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN45"><span class='Ref_to_Const'>INDEX_MAX_KEYS</span></a><span class='Delimiter'>]; 
+</span><a name="LN732"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>error_new</span><span class='Delimiter'>; 
+</span><a name="LN733"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>error_existing</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Ignore the entry for the tuple we're trying to check. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN640"><span class='Ref_to_Parameter'>tupleid</span></a><span class='Parentheses'>) </span><span class='Operator'>&& 
+</span>            <a href="../storage/page/itemptr.c.html#LN27"><span class='Ref_to_Func'>ItemPointerEquals</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN640"><span class='Ref_to_Parameter'>tupleid</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execIndexing.c.html#LN652"><span class='Ref_To_Local'>tup</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/htup.h.html#LN64"><span class='Ref_to_Member'>t_self</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN657"><span class='Ref_To_Local'>found_self</span></a><span class='Parentheses'>)</span>     <span class='Comment_Single_Line'>/* should not happen */ 
+</span>                <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"found self tuple multiple times in index \"%s\""</span><span class='Delimiter'>, 
+</span>                     <a href="../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="execIndexing.c.html#LN657"><span class='Ref_To_Local'>found_self</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Extract the index column values and isnull flags from the existing 
+         * tuple. 
+         */ 
+</span>        <a href="../../include/executor/tuptable.h.html#LN147"><span class='Ref_to_Proto'>ExecStoreTuple</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN652"><span class='Ref_To_Local'>tup</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN659"><span class='Ref_To_Local'>existing_slot</span></a><span class='Delimiter'>, </span><a href="../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/catalog/index.h.html#LN85"><span class='Ref_to_Proto'>FormIndexDatum</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN639"><span class='Ref_to_Parameter'>indexInfo</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN659"><span class='Ref_To_Local'>existing_slot</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN642"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, 
+</span>                       <a href="execIndexing.c.html#LN730"><span class='Ref_To_Local'>existing_values</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN731"><span class='Ref_To_Local'>existing_isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If lossy indexscan, must recheck the condition */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN651"><span class='Ref_To_Local'>index_scan</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/relscan.h.html#LN121"><span class='Ref_to_Member'>xs_recheck</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execIndexing.c.html#LN133"><span class='Ref_to_Proto'>index_recheck_constraint</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Delimiter'>, 
+</span>                                          <a href="execIndexing.c.html#LN647"><span class='Ref_To_Local'>constr_procs</span></a><span class='Delimiter'>, 
+</span>                                          <a href="execIndexing.c.html#LN730"><span class='Ref_To_Local'>existing_values</span></a><span class='Delimiter'>, 
+</span>                                          <a href="execIndexing.c.html#LN731"><span class='Ref_To_Local'>existing_isnull</span></a><span class='Delimiter'>, 
+</span>                                          <a href="execIndexing.c.html#LN641"><span class='Ref_to_Parameter'>values</span></a><span class='Parentheses'>))</span> 
+                <span class='Control'>continue</span><span class='Delimiter'>;</span>       <span class='Comment_Multi_Line'>/* tuple doesn't actually match, so no 
+                                 * conflict */ 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * At this point we have either a conflict or a potential conflict. 
+         * 
+         * If an in-progress transaction is affecting the visibility of this 
+         * tuple, we need to wait for it to complete and then recheck (unless 
+         * the caller requested not to).  For simplicity we do rechecking by 
+         * just restarting the whole scan --- this case probably doesn't 
+         * happen often enough to be worth trying harder, and anyway we don't 
+         * want to hold any index internal locks while waiting. 
+         */ 
+</span>        <a href="execIndexing.c.html#LN727"><span class='Ref_To_Local'>xwait</span></a> <span class='Operator'>= </span><a href="../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN654"><span class='Ref_To_Local'>DirtySnapshot</span></a><span class='Operator'>.</span><a href="../../include/utils/snapshot.h.html#LN65"><span class='Ref_to_Member'>xmin</span></a><span class='Parentheses'>) </span><span class='Operator'>? 
+</span>            <a href="execIndexing.c.html#LN654"><span class='Ref_To_Local'>DirtySnapshot</span></a><span class='Operator'>.</span><a href="../../include/utils/snapshot.h.html#LN65"><span class='Ref_to_Member'>xmin</span></a> <span class='Operator'>: </span><a href="execIndexing.c.html#LN654"><span class='Ref_To_Local'>DirtySnapshot</span></a><span class='Operator'>.</span><a href="../../include/utils/snapshot.h.html#LN66"><span class='Ref_to_Member'>xmax</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN727"><span class='Ref_To_Local'>xwait</span></a><span class='Parentheses'>)</span> <span class='Operator'>&& 
+</span>            <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN643"><span class='Ref_to_Parameter'>waitMode</span></a> <span class='Operator'>== </span><a href="execIndexing.c.html#LN119"><span class='Ref_to_EnumConst'>CEOUC_WAIT</span></a> <span class='Operator'>|| 
+</span>             <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN643"><span class='Ref_to_Parameter'>waitMode</span></a> <span class='Operator'>== </span><a href="execIndexing.c.html#LN121"><span class='Ref_to_EnumConst'>CEOUC_LIVELOCK_PREVENTING_WAIT</span></a> <span class='Operator'>&& 
+</span>              <a href="execIndexing.c.html#LN654"><span class='Ref_To_Local'>DirtySnapshot</span></a><span class='Operator'>.</span><a href="../../include/utils/snapshot.h.html#LN101"><span class='Ref_to_Member'>speculativeToken</span></a> <span class='Operator'>&& 
+</span>              <a href="../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="../../include/access/xact.h.html#LN333"><span class='Ref_to_Proto'>GetCurrentTransactionId</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN727"><span class='Ref_To_Local'>xwait</span></a><span class='Parentheses'>))))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="execIndexing.c.html#LN728"><span class='Ref_To_Local'>ctid_wait</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN652"><span class='Ref_To_Local'>tup</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/htup.h.html#LN66"><span class='Ref_to_Member'>t_data</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/htup_details.h.html#LN149"><span class='Ref_to_Member'>t_ctid</span></a><span class='Delimiter'>; 
+</span>            <a href="execIndexing.c.html#LN729"><span class='Ref_To_Local'>reason_wait</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN639"><span class='Ref_to_Parameter'>indexInfo</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN139"><span class='Ref_to_Member'>ii_ExclusionOps</span></a> <span class='Operator'>? 
+</span>                <a href="../../include/storage/lmgr.h.html#LN33"><span class='Ref_to_EnumConst'>XLTW_RecheckExclusionConstr</span></a> <span class='Operator'>: </span><a href="../../include/storage/lmgr.h.html#LN30"><span class='Ref_to_EnumConst'>XLTW_InsertIndex</span></a><span class='Delimiter'>; 
+</span>            <a href="../../include/access/genam.h.html#LN149"><span class='Ref_to_Proto'>index_endscan</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN651"><span class='Ref_To_Local'>index_scan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN654"><span class='Ref_To_Local'>DirtySnapshot</span></a><span class='Operator'>.</span><a href="../../include/utils/snapshot.h.html#LN101"><span class='Ref_to_Member'>speculativeToken</span></a><span class='Parentheses'>) 
+</span>                <a href="../../include/storage/lmgr.h.html#LN84"><span class='Ref_to_Proto'>SpeculativeInsertionWait</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN654"><span class='Ref_To_Local'>DirtySnapshot</span></a><span class='Operator'>.</span><a href="../../include/utils/snapshot.h.html#LN65"><span class='Ref_to_Member'>xmin</span></a><span class='Delimiter'>, 
+</span>                                         <a href="execIndexing.c.html#LN654"><span class='Ref_To_Local'>DirtySnapshot</span></a><span class='Operator'>.</span><a href="../../include/utils/snapshot.h.html#LN101"><span class='Ref_to_Member'>speculativeToken</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="../../include/storage/lmgr.h.html#LN73"><span class='Ref_to_Proto'>XactLockTableWait</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN727"><span class='Ref_To_Local'>xwait</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>heap</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="execIndexing.c.html#LN728"><span class='Ref_To_Local'>ctid_wait</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN729"><span class='Ref_To_Local'>reason_wait</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>goto</span> <span class='Symbol_Characters'>&uarr;</span><a href="execIndexing.c.html#LN718"><span class='Ref_to_Label'>retry</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * We have a definite conflict (or a potential one, but the caller 
+         * didn't want to wait).  Return it to caller, or report it. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN644"><span class='Ref_to_Parameter'>violationOK</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="execIndexing.c.html#LN656"><span class='Ref_To_Local'>conflict</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN645"><span class='Ref_to_Parameter'>conflictTid</span></a><span class='Parentheses'>) 
+</span>                <span class='Operator'>*</span><a href="execIndexing.c.html#LN645"><span class='Ref_to_Parameter'>conflictTid</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN652"><span class='Ref_To_Local'>tup</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/htup.h.html#LN64"><span class='Ref_to_Member'>t_self</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="execIndexing.c.html#LN732"><span class='Ref_To_Local'>error_new</span></a> <span class='Operator'>= </span><a href="../access/index/genam.c.html#LN175"><span class='Ref_to_Func'>BuildIndexValueDescription</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN641"><span class='Ref_to_Parameter'>values</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN641"><span class='Ref_to_Parameter'>isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="execIndexing.c.html#LN733"><span class='Ref_To_Local'>error_existing</span></a> <span class='Operator'>= </span><a href="../access/index/genam.c.html#LN175"><span class='Ref_to_Func'>BuildIndexValueDescription</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN730"><span class='Ref_To_Local'>existing_values</span></a><span class='Delimiter'>, 
+</span>                                                    <a href="execIndexing.c.html#LN731"><span class='Ref_To_Local'>existing_isnull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN642"><span class='Ref_to_Parameter'>newIndex</span></a><span class='Parentheses'>) 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_EXCLUSION_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not create exclusion constraint \"%s\""</span><span class='Delimiter'>, 
+</span>                            <a href="../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Parentheses'>))</span><span class='Delimiter'>, 
+</span>                     <a href="execIndexing.c.html#LN732"><span class='Ref_To_Local'>error_new</span></a> <span class='Operator'>&& </span><a href="execIndexing.c.html#LN733"><span class='Ref_To_Local'>error_existing</span></a> <span class='Operator'>? 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Key %s conflicts with key %s."</span><span class='Delimiter'>, 
+</span>                               <a href="execIndexing.c.html#LN732"><span class='Ref_To_Local'>error_new</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN733"><span class='Ref_To_Local'>error_existing</span></a><span class='Parentheses'>)</span> <span class='Operator'>: 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Key conflicts exist."</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../../include/utils/relcache.h.html#LN79"><span class='Ref_to_Proto'>errtableconstraint</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>heap</span></a><span class='Delimiter'>, 
+</span>                                        <a href="../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_EXCLUSION_VIOLATION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"conflicting key value violates exclusion constraint \"%s\""</span><span class='Delimiter'>, 
+</span>                            <a href="../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Parentheses'>))</span><span class='Delimiter'>, 
+</span>                     <a href="execIndexing.c.html#LN732"><span class='Ref_To_Local'>error_new</span></a> <span class='Operator'>&& </span><a href="execIndexing.c.html#LN733"><span class='Ref_To_Local'>error_existing</span></a> <span class='Operator'>? 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Key %s conflicts with existing key %s."</span><span class='Delimiter'>, 
+</span>                               <a href="execIndexing.c.html#LN732"><span class='Ref_To_Local'>error_new</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN733"><span class='Ref_To_Local'>error_existing</span></a><span class='Parentheses'>)</span> <span class='Operator'>: 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Key conflicts with existing key."</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../../include/utils/relcache.h.html#LN79"><span class='Ref_to_Proto'>errtableconstraint</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>heap</span></a><span class='Delimiter'>, 
+</span>                                        <a href="../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN638"><span class='Ref_to_Parameter'>index</span></a><span class='Parentheses'>))))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while (tup=index_getnext(in... &raquo; </span> 
+ 
+    <a href="../../include/access/genam.h.html#LN149"><span class='Ref_to_Proto'>index_endscan</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN651"><span class='Ref_To_Local'>index_scan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Ordinarily, at this point the search should have found the originally 
+     * inserted tuple (if any), unless we exited the loop early because of 
+     * conflict.  However, it is possible to define exclusion constraints for 
+     * which that wouldn't be true --- for instance, if the operator is &LT;&GT;. So 
+     * we no longer complain if found_self is still false. 
+     */ 
+</span> 
+    <a href="execIndexing.c.html#LN658"><span class='Ref_To_Local'>econtext</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN196"><span class='Ref_to_Member'>ecxt_scantuple</span></a> <span class='Operator'>= </span><a href="execIndexing.c.html#LN660"><span class='Ref_To_Local'>save_scantuple</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/executor/tuptable.h.html#LN145"><span class='Ref_to_Proto'>ExecDropSingleTupleTableSlot</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN659"><span class='Ref_To_Local'>existing_slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Operator'>!</span><a href="execIndexing.c.html#LN656"><span class='Ref_To_Local'>conflict</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end check_exclusion_or_unique_constraint &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Check for violation of an exclusion constraint 
+ * 
+ * This is a dumbed down version of check_exclusion_or_unique_constraint 
+ * for external callers. They don't need all the special modes. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN862"></a><span class='Declare_Function'>check_exclusion_constraint</span><span class='Parentheses'>(</span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>heap</span><span class='Delimiter'>, </span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>index</span><span class='Delimiter'>, 
+</span><a name="LN863"></a>                           <a href="../../include/nodes/execnodes.h.html#LN130"><span class='Ref_to_Struct'>IndexInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>indexInfo</span><span class='Delimiter'>, 
+</span><a name="LN864"></a>                           <a href="../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>tupleid</span><span class='Delimiter'>, 
+</span><a name="LN865"></a>                           <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>values</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>isnull</span><span class='Delimiter'>, 
+</span><a name="LN866"></a>                           <a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>newIndex</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="execIndexing.c.html#LN124"><span class='Ref_to_Proto'>check_exclusion_or_unique_constraint</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN862"><span class='Ref_to_Parameter'>heap</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN862"><span class='Ref_to_Parameter'>index</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN863"><span class='Ref_to_Parameter'>indexInfo</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN864"><span class='Ref_to_Parameter'>tupleid</span></a><span class='Delimiter'>, 
+</span>                                                <a href="execIndexing.c.html#LN865"><span class='Ref_to_Parameter'>values</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN865"><span class='Ref_to_Parameter'>isnull</span></a><span class='Delimiter'>, 
+</span>                                                <a href="execIndexing.c.html#LN866"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="execIndexing.c.html#LN866"><span class='Ref_to_Parameter'>newIndex</span></a><span class='Delimiter'>, 
+</span>                                                <a href="execIndexing.c.html#LN119"><span class='Ref_to_EnumConst'>CEOUC_WAIT</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Check existing tuple's index values to see if it really matches the 
+ * exclusion condition against the new_values.  Returns true if conflict. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN879"></a><span class='Declare_Function'>index_recheck_constraint</span><span class='Parentheses'>(</span><a href="../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>index</span><span class='Delimiter'>, </span><a href="../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>constr_procs</span><span class='Delimiter'>, 
+</span><a name="LN880"></a>                         <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>existing_values</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>existing_isnull</span><span class='Delimiter'>, 
+</span><a name="LN881"></a>                         <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>new_values</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN883"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>index_natts</span> <span class='Operator'>= </span><a href="execIndexing.c.html#LN879"><span class='Ref_to_Parameter'>index</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN158"><span class='Ref_to_Member'>rd_index</span></a><span class='Operator'>-&GT;</span>indnatts<span class='Delimiter'>; 
+</span><a name="LN884"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN884"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN884"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="execIndexing.c.html#LN883"><span class='Ref_To_Local'>index_natts</span></a><span class='Delimiter'>; </span><a href="execIndexing.c.html#LN884"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Assume the exclusion operators are strict */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="execIndexing.c.html#LN880"><span class='Ref_to_Parameter'>existing_isnull</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN884"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/postgres.h.html#LN398"><span class='Ref_to_Macro'>DatumGetBool</span></a><span class='Parentheses'>(</span><a href="../../include/fmgr.h.html#LN550"><span class='Ref_to_Proto'>OidFunctionCall2Coll</span></a><span class='Parentheses'>(</span><a href="execIndexing.c.html#LN879"><span class='Ref_to_Parameter'>constr_procs</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN884"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                                               <a href="execIndexing.c.html#LN879"><span class='Ref_to_Parameter'>index</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/rel.h.html#LN192"><span class='Ref_to_Member'>rd_indcollation</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN884"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                                               <a href="execIndexing.c.html#LN880"><span class='Ref_to_Parameter'>existing_values</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN884"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                                               <a href="execIndexing.c.html#LN881"><span class='Ref_to_Parameter'>new_values</span></a><span class='Delimiter'>[</span><a href="execIndexing.c.html#LN884"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)))</span> 
+            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end index_recheck_constraint &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

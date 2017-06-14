@@ -1,0 +1,1419 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\postmaster\checkpointer.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\postmaster\checkpointer.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:45 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * checkpointer.c 
+ * 
+ * The checkpointer is new as of Postgres 9.2.  It handles all checkpoints. 
+ * Checkpoints are automatically dispatched after a certain amount of time has 
+ * elapsed since the last one, and it can be signaled to perform requested 
+ * checkpoints as well.  (The GUC parameter that mandates a checkpoint every 
+ * so many WAL segments is implemented by having backends signal when they 
+ * fill WAL segments; the checkpointer itself doesn't watch for the 
+ * condition.) 
+ * 
+ * The checkpointer is started by the postmaster as soon as the startup 
+ * subprocess finishes, or as soon as recovery begins if we are doing archive 
+ * recovery.  It remains alive until the postmaster commands it to terminate. 
+ * Normal termination is by SIGUSR2, which instructs the checkpointer to 
+ * execute a shutdown checkpoint and then exit(0).  (All backends must be 
+ * stopped before SIGUSR2 is issued!)  Emergency termination is by SIGQUIT; 
+ * like any backend, the checkpointer will simply abort and exit on SIGQUIT. 
+ * 
+ * If the checkpointer exits unexpectedly, the postmaster treats that the same 
+ * as a backend crash: shared memory may be corrupted, so remaining backends 
+ * should be killed by SIGQUIT and then a recovery cycle started.  (Even if 
+ * shared memory isn't corrupted, we have lost information about which 
+ * files need to be fsync'd for the next checkpoint, and so a system 
+ * restart needs to be forced.) 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/postmaster/checkpointer.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;signal.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/time.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;time.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog_internal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"libpq/pqsignal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/bgwriter.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/syncrep.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/bufmgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/condition_variable.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/fd.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/smgr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/spin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/guc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/resowner.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/*---------- 
+ * Shared memory area for communication between checkpointer and backends 
+ * 
+ * The ckpt counters allow backends to watch for completion of a checkpoint 
+ * request they send.  Here's how it works: 
+ *  * At start of a checkpoint, checkpointer reads (and clears) the request 
+ *    flags and increments ckpt_started, while holding ckpt_lck. 
+ *  * On completion of a checkpoint, checkpointer sets ckpt_done to 
+ *    equal ckpt_started. 
+ *  * On failure of a checkpoint, checkpointer increments ckpt_failed 
+ *    and sets ckpt_done to equal ckpt_started. 
+ * 
+ * The algorithm for backends is: 
+ *  1. Record current values of ckpt_failed and ckpt_started, and 
+ *     set request flags, while holding ckpt_lck. 
+ *  2. Send signal to request checkpoint. 
+ *  3. Sleep until ckpt_started changes.  Now you know a checkpoint has 
+ *     begun since you started this algorithm (although *not* that it was 
+ *     specifically initiated by your signal), and that it is using your flags. 
+ *  4. Record new value of ckpt_started. 
+ *  5. Sleep until ckpt_done &GT;= saved value of ckpt_started.  (Use modulo 
+ *     arithmetic here in case counters wrap around.)  Now you know a 
+ *     checkpoint has started and completed, but not whether it was 
+ *     successful. 
+ *  6. If ckpt_failed is different from the originally saved value, 
+ *     assume request failed; otherwise it was definitely successful. 
+ * 
+ * ckpt_flags holds the OR of the checkpoint request flags sent by all 
+ * requesting backends since the last checkpoint start.  The flags are 
+ * chosen so that OR'ing is the correct way to combine multiple requests. 
+ * 
+ * num_backend_writes is used to count the number of buffer writes performed 
+ * by user backend processes.  This counter should be wide enough that it 
+ * can't overflow during a single processing cycle.  num_backend_fsync 
+ * counts the subset of those writes that also had to do their own fsync, 
+ * because the checkpointer failed to absorb their request. 
+ * 
+ * The requests array holds fsync requests sent by backends and not yet 
+ * absorbed by the checkpointer. 
+ * 
+ * Unlike the checkpoint fields, num_backend_writes, num_backend_fsync, and 
+ * the requests fields are protected by CheckpointerCommLock. 
+ *---------- 
+ */ 
+</span><span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN110"></a>    <a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Member'>rnode</span><span class='Delimiter'>; 
+</span><a name="LN111"></a>    <a href="../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a>  <span class='Declare_Member'>forknum</span><span class='Delimiter'>; 
+</span><a name="LN112"></a>    <a href="../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Member'>segno</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* see md.c for special values */ 
+</span>    <span class='Comment_Multi_Line'>/* might add a real request-type field later; not needed yet */ 
+</span><a name="LN114"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>CheckpointerRequest</span><span class='Delimiter'>; 
+</span> 
+<span class='Control'>typedef</span> <span class='Control'>struct</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN118"></a>    <a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Member'>checkpointer_pid</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* PID (0 if not started) */ 
+</span> 
+<a name="LN120"></a>    <a href="../../include/storage/s_lock.h.html#LN137"><span class='Ref_to_Typedef'>slock_t</span></a>     <span class='Declare_Member'>ckpt_lck</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* protects all the ckpt_* fields */ 
+</span> 
+<a name="LN122"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>ckpt_started</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* advances when checkpoint starts */ 
+</span><a name="LN123"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>ckpt_done</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* advances when checkpoint done */ 
+</span><a name="LN124"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>ckpt_failed</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* advances when checkpoint fails */ 
+</span> 
+<a name="LN126"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>ckpt_flags</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* checkpoint flags, as defined in xlog.h */ 
+</span> 
+<a name="LN128"></a>    <a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>num_backend_writes</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* counts user backend buffer writes */ 
+</span><a name="LN129"></a>    <a href="../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a>      <span class='Declare_Member'>num_backend_fsync</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* counts user backend fsync calls */ 
+</span> 
+<a name="LN131"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>num_requests</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* current # of requests */ 
+</span><a name="LN132"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>max_requests</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* allocated array size */ 
+</span><a name="LN133"></a>    <a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a> <span class='Declare_Member'>requests</span><span class='Delimiter'>[</span>FLEXIBLE_ARRAY_MEMBER<span class='Delimiter'>]; 
+</span><a name="LN134"></a>} <span class='Declare_Typedef'>CheckpointerShmemStruct</span><span class='Delimiter'>; 
+</span> 
+<a name="LN136"></a><span class='Keyword'>static </span><a href="checkpointer.c.html#LN116"><span class='Ref_to_Typedef'>CheckpointerShmemStruct</span></a> <span class='Operator'>*</span><span class='Declare_Var'>CheckpointerShmem</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* interval for calling AbsorbFsyncRequests in CheckpointWriteDelay */ 
+</span><a name="LN139"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>WRITES_PER_ABSORB</span>       <span class='Number'>1000</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * GUC parameters 
+ */ 
+</span><a name="LN144"></a><span class='Keyword'>int</span>         <span class='Declare_Var'>CheckPointTimeout</span> <span class='Operator'>= </span><span class='Number'>300</span><span class='Delimiter'>; 
+</span><a name="LN145"></a><span class='Keyword'>int</span>         <span class='Declare_Var'>CheckPointWarning</span> <span class='Operator'>= </span><span class='Number'>30</span><span class='Delimiter'>; 
+</span><a name="LN146"></a><span class='Keyword'>double</span>      <span class='Declare_Var'>CheckPointCompletionTarget</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Operator'>.</span><span class='Number'>5</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Flags set by interrupt handlers for later service in the main loop. 
+ */ 
+</span><a name="LN151"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>got_SIGHUP</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN152"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>checkpoint_requested</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN153"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>shutdown_requested</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Private state 
+ */ 
+</span><a name="LN158"></a><span class='Keyword'>static bool </span><span class='Declare_Var'>ckpt_active</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* these values are valid when ckpt_active is true: */ 
+</span><a name="LN161"></a><span class='Keyword'>static </span><a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a> <span class='Declare_Var'>ckpt_start_time</span><span class='Delimiter'>; 
+</span><a name="LN162"></a><span class='Keyword'>static </span><a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Var'>ckpt_start_recptr</span><span class='Delimiter'>; 
+</span><a name="LN163"></a><span class='Keyword'>static double </span><span class='Declare_Var'>ckpt_cached_elapsed</span><span class='Delimiter'>; 
+</span> 
+<a name="LN165"></a><span class='Keyword'>static </span><a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a> <span class='Declare_Var'>last_checkpoint_time</span><span class='Delimiter'>; 
+</span><a name="LN166"></a><span class='Keyword'>static </span><a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a> <span class='Declare_Var'>last_xlog_switch_time</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Prototypes for private functions */ 
+</span> 
+<a name="LN170"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>CheckArchiveTimeout</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN171"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>IsCheckpointOnSchedule</span><span class='Parentheses'>(</span><span class='Keyword'>double </span><span class='Declare_Parameter'>progress</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN172"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>ImmediateCheckpointRequested</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN173"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>CompactCheckpointerRequestQueue</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN174"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>UpdateSharedMemoryConfig</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Signal handlers */ 
+</span> 
+<a name="LN178"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>chkpt_quickdie</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN179"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>ChkptSigHupHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN180"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>ReqCheckpointHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN181"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>chkpt_sigusr1_handler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN182"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>ReqShutdownHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Main entry point for checkpointer process 
+ * 
+ * This is invoked from AuxiliaryProcessMain, which has already created the 
+ * basic execution environment, but not enabled signals yet. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN192"></a><span class='Declare_Function'>CheckpointerMain</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN194"></a>    <a href="../../include/c.h.html#LN1087"><span class='Ref_to_Const'>sigjmp_buf</span></a>  <span class='Declare_Local'>local_sigjmp_buf</span><span class='Delimiter'>; 
+</span><a name="LN195"></a>    <a href="../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>checkpointer_context</span><span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN118"><span class='Ref_to_Member'>checkpointer_pid</span></a> <span class='Operator'>= </span><a href="../utils/init/globals.c.html#LN38"><span class='Ref_to_Global_Var'>MyProcPid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Properly accept or ignore signals the postmaster might send us 
+     * 
+     * Note: we deliberately ignore SIGTERM, because during a standard Unix 
+     * system shutdown cycle, init will SIGTERM all processes at once.  We 
+     * want to wait for the backends to exit, whereupon the postmaster will 
+     * tell us it's okay to shut down (via SIGUSR2). 
+     */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN187"><span class='Ref_to_Const'>SIGHUP</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN179"><span class='Ref_to_Proto'>ChkptSigHupHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>       <span class='Comment_Multi_Line'>/* set flag to read config 
+                                                 * file */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGINT<span class='Delimiter'>, </span><a href="checkpointer.c.html#LN180"><span class='Ref_to_Proto'>ReqCheckpointHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* request checkpoint */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGTERM<span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* ignore SIGTERM */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN188"><span class='Ref_to_Const'>SIGQUIT</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN178"><span class='Ref_to_Proto'>chkpt_quickdie</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>  <span class='Comment_Single_Line'>/* hard crash time */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN193"><span class='Ref_to_Const'>SIGALRM</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN192"><span class='Ref_to_Const'>SIGPIPE</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN201"><span class='Ref_to_Const'>SIGUSR1</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN181"><span class='Ref_to_Proto'>chkpt_sigusr1_handler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN202"><span class='Ref_to_Const'>SIGUSR2</span></a><span class='Delimiter'>, </span><a href="bgwriter.c.html#LN98"><span class='Ref_to_Proto'>ReqShutdownHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* request shutdown */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Reset some signals that are accepted by postmaster but not here 
+     */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN197"><span class='Ref_to_Const'>SIGCHLD</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN198"><span class='Ref_to_Const'>SIGTTIN</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN199"><span class='Ref_to_Const'>SIGTTOU</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN196"><span class='Ref_to_Const'>SIGCONT</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN200"><span class='Ref_to_Const'>SIGWINCH</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* We allow SIGQUIT (quickdie) at all times */ 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN29"><span class='Ref_to_Macro'>sigdelset</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN22"><span class='Ref_to_Global_Var'>BlockSig</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN188"><span class='Ref_to_Const'>SIGQUIT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Initialize so that first time-driven event happens at the correct time. 
+     */ 
+</span>    <a href="checkpointer.c.html#LN165"><span class='Ref_to_Global_Var'>last_checkpoint_time</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN166"><span class='Ref_to_Global_Var'>last_xlog_switch_time</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a><span class='Parentheses'>) </span>time<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create a resource owner to keep track of our resources (currently only 
+     * buffer pins). 
+     */ 
+</span>    <a href="../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a> <span class='Operator'>= </span><a href="../../include/utils/resowner.h.html#LN66"><span class='Ref_to_Proto'>ResourceOwnerCreate</span></a><span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='String'>"Checkpointer"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Create a memory context that we will do all our work in.  We do this so 
+     * that we can reset the context during error recovery and thereby avoid 
+     * possible memory leaks.  Formerly this code just ran in 
+     * TopMemoryContext, but resetting that would be a really bad idea. 
+     */ 
+</span>    <a href="checkpointer.c.html#LN195"><span class='Ref_To_Local'>checkpointer_context</span></a> <span class='Operator'>= </span><a href="../../include/utils/memutils.h.html#LN145"><span class='Ref_to_Proto'>AllocSetContextCreate</span></a><span class='Parentheses'>(</span><a href="../utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, 
+</span>                                                 <span class='String'>"Checkpointer"</span><span class='Delimiter'>, 
+</span>                                                 <a href="../../include/utils/memutils.h.html#LN164"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_SIZES</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN195"><span class='Ref_To_Local'>checkpointer_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If an exception is encountered, processing resumes here. 
+     * 
+     * See notes in postgres.c about the design of this coding. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1088"><span class='Ref_to_Macro'>sigsetjmp</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN194"><span class='Ref_To_Local'>local_sigjmp_buf</span></a><span class='Delimiter'>, </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Since not using PG_TRY, must reset error stack by hand */ 
+</span>        <a href="../utils/error/elog.c.html#LN87"><span class='Ref_to_Global_Var'>error_context_stack</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Prevent interrupts while cleaning up */ 
+</span>        <a href="../../include/miscadmin.h.html#LN116"><span class='Ref_to_Macro'>HOLD_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Report the error to the server log */ 
+</span>        <a href="../../include/utils/elog.h.html#LN362"><span class='Ref_to_Proto'>EmitErrorReport</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * These operations are really just a minimal subset of 
+         * AbortTransaction().  We don't have very many resources to worry 
+         * about in checkpointer, but we do have LWLocks, buffers, and temp 
+         * files. 
+         */ 
+</span>        <a href="../../include/storage/lwlock.h.html#LN150"><span class='Ref_to_Proto'>LWLockReleaseAll</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/condition_variable.h.html#LN45"><span class='Ref_to_Proto'>ConditionVariableCancelSleep</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/pgstat.h.html#LN1230"><span class='Ref_to_Func'>pgstat_report_wait_end</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/bufmgr.h.html#LN221"><span class='Ref_to_Proto'>AbortBufferIO</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/bufmgr.h.html#LN213"><span class='Ref_to_Proto'>UnlockBuffers</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* buffer pins are released here: */ 
+</span>        <a href="../../include/utils/resowner.h.html#LN68"><span class='Ref_to_Proto'>ResourceOwnerRelease</span></a><span class='Parentheses'>(</span><a href="../utils/resowner/resowner.c.html#LN137"><span class='Ref_to_Global_Var'>CurrentResourceOwner</span></a><span class='Delimiter'>, 
+</span>                             <a href="../../include/utils/resowner.h.html#LN46"><span class='Ref_to_EnumConst'>RESOURCE_RELEASE_BEFORE_LOCKS</span></a><span class='Delimiter'>, 
+</span>                             <span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* we needn't bother with the other ResourceOwnerRelease phases */ 
+</span>        <a href="../../include/storage/bufmgr.h.html#LN184"><span class='Ref_to_Proto'>AtEOXact_Buffers</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/smgr.h.html#LN111"><span class='Ref_to_Proto'>AtEOXact_SMgr</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/fd.h.html#LN109"><span class='Ref_to_Proto'>AtEOXact_Files</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/hsearch.h.html#LN141"><span class='Ref_to_Proto'>AtEOXact_HashTables</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Warn any waiting backends that the checkpoint failed. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN158"><span class='Ref_to_Global_Var'>ckpt_active</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN124"><span class='Ref_to_Member'>ckpt_failed</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN123"><span class='Ref_to_Member'>ckpt_done</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN122"><span class='Ref_to_Member'>ckpt_started</span></a><span class='Delimiter'>; 
+</span>            <a href="../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="checkpointer.c.html#LN158"><span class='Ref_to_Global_Var'>ckpt_active</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Now return to normal top-level context and clear ErrorContext for 
+         * next time. 
+         */ 
+</span>        <a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN195"><span class='Ref_To_Local'>checkpointer_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/elog.h.html#LN365"><span class='Ref_to_Proto'>FlushErrorState</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Flush any leaked data in the top-level context */ 
+</span>        <a href="../../include/utils/memutils.h.html#LN66"><span class='Ref_to_Macro'>MemoryContextResetAndDeleteChildren</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN195"><span class='Ref_To_Local'>checkpointer_context</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Now we can allow interrupts again */ 
+</span>        <a href="../../include/miscadmin.h.html#LN118"><span class='Ref_to_Macro'>RESUME_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Sleep at least 1 second after any error.  A write error is likely 
+         * to be repeated, and we don't want to be filling the error logs as 
+         * fast as we can. 
+         */ 
+</span>        <a href="../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><span class='Number'>1000000L</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Close all open files after any error.  This is helpful on Windows, 
+         * where holding deleted files open causes various strange errors. 
+         * It's not clear we need it elsewhere, but shouldn't hurt. 
+         */ 
+</span>        <a href="../../include/storage/smgr.h.html#LN88"><span class='Ref_to_Proto'>smgrcloseall</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if sigsetjmp(local_sigjm... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* We can now handle ereport(ERROR) */ 
+</span>    <a href="../utils/error/elog.c.html#LN89"><span class='Ref_to_Global_Var'>PG_exception_stack</span></a> <span class='Operator'>= &</span><a href="checkpointer.c.html#LN194"><span class='Ref_To_Local'>local_sigjmp_buf</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Unblock signals (they were blocked when the postmaster forked us) 
+     */ 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN18"><span class='Ref_to_Macro'>PG_SETMASK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN21"><span class='Ref_to_Global_Var'>UnBlockSig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Ensure all shared memory values are set correctly for the config. Doing 
+     * this here ensures no race conditions from other concurrent updaters. 
+     */ 
+</span>    <a href="checkpointer.c.html#LN174"><span class='Ref_to_Proto'>UpdateSharedMemoryConfig</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Advertise our latch that backends can use to wake us up while we're 
+     * sleeping. 
+     */ 
+</span>    <a href="../storage/lmgr/proc.c.html#LN79"><span class='Ref_to_Global_Var'>ProcGlobal</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN247"><span class='Ref_to_Member'>checkpointerLatch</span></a> <span class='Operator'>= &</span><a href="../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN102"><span class='Ref_to_Member'>procLatch</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Loop forever 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN352"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>do_checkpoint</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN353"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>flags</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN354"></a>        <a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a>   <span class='Declare_Local'>now</span><span class='Delimiter'>; 
+</span><a name="LN355"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>elapsed_secs</span><span class='Delimiter'>; 
+</span><a name="LN356"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>cur_timeout</span><span class='Delimiter'>; 
+</span><a name="LN357"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Clear any already-pending wakeups */ 
+</span>        <a href="../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Process any requests or signals received recently. 
+         */ 
+</span>        <a href="../../include/postmaster/bgwriter.h.html#LN35"><span class='Ref_to_Proto'>AbsorbFsyncRequests</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="../utils/misc/guc-file.l.html#LN107"><span class='Ref_to_Func'>ProcessConfigFile</span></a><span class='Parentheses'>(</span><a href="../../include/utils/guc.h.html#LN71"><span class='Ref_to_EnumConst'>PGC_SIGHUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Checkpointer is the last process to shut down, so we ask it to 
+             * hold the keys for a range of other tasks required most of which 
+             * have nothing to do with checkpointing at all. 
+             * 
+             * For various reasons, some config values can change dynamically 
+             * so the primary copy of them is held in shared memory to make 
+             * sure all backends see the same value.  We make Checkpointer 
+             * responsible for updating the shared memory copy if the 
+             * parameter setting changes because of SIGHUP. 
+             */ 
+</span>            <a href="checkpointer.c.html#LN174"><span class='Ref_to_Proto'>UpdateSharedMemoryConfig</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN152"><span class='Ref_to_Global_Var'>checkpoint_requested</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="checkpointer.c.html#LN152"><span class='Ref_to_Global_Var'>checkpoint_requested</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN352"><span class='Ref_To_Local'>do_checkpoint</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="pgstat.c.html#LN142"><span class='Ref_to_Global_Var'>BgWriterStats</span></a><span class='Operator'>.</span><a href="../../include/pgstat.h.html#LN413"><span class='Ref_to_Member'>m_requested_checkpoints</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="startup.c.html#LN41"><span class='Ref_to_Global_Var'>shutdown_requested</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * From here on, elog(ERROR) should end with exit(1), not send 
+             * control back to the sigsetjmp block above 
+             */ 
+</span>            <a href="../utils/init/globals.c.html#LN104"><span class='Ref_to_Global_Var'>ExitOnAnyError</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* Close down the database */ 
+</span>            <a href="../../include/access/xlog.h.html#LN265"><span class='Ref_to_Proto'>ShutdownXLOG</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* Normal exit from the checkpointer is here */ 
+</span>            <a href="../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* done */ 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Force a checkpoint if too much time has elapsed since the last one. 
+         * Note that we count a timed checkpoint in stats only when this 
+         * occurs without an external request, but we set the CAUSE_TIME flag 
+         * bit even if there is also an external request. 
+         */ 
+</span>        <a href="checkpointer.c.html#LN354"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a><span class='Parentheses'>) </span>time<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN354"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN165"><span class='Ref_to_Global_Var'>last_checkpoint_time</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a> <span class='Operator'>&GT;= </span><a href="checkpointer.c.html#LN144"><span class='Ref_to_Global_Var'>CheckPointTimeout</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="checkpointer.c.html#LN352"><span class='Ref_To_Local'>do_checkpoint</span></a><span class='Parentheses'>) 
+</span>                <a href="pgstat.c.html#LN142"><span class='Ref_to_Global_Var'>BgWriterStats</span></a><span class='Operator'>.</span><a href="../../include/pgstat.h.html#LN412"><span class='Ref_to_Member'>m_timed_checkpoints</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN352"><span class='Ref_To_Local'>do_checkpoint</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN353"><span class='Ref_To_Local'>flags</span></a> <span class='Operator'>|= </span><a href="../../include/access/xlog.h.html#LN186"><span class='Ref_to_Const'>CHECKPOINT_CAUSE_TIME</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Do a checkpoint if requested. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN352"><span class='Ref_To_Local'>do_checkpoint</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN425"></a>            <span class='Keyword'>bool</span>        <span class='Declare_Local'>ckpt_performed</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN426"></a>            <span class='Keyword'>bool</span>        <span class='Declare_Local'>do_restartpoint</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Check if we should perform a checkpoint or a restartpoint. As a 
+             * side-effect, RecoveryInProgress() initializes TimeLineID if 
+             * it's not set yet. 
+             */ 
+</span>            <a href="checkpointer.c.html#LN426"><span class='Ref_To_Local'>do_restartpoint</span></a> <span class='Operator'>= </span><a href="../../include/access/xlog.h.html#LN242"><span class='Ref_to_Proto'>RecoveryInProgress</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Atomically fetch the request flags to figure out what kind of a 
+             * checkpoint we should perform, and increase the started-counter 
+             * to acknowledge that we've started a new checkpoint. 
+             */ 
+</span>            <a href="../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN353"><span class='Ref_To_Local'>flags</span></a> <span class='Operator'>|= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN126"><span class='Ref_to_Member'>ckpt_flags</span></a><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN126"><span class='Ref_to_Member'>ckpt_flags</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN122"><span class='Ref_to_Member'>ckpt_started</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <a href="../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * The end-of-recovery checkpoint is a real checkpoint that's 
+             * performed while we're still in recovery. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN353"><span class='Ref_To_Local'>flags</span></a> <span class='Operator'>& </span><a href="../../include/access/xlog.h.html#LN175"><span class='Ref_to_Const'>CHECKPOINT_END_OF_RECOVERY</span></a><span class='Parentheses'>) 
+</span>                <a href="checkpointer.c.html#LN426"><span class='Ref_To_Local'>do_restartpoint</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * We will warn if (a) too soon since last checkpoint (whatever 
+             * caused it) and (b) somebody set the CHECKPOINT_CAUSE_XLOG flag 
+             * since the last checkpoint start.  Note in particular that this 
+             * implementation will not generate warnings caused by 
+             * CheckPointTimeout &LT; CheckPointWarning. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="checkpointer.c.html#LN426"><span class='Ref_To_Local'>do_restartpoint</span></a> <span class='Operator'>&& 
+</span>                <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN353"><span class='Ref_To_Local'>flags</span></a> <span class='Operator'>& </span><a href="../../include/access/xlog.h.html#LN185"><span class='Ref_to_Const'>CHECKPOINT_CAUSE_XLOG</span></a><span class='Parentheses'>) </span><span class='Operator'>&& 
+</span>                <a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a> <span class='Operator'>&LT; </span><a href="checkpointer.c.html#LN145"><span class='Ref_to_Global_Var'>CheckPointWarning</span></a><span class='Parentheses'>)</span> 
+                <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN848"><span class='Ref_to_Func'>errmsg_plural</span></a><span class='Parentheses'>(</span><span class='String'>"checkpoints are occurring too frequently (%d second apart)"</span><span class='Delimiter'>, 
+</span>                <span class='String'>"checkpoints are occurring too frequently (%d seconds apart)"</span><span class='Delimiter'>, 
+</span>                                       <a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a><span class='Delimiter'>, 
+</span>                                       <a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                         <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Consider increasing the configuration parameter \"max_wal_size\"."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Initialize checkpointer-private variables used during 
+             * checkpoint. 
+             */ 
+</span>            <a href="checkpointer.c.html#LN158"><span class='Ref_to_Global_Var'>ckpt_active</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN426"><span class='Ref_To_Local'>do_restartpoint</span></a><span class='Parentheses'>) 
+</span>                <a href="checkpointer.c.html#LN162"><span class='Ref_to_Global_Var'>ckpt_start_recptr</span></a> <span class='Operator'>= </span><a href="../../include/access/xlog.h.html#LN247"><span class='Ref_to_Proto'>GetXLogReplayRecPtr</span></a><span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="checkpointer.c.html#LN162"><span class='Ref_to_Global_Var'>ckpt_start_recptr</span></a> <span class='Operator'>= </span><a href="../../include/access/xlog.h.html#LN274"><span class='Ref_to_Proto'>GetInsertRecPtr</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN161"><span class='Ref_to_Global_Var'>ckpt_start_time</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN354"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN163"><span class='Ref_to_Global_Var'>ckpt_cached_elapsed</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Do the checkpoint. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="checkpointer.c.html#LN426"><span class='Ref_To_Local'>do_restartpoint</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="../../include/access/xlog.h.html#LN267"><span class='Ref_to_Proto'>CreateCheckPoint</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN353"><span class='Ref_To_Local'>flags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="checkpointer.c.html#LN425"><span class='Ref_To_Local'>ckpt_performed</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+                <a href="checkpointer.c.html#LN425"><span class='Ref_To_Local'>ckpt_performed</span></a> <span class='Operator'>= </span><a href="../../include/access/xlog.h.html#LN268"><span class='Ref_to_Proto'>CreateRestartPoint</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN353"><span class='Ref_To_Local'>flags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * After any checkpoint, close all smgr files.  This is so we 
+             * won't hang onto smgr references to deleted files indefinitely. 
+             */ 
+</span>            <a href="../../include/storage/smgr.h.html#LN88"><span class='Ref_to_Proto'>smgrcloseall</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Indicate checkpoint completion to any waiting backends. 
+             */ 
+</span>            <a href="../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN123"><span class='Ref_to_Member'>ckpt_done</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN122"><span class='Ref_to_Member'>ckpt_started</span></a><span class='Delimiter'>; 
+</span>            <a href="../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN425"><span class='Ref_To_Local'>ckpt_performed</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * Note we record the checkpoint start time not end time as 
+                 * last_checkpoint_time.  This is so that time-driven 
+                 * checkpoints happen at a predictable spacing. 
+                 */ 
+</span>                <a href="checkpointer.c.html#LN165"><span class='Ref_to_Global_Var'>last_checkpoint_time</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN354"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * We were not able to perform the restartpoint (checkpoints 
+                 * throw an ERROR in case of error).  Most likely because we 
+                 * have not received any new checkpoint WAL records since the 
+                 * last restartpoint. Try again in 15 s. 
+                 */ 
+</span>                <a href="checkpointer.c.html#LN165"><span class='Ref_to_Global_Var'>last_checkpoint_time</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN354"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN144"><span class='Ref_to_Global_Var'>CheckPointTimeout</span></a> <span class='Operator'>+ </span><span class='Number'>15</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <a href="checkpointer.c.html#LN158"><span class='Ref_to_Global_Var'>ckpt_active</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if do_checkpoint &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* Check for archive_timeout and switch xlog files if necessary. */ 
+</span>        <a href="checkpointer.c.html#LN170"><span class='Ref_to_Proto'>CheckArchiveTimeout</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Send off activity statistics to the stats collector.  (The reason 
+         * why we re-use bgwriter-related code for this is that the bgwriter 
+         * and checkpointer used to be just one process.  It's probably not 
+         * worth the trouble to split the stats support into two independent 
+         * stats message types.) 
+         */ 
+</span>        <a href="../../include/pgstat.h.html#LN1310"><span class='Ref_to_Proto'>pgstat_send_bgwriter</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Sleep until we are signaled or it's time for another checkpoint or 
+         * xlog file switch. 
+         */ 
+</span>        <a href="checkpointer.c.html#LN354"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a><span class='Parentheses'>) </span>time<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN354"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN165"><span class='Ref_to_Global_Var'>last_checkpoint_time</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a> <span class='Operator'>&GT;= </span><a href="checkpointer.c.html#LN144"><span class='Ref_to_Global_Var'>CheckPointTimeout</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* no sleep for us ... */ 
+</span>        <a href="checkpointer.c.html#LN356"><span class='Ref_To_Local'>cur_timeout</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN144"><span class='Ref_to_Global_Var'>CheckPointTimeout</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../access/transam/xlog.c.html#LN92"><span class='Ref_to_Global_Var'>XLogArchiveTimeout</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& !</span><a href="../../include/access/xlog.h.html#LN242"><span class='Ref_to_Proto'>RecoveryInProgress</span></a><span class='Parentheses'>())</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN354"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN166"><span class='Ref_to_Global_Var'>last_xlog_switch_time</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a> <span class='Operator'>&GT;= </span><a href="../access/transam/xlog.c.html#LN92"><span class='Ref_to_Global_Var'>XLogArchiveTimeout</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>continue</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* no sleep for us ... */ 
+</span>            <a href="checkpointer.c.html#LN356"><span class='Ref_To_Local'>cur_timeout</span></a> <span class='Operator'>= </span><a href="../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN356"><span class='Ref_To_Local'>cur_timeout</span></a><span class='Delimiter'>, </span><a href="../access/transam/xlog.c.html#LN92"><span class='Ref_to_Global_Var'>XLogArchiveTimeout</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN355"><span class='Ref_To_Local'>elapsed_secs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="checkpointer.c.html#LN357"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                       <a href="checkpointer.c.html#LN356"><span class='Ref_To_Local'>cur_timeout</span></a> <span class='Operator'>* </span><span class='Number'>1000L</span> <span class='Comment_Multi_Line'>/* convert to ms */ </span><span class='Delimiter'>, 
+</span>                       <a href="../../include/pgstat.h.html#LN760"><span class='Ref_to_EnumConst'>WAIT_EVENT_CHECKPOINTER_MAIN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Emergency bailout if postmaster has died.  This is to avoid the 
+         * necessity for manual cleanup of all postmaster children. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN357"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../test/isolation/specscanner.l.html#LN91"><span class='Ref_to_Proto'>exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end CheckpointerMain &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * CheckArchiveTimeout -- check for archive_timeout and switch xlog files 
+ * 
+ * This will switch to a new WAL file and force an archive file write if 
+ * meaningful activity is recorded in the current WAL file. This includes most 
+ * writes, including just a single checkpoint record, but excludes WAL records 
+ * that were inserted with the XLOG_MARK_UNIMPORTANT flag being set (like 
+ * snapshots of running transactions).  Such records, depending on 
+ * configuration, occur on regular intervals and don't contain important 
+ * information.  This avoids generating archives with a few unimportant 
+ * records. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN585"></a><span class='Declare_Function'>CheckArchiveTimeout</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN587"></a>    <a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a>   <span class='Declare_Local'>now</span><span class='Delimiter'>; 
+</span><a name="LN588"></a>    <a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a>   <span class='Declare_Local'>last_time</span><span class='Delimiter'>; 
+</span><a name="LN589"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>last_switch_lsn</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../access/transam/xlog.c.html#LN92"><span class='Ref_to_Global_Var'>XLogArchiveTimeout</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="../../include/access/xlog.h.html#LN242"><span class='Ref_to_Proto'>RecoveryInProgress</span></a><span class='Parentheses'>())</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN587"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a><span class='Parentheses'>) </span>time<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* First we do a quick check using possibly-stale local state. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><span class='Keyword'>int</span><span class='Parentheses'>) (</span><a href="checkpointer.c.html#LN587"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN166"><span class='Ref_to_Global_Var'>last_xlog_switch_time</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="../access/transam/xlog.c.html#LN92"><span class='Ref_to_Global_Var'>XLogArchiveTimeout</span></a><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Update local state ... note that last_xlog_switch_time is the last time 
+     * a switch was performed *or requested*. 
+     */ 
+</span>    <a href="checkpointer.c.html#LN588"><span class='Ref_To_Local'>last_time</span></a> <span class='Operator'>= </span><a href="../../include/access/xlog_internal.h.html#LN289"><span class='Ref_to_Proto'>GetLastSegSwitchData</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN589"><span class='Ref_To_Local'>last_switch_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN166"><span class='Ref_to_Global_Var'>last_xlog_switch_time</span></a> <span class='Operator'>= </span><a href="../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN10"><span class='Ref_to_Macro'>Max</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN166"><span class='Ref_to_Global_Var'>last_xlog_switch_time</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN588"><span class='Ref_To_Local'>last_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now we can do the real checks */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><span class='Keyword'>int</span><span class='Parentheses'>) (</span><a href="checkpointer.c.html#LN587"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN166"><span class='Ref_to_Global_Var'>last_xlog_switch_time</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT;= </span><a href="../access/transam/xlog.c.html#LN92"><span class='Ref_to_Global_Var'>XLogArchiveTimeout</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Switch segment only when "important" WAL has been logged since the 
+         * last segment switch (last_switch_lsn points to end of segment 
+         * switch occurred in). 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/xlog.h.html#LN276"><span class='Ref_to_Proto'>GetLastImportantRecPtr</span></a><span class='Parentheses'>() </span><span class='Operator'>&GT; </span><a href="checkpointer.c.html#LN589"><span class='Ref_To_Local'>last_switch_lsn</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN618"></a>            <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>switchpoint</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* mark switch as unimportant, avoids triggering checkpoints */ 
+</span>            <a href="checkpointer.c.html#LN618"><span class='Ref_To_Local'>switchpoint</span></a> <span class='Operator'>= </span><a href="../../include/access/xlog_internal.h.html#LN290"><span class='Ref_to_Proto'>RequestXLogSwitch</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * If the returned pointer points exactly to a segment boundary, 
+             * assume nothing happened. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="checkpointer.c.html#LN618"><span class='Ref_To_Local'>switchpoint</span></a> <span class='Operator'>% </span><a href="../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+                <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><span class='String'>"write-ahead log switch forced (archive_timeout=%d)"</span><span class='Delimiter'>, 
+</span>                     <a href="../access/transam/xlog.c.html#LN92"><span class='Ref_to_Global_Var'>XLogArchiveTimeout</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Update state in any case, so we don't retry constantly when the 
+         * system is idle. 
+         */ 
+</span>        <a href="checkpointer.c.html#LN166"><span class='Ref_to_Global_Var'>last_xlog_switch_time</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN587"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if (int)(now-last_xlog_s... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end CheckArchiveTimeout &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Returns true if an immediate checkpoint request is pending.  (Note that 
+ * this does not check the *current* checkpoint's IMMEDIATE flag, but whether 
+ * there is one pending behind it.) 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN646"></a><span class='Declare_Function'>ImmediateCheckpointRequested</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN152"><span class='Ref_to_Global_Var'>checkpoint_requested</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN650"></a>        <span class='Keyword'>volatile </span><a href="checkpointer.c.html#LN116"><span class='Ref_to_Typedef'>CheckpointerShmemStruct</span></a> <span class='Operator'>*</span><span class='Declare_Local'>cps</span> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * We don't need to acquire the ckpt_lck in this case because we're 
+         * only looking at a single flag bit. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN650"><span class='Ref_To_Local'>cps</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN126"><span class='Ref_to_Member'>ckpt_flags</span></a> <span class='Operator'>& </span><a href="../../include/access/xlog.h.html#LN178"><span class='Ref_to_Const'>CHECKPOINT_IMMEDIATE</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * CheckpointWriteDelay -- control rate of checkpoint 
+ * 
+ * This function is called after each page write performed by BufferSync(). 
+ * It is responsible for throttling BufferSync()'s write rate to hit 
+ * checkpoint_completion_target. 
+ * 
+ * The checkpoint request flags should be passed in; currently the only one 
+ * examined is CHECKPOINT_IMMEDIATE, which disables delays between writes. 
+ * 
+ * 'progress' is an estimate of how much of the work has been done, as a 
+ * fraction between 0.0 meaning none, and 1.0 meaning all done. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN676"></a><span class='Declare_Function'>CheckpointWriteDelay</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>flags</span><span class='Delimiter'>, </span><span class='Keyword'>double </span><span class='Declare_Parameter'>progress</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN678"></a>    <span class='Keyword'>static int</span>  <span class='Declare_Local'>absorb_counter</span> <span class='Operator'>= </span><a href="checkpointer.c.html#LN139"><span class='Ref_to_Const'>WRITES_PER_ABSORB</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Do nothing if checkpoint is being executed by non-checkpointer process */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/miscadmin.h.html#LN409"><span class='Ref_to_Macro'>AmCheckpointerProcess</span></a><span class='Parentheses'>())</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Perform the usual duties and take a nap, unless we're behind schedule, 
+     * in which case we just try to catch up as quickly as possible. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN676"><span class='Ref_to_Parameter'>flags</span></a> <span class='Operator'>& </span><a href="../../include/access/xlog.h.html#LN178"><span class='Ref_to_Const'>CHECKPOINT_IMMEDIATE</span></a><span class='Parentheses'>) </span><span class='Operator'>&& 
+</span>        <span class='Operator'>!</span><a href="startup.c.html#LN41"><span class='Ref_to_Global_Var'>shutdown_requested</span></a> <span class='Operator'>&& 
+</span>        <span class='Operator'>!</span><a href="checkpointer.c.html#LN172"><span class='Ref_to_Proto'>ImmediateCheckpointRequested</span></a><span class='Parentheses'>() </span><span class='Operator'>&& 
+</span>        <a href="checkpointer.c.html#LN171"><span class='Ref_to_Proto'>IsCheckpointOnSchedule</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN676"><span class='Ref_to_Parameter'>progress</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="../utils/misc/guc-file.l.html#LN107"><span class='Ref_to_Func'>ProcessConfigFile</span></a><span class='Parentheses'>(</span><a href="../../include/utils/guc.h.html#LN71"><span class='Ref_to_EnumConst'>PGC_SIGHUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* update shmem copies of config variables */ 
+</span>            <a href="checkpointer.c.html#LN174"><span class='Ref_to_Proto'>UpdateSharedMemoryConfig</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="../../include/postmaster/bgwriter.h.html#LN35"><span class='Ref_to_Proto'>AbsorbFsyncRequests</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="checkpointer.c.html#LN678"><span class='Ref_To_Local'>absorb_counter</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN139"><span class='Ref_to_Const'>WRITES_PER_ABSORB</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="checkpointer.c.html#LN170"><span class='Ref_to_Proto'>CheckArchiveTimeout</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Report interim activity statistics to the stats collector. 
+         */ 
+</span>        <a href="../../include/pgstat.h.html#LN1310"><span class='Ref_to_Proto'>pgstat_send_bgwriter</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * This sleep used to be connected to bgwriter_delay, typically 200ms. 
+         * That resulted in more frequent wakeups if not much work to do. 
+         * Checkpointer and bgwriter are no longer related so take the Big 
+         * Sleep. 
+         */ 
+</span>        <a href="../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><span class='Number'>100000L</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !(flags&CHECKPOINT_IM... &raquo; </span> 
+    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>--</span><a href="checkpointer.c.html#LN678"><span class='Ref_To_Local'>absorb_counter</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Absorb pending fsync requests after each WRITES_PER_ABSORB write 
+         * operations even when we don't sleep, to prevent overflow of the 
+         * fsync request queue. 
+         */ 
+</span>        <a href="../../include/postmaster/bgwriter.h.html#LN35"><span class='Ref_to_Proto'>AbsorbFsyncRequests</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="checkpointer.c.html#LN678"><span class='Ref_To_Local'>absorb_counter</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN139"><span class='Ref_to_Const'>WRITES_PER_ABSORB</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end CheckpointWriteDelay &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * IsCheckpointOnSchedule -- are we on schedule to finish this checkpoint 
+ *       (or restartpoint) in time? 
+ * 
+ * Compares the current progress against the time/segments elapsed since last 
+ * checkpoint, and returns true if the progress we've made this far is greater 
+ * than the elapsed time/segments. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN740"></a><span class='Declare_Function'>IsCheckpointOnSchedule</span><span class='Parentheses'>(</span><span class='Keyword'>double </span><span class='Declare_Parameter'>progress</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN742"></a>    <a href="../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span><span class='Delimiter'>; 
+</span><a name="LN743"></a>    <span class='Control'>struct</span> timeval <span class='Declare_Local'>now</span><span class='Delimiter'>; 
+</span><a name="LN744"></a>    <span class='Keyword'>double</span>      <span class='Declare_Local'>elapsed_xlogs</span><span class='Delimiter'>, 
+</span><a name="LN745"></a>                <span class='Declare_Local'>elapsed_time</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN158"><span class='Ref_to_Global_Var'>ckpt_active</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Scale progress according to checkpoint_completion_target. */ 
+</span>    <a href="checkpointer.c.html#LN740"><span class='Ref_to_Parameter'>progress</span></a> <span class='Operator'>*= </span><a href="checkpointer.c.html#LN146"><span class='Ref_to_Global_Var'>CheckPointCompletionTarget</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check against the cached value first. Only do the more expensive 
+     * calculations once we reach the target previously calculated. Since 
+     * neither time or WAL insert pointer moves backwards, a freshly 
+     * calculated value can only be greater than or equal to the cached value. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN740"><span class='Ref_to_Parameter'>progress</span></a> <span class='Operator'>&LT; </span><a href="checkpointer.c.html#LN163"><span class='Ref_to_Global_Var'>ckpt_cached_elapsed</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check progress against WAL segments written and CheckPointSegments. 
+     * 
+     * We compare the current WAL insert location against the location 
+     * computed before calling CreateCheckPoint. The code in XLogInsert that 
+     * actually triggers a checkpoint when CheckPointSegments is exceeded 
+     * compares against RedoRecptr, so this is not completely accurate. 
+     * However, it's good enough for our purposes, we're only calculating an 
+     * estimate anyway. 
+     * 
+     * During recovery, we compare last replayed WAL record's location with 
+     * the location computed before calling CreateRestartPoint. That maintains 
+     * the same pacing as we have during checkpoints in normal operation, but 
+     * we might exceed max_wal_size by a fair amount. That's because there can 
+     * be a large gap between a checkpoint's redo-pointer and the checkpoint 
+     * record itself, and we only start the restartpoint after we've seen the 
+     * checkpoint record. (The gap is typically up to CheckPointSegments * 
+     * checkpoint_completion_target where checkpoint_completion_target is the 
+     * value that was in effect when the WAL was generated). 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/xlog.h.html#LN242"><span class='Ref_to_Proto'>RecoveryInProgress</span></a><span class='Parentheses'>())</span> 
+        <a href="checkpointer.c.html#LN742"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../include/access/xlog.h.html#LN247"><span class='Ref_to_Proto'>GetXLogReplayRecPtr</span></a><span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="checkpointer.c.html#LN742"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../include/access/xlog.h.html#LN274"><span class='Ref_to_Proto'>GetInsertRecPtr</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN744"><span class='Ref_To_Local'>elapsed_xlogs</span></a> <span class='Operator'>= </span><span class='Parentheses'>(((</span><span class='Keyword'>double</span><span class='Parentheses'>) (</span><a href="checkpointer.c.html#LN742"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN162"><span class='Ref_to_Global_Var'>ckpt_start_recptr</span></a><span class='Parentheses'>))</span> <span class='Operator'>/ </span><a href="../../include/access/xlog_internal.h.html#LN91"><span class='Ref_to_Const'>XLogSegSize</span></a><span class='Parentheses'>)</span> <span class='Operator'>/ </span><a href="../access/transam/xlog.c.html#LN123"><span class='Ref_to_Global_Var'>CheckPointSegments</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN740"><span class='Ref_to_Parameter'>progress</span></a> <span class='Operator'>&LT; </span><a href="checkpointer.c.html#LN744"><span class='Ref_To_Local'>elapsed_xlogs</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="checkpointer.c.html#LN163"><span class='Ref_to_Global_Var'>ckpt_cached_elapsed</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN744"><span class='Ref_To_Local'>elapsed_xlogs</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check progress against time elapsed and checkpoint_timeout. 
+     */ 
+</span>    <a href="../../port/gettimeofday.c.html#LN103"><span class='Ref_to_Func'>gettimeofday</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN743"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN745"><span class='Ref_To_Local'>elapsed_time</span></a> <span class='Operator'>= </span><span class='Parentheses'>((</span><span class='Keyword'>double</span><span class='Parentheses'>)</span> <span class='Parentheses'>((</span><a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a><span class='Parentheses'>) </span><a href="checkpointer.c.html#LN743"><span class='Ref_To_Local'>now</span></a><span class='Operator'>.</span>tv_sec <span class='Operator'>- </span><a href="checkpointer.c.html#LN161"><span class='Ref_to_Global_Var'>ckpt_start_time</span></a><span class='Parentheses'>)</span> <span class='Operator'>+ 
+</span>                    <a href="checkpointer.c.html#LN743"><span class='Ref_To_Local'>now</span></a><span class='Operator'>.</span>tv_usec <span class='Operator'>/ </span><span class='Number'>1000000</span><span class='Operator'>.</span><span class='Number'>0</span><span class='Parentheses'>)</span> <span class='Operator'>/ </span><a href="checkpointer.c.html#LN144"><span class='Ref_to_Global_Var'>CheckPointTimeout</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN740"><span class='Ref_to_Parameter'>progress</span></a> <span class='Operator'>&LT; </span><a href="checkpointer.c.html#LN745"><span class='Ref_To_Local'>elapsed_time</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="checkpointer.c.html#LN163"><span class='Ref_to_Global_Var'>ckpt_cached_elapsed</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN745"><span class='Ref_To_Local'>elapsed_time</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* It looks like we're on schedule. */ 
+</span>    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end IsCheckpointOnSchedule &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      signal handler routines 
+ * -------------------------------- 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * chkpt_quickdie() occurs when signalled SIGQUIT by the postmaster. 
+ * 
+ * Some backend has bought the farm, 
+ * so we need to stop what we're doing and exit. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN823"></a><span class='Declare_Function'>chkpt_quickdie</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN18"><span class='Ref_to_Macro'>PG_SETMASK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN22"><span class='Ref_to_Global_Var'>BlockSig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We DO NOT want to run proc_exit() callbacks -- we're here because 
+     * shared memory may be corrupted, so we don't want to try to clean up our 
+     * transaction.  Just nail the windows shut and get out of town.  Now that 
+     * there's an atexit callback to prevent third-party code from breaking 
+     * things by calling exit() directly, we have to reset the callbacks 
+     * explicitly to make this work as intended. 
+     */ 
+</span>    <a href="../../include/storage/ipc.h.html#LN72"><span class='Ref_to_Proto'>on_exit_reset</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Note we do exit(2) not exit(0).  This is to force the postmaster into a 
+     * system reset cycle if some idiot DBA sends a manual SIGQUIT to a random 
+     * backend.  This is necessary precisely because we don't clean up our 
+     * shared memory state.  (The "dead man switch" mechanism in pmsignal.c 
+     * should ensure the postmaster sees this as a crash, too, but no harm in 
+     * being doubly sure.) 
+     */ 
+</span>    <a href="../../test/isolation/specscanner.l.html#LN91"><span class='Ref_to_Proto'>exit</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end chkpt_quickdie &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* SIGHUP: set flag to re-read config file at next convenient time */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN850"></a><span class='Declare_Function'>ChkptSigHupHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN852"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="checkpointer.c.html#LN852"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGINT: set flag to run a normal checkpoint right away */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN862"></a><span class='Declare_Function'>ReqCheckpointHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN864"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN152"><span class='Ref_to_Global_Var'>checkpoint_requested</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="checkpointer.c.html#LN864"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGUSR1: used for latch wakeups */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN874"></a><span class='Declare_Function'>chkpt_sigusr1_handler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN876"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/latch.h.html#LN173"><span class='Ref_to_Proto'>latch_sigusr1_handler</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="checkpointer.c.html#LN876"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGUSR2: set flag to run a shutdown checkpoint and exit */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN885"></a><span class='Declare_Function'>ReqShutdownHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN887"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="startup.c.html#LN41"><span class='Ref_to_Global_Var'>shutdown_requested</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="checkpointer.c.html#LN887"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* -------------------------------- 
+ *      communication with backends 
+ * -------------------------------- 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * CheckpointerShmemSize 
+ *      Compute space needed for checkpointer-related shared memory 
+ */ 
+</span><a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN906"></a><span class='Declare_Function'>CheckpointerShmemSize</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN908"></a>    <a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>size</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Currently, the size of the requests[] array is arbitrarily set equal to 
+     * NBuffers.  This may prove too large or small ... 
+     */ 
+</span>    <a href="checkpointer.c.html#LN908"><span class='Ref_To_Local'>size</span></a> <span class='Operator'>= </span><a href="../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN116"><span class='Ref_to_Typedef'>CheckpointerShmemStruct</span></a><span class='Delimiter'>, </span>requests<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN908"><span class='Ref_To_Local'>size</span></a> <span class='Operator'>= </span><a href="../../include/storage/shmem.h.html#LN44"><span class='Ref_to_Proto'>add_size</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN908"><span class='Ref_To_Local'>size</span></a><span class='Delimiter'>, </span><a href="../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN122"><span class='Ref_to_Global_Var'>NBuffers</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="checkpointer.c.html#LN908"><span class='Ref_To_Local'>size</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * CheckpointerShmemInit 
+ *      Allocate and initialize checkpointer-related shared memory 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN925"></a><span class='Declare_Function'>CheckpointerShmemInit</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN927"></a>    <a href="../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>size</span> <span class='Operator'>= </span><a href="../../include/postmaster/bgwriter.h.html#LN37"><span class='Ref_to_Proto'>CheckpointerShmemSize</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN928"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN116"><span class='Ref_to_Typedef'>CheckpointerShmemStruct</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../include/storage/shmem.h.html#LN43"><span class='Ref_to_Proto'>ShmemInitStruct</span></a><span class='Parentheses'>(</span><span class='String'>"Checkpointer Data"</span><span class='Delimiter'>, 
+</span>                        <a href="checkpointer.c.html#LN927"><span class='Ref_To_Local'>size</span></a><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="checkpointer.c.html#LN928"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="checkpointer.c.html#LN928"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * First time through, so initialize.  Note that we zero the whole 
+         * requests array; this is so that CompactCheckpointerRequestQueue can 
+         * assume that any pad bytes in the request structs are zeroes. 
+         */ 
+</span>        <a href="../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN927"><span class='Ref_To_Local'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/spin.h.html#LN59"><span class='Ref_to_Macro'>SpinLockInit</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN132"><span class='Ref_to_Member'>max_requests</span></a> <span class='Operator'>= </span><a href="../utils/init/globals.c.html#LN122"><span class='Ref_to_Global_Var'>NBuffers</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end CheckpointerShmemInit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * RequestCheckpoint 
+ *      Called in backend processes to request a checkpoint 
+ * 
+ * flags is a bitwise OR of the following: 
+ *  CHECKPOINT_IS_SHUTDOWN: checkpoint is for database shutdown. 
+ *  CHECKPOINT_END_OF_RECOVERY: checkpoint is for end of WAL recovery. 
+ *  CHECKPOINT_IMMEDIATE: finish the checkpoint ASAP, 
+ *      ignoring checkpoint_completion_target parameter. 
+ *  CHECKPOINT_FORCE: force a checkpoint even if no XLOG activity has occurred 
+ *      since the last one (implied by CHECKPOINT_IS_SHUTDOWN or 
+ *      CHECKPOINT_END_OF_RECOVERY). 
+ *  CHECKPOINT_WAIT: wait for completion before returning (otherwise, 
+ *      just signal checkpointer to do it, and return). 
+ *  CHECKPOINT_CAUSE_XLOG: checkpoint is requested due to xlog filling. 
+ *      (This affects logging, and in particular enables CheckPointWarning.) 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN966"></a><span class='Declare_Function'>RequestCheckpoint</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>flags</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN968"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>ntries</span><span class='Delimiter'>; 
+</span><a name="LN969"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>old_failed</span><span class='Delimiter'>, 
+</span><a name="LN970"></a>                <span class='Declare_Local'>old_started</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If in a standalone backend, just do it ourselves. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../utils/init/globals.c.html#LN99"><span class='Ref_to_Global_Var'>IsPostmasterEnvironment</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * There's no point in doing slow checkpoints in a standalone backend, 
+         * because there's no other backends the checkpoint could disrupt. 
+         */ 
+</span>        <a href="../../include/access/xlog.h.html#LN267"><span class='Ref_to_Proto'>CreateCheckPoint</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN966"><span class='Ref_to_Parameter'>flags</span></a> <span class='Operator'>| </span><a href="../../include/access/xlog.h.html#LN178"><span class='Ref_to_Const'>CHECKPOINT_IMMEDIATE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * After any checkpoint, close all smgr files.  This is so we won't 
+         * hang onto smgr references to deleted files indefinitely. 
+         */ 
+</span>        <a href="../../include/storage/smgr.h.html#LN88"><span class='Ref_to_Proto'>smgrcloseall</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Atomically set the request flags, and take a snapshot of the counters. 
+     * When we see ckpt_started &GT; old_started, we know the flags we set here 
+     * have been seen by checkpointer. 
+     * 
+     * Note that we OR the flags with any existing flags, to avoid overriding 
+     * a "stronger" request by another backend.  The flag senses must be 
+     * chosen to make this work! 
+     */ 
+</span>    <a href="../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN969"><span class='Ref_To_Local'>old_failed</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN124"><span class='Ref_to_Member'>ckpt_failed</span></a><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN970"><span class='Ref_To_Local'>old_started</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN122"><span class='Ref_to_Member'>ckpt_started</span></a><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN126"><span class='Ref_to_Member'>ckpt_flags</span></a> <span class='Operator'>|= </span><a href="checkpointer.c.html#LN966"><span class='Ref_to_Parameter'>flags</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Send signal to request checkpoint.  It's possible that the checkpointer 
+     * hasn't started yet, or is in process of restarting, so we will retry a 
+     * few times if needed.  Also, if not told to wait for the checkpoint to 
+     * occur, we consider failure to send the signal to be nonfatal and merely 
+     * LOG it. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN968"><span class='Ref_To_Local'>ntries</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>;; </span><a href="checkpointer.c.html#LN968"><span class='Ref_To_Local'>ntries</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN118"><span class='Ref_to_Member'>checkpointer_pid</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN968"><span class='Ref_To_Local'>ntries</span></a> <span class='Operator'>&GT;= </span><span class='Number'>20</span><span class='Parentheses'>)</span>   <span class='Comment_Single_Line'>/* max wait 2.0 sec */ 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>((</span><a href="checkpointer.c.html#LN966"><span class='Ref_to_Parameter'>flags</span></a> <span class='Operator'>& </span><a href="../../include/access/xlog.h.html#LN183"><span class='Ref_to_Const'>CHECKPOINT_WAIT</span></a><span class='Parentheses'>) </span><span class='Operator'>? </span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a> <span class='Operator'>: </span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                     <span class='String'>"could not request checkpoint because checkpointer not running"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/port.h.html#LN210"><span class='Ref_to_Macro'>kill</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN118"><span class='Ref_to_Member'>checkpointer_pid</span></a><span class='Delimiter'>, </span>SIGINT<span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN968"><span class='Ref_To_Local'>ntries</span></a> <span class='Operator'>&GT;= </span><span class='Number'>20</span><span class='Parentheses'>)</span>   <span class='Comment_Single_Line'>/* max wait 2.0 sec */ 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>((</span><a href="checkpointer.c.html#LN966"><span class='Ref_to_Parameter'>flags</span></a> <span class='Operator'>& </span><a href="../../include/access/xlog.h.html#LN183"><span class='Ref_to_Const'>CHECKPOINT_WAIT</span></a><span class='Parentheses'>) </span><span class='Operator'>? </span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a> <span class='Operator'>: </span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                     <span class='String'>"could not signal for checkpoint: %m"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+            <span class='Control'>break</span><span class='Delimiter'>;</span>              <span class='Comment_Single_Line'>/* signal sent successfully */ 
+</span> 
+        <a href="../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><span class='Number'>100000L</span><span class='Parentheses'>)</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* wait 0.1 sec, then retry */ 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ntries=0;;ntries++ &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * If requested, wait for completion.  We detect completion according to 
+     * the algorithm given above. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN966"><span class='Ref_to_Parameter'>flags</span></a> <span class='Operator'>& </span><a href="../../include/access/xlog.h.html#LN183"><span class='Ref_to_Const'>CHECKPOINT_WAIT</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN1049"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>new_started</span><span class='Delimiter'>, 
+</span><a name="LN1050"></a>                    <span class='Declare_Local'>new_failed</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Wait for a new checkpoint to start. */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN1049"><span class='Ref_To_Local'>new_started</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN122"><span class='Ref_to_Member'>ckpt_started</span></a><span class='Delimiter'>; 
+</span>            <a href="../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1049"><span class='Ref_To_Local'>new_started</span></a> <span class='Operator'>!= </span><a href="checkpointer.c.html#LN970"><span class='Ref_To_Local'>old_started</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><span class='Number'>100000L</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * We are waiting for ckpt_done &GT;= new_started, in a modulo sense. 
+         */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN1071"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>new_done</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN1071"><span class='Ref_To_Local'>new_done</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN123"><span class='Ref_to_Member'>ckpt_done</span></a><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN1050"><span class='Ref_To_Local'>new_failed</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN124"><span class='Ref_to_Member'>ckpt_failed</span></a><span class='Delimiter'>; 
+</span>            <a href="../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1071"><span class='Ref_To_Local'>new_done</span></a> <span class='Operator'>- </span><a href="checkpointer.c.html#LN1049"><span class='Ref_To_Local'>new_started</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><span class='Number'>100000L</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1050"><span class='Ref_To_Local'>new_failed</span></a> <span class='Operator'>!= </span><a href="checkpointer.c.html#LN969"><span class='Ref_To_Local'>old_failed</span></a><span class='Parentheses'>) 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"checkpoint request failed"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Consult recent messages in the server log for details."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if flags&CHECKPOINT_WAIT &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end RequestCheckpoint &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ForwardFsyncRequest 
+ *      Forward a file-fsync request from a backend to the checkpointer 
+ * 
+ * Whenever a backend is compelled to write directly to a relation 
+ * (which should be seldom, if the background writer is getting its job done), 
+ * the backend calls this routine to pass over knowledge that the relation 
+ * is dirty and must be fsync'd before next checkpoint.  We also use this 
+ * opportunity to count such writes for statistical purposes. 
+ * 
+ * This functionality is only supported for regular (not backend-local) 
+ * relations, so the rnode argument is intentionally RelFileNode not 
+ * RelFileNodeBackend. 
+ * 
+ * segno specifies which segment (not block!) of the relation needs to be 
+ * fsync'd.  (Since the valid range is much less than BlockNumber, we can 
+ * use high values for special flags; that's all internal to md.c, which 
+ * see for details.) 
+ * 
+ * To avoid holding the lock for longer than necessary, we normally write 
+ * to the requests[] queue without checking for duplicates.  The checkpointer 
+ * will have to eliminate dups internally anyway.  However, if we discover 
+ * that the queue is full, we make a pass over the entire queue to compact 
+ * it.  This is somewhat expensive, but the alternative is for the backend 
+ * to perform its own fsync, which is far more expensive in practice.  It 
+ * is theoretically possible a backend fsync might still be necessary, if 
+ * the queue is full and contains no duplicate entries.  In that case, we 
+ * let the backend know by returning false. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN1122"></a><span class='Declare_Function'>ForwardFsyncRequest</span><span class='Parentheses'>(</span><a href="../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>rnode</span><span class='Delimiter'>, </span><a href="../../include/common/relpath.h.html#LN23"><span class='Ref_to_Enum'>ForkNumber</span></a> <span class='Declare_Parameter'>forknum</span><span class='Delimiter'>, </span><a href="../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>segno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1124"></a>    <a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a> <span class='Operator'>*</span><span class='Declare_Local'>request</span><span class='Delimiter'>; 
+</span><a name="LN1125"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>too_full</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* probably shouldn't even get here */ 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/miscadmin.h.html#LN409"><span class='Ref_to_Macro'>AmCheckpointerProcess</span></a><span class='Parentheses'>())</span> 
+        <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"ForwardFsyncRequest must not be called in checkpointer"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CheckpointerCommLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Count all backend writes regardless of if they fit in the queue */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/miscadmin.h.html#LN408"><span class='Ref_to_Macro'>AmBackgroundWriterProcess</span></a><span class='Parentheses'>())</span> 
+        <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN128"><span class='Ref_to_Member'>num_backend_writes</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the checkpointer isn't running or the request queue is full, the 
+     * backend will have to perform its own fsync request.  But before forcing 
+     * that to happen, we can try to compact the request queue. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN118"><span class='Ref_to_Member'>checkpointer_pid</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>        <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a> <span class='Operator'>&GT;= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN132"><span class='Ref_to_Member'>max_requests</span></a> <span class='Operator'>&& 
+</span>         <span class='Operator'>!</span><a href="checkpointer.c.html#LN173"><span class='Ref_to_Proto'>CompactCheckpointerRequestQueue</span></a><span class='Parentheses'>()))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Count the subset of writes where backends have to do their own 
+         * fsync 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/miscadmin.h.html#LN408"><span class='Ref_to_Macro'>AmBackgroundWriterProcess</span></a><span class='Parentheses'>())</span> 
+            <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN129"><span class='Ref_to_Member'>num_backend_fsync</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CheckpointerCommLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* OK, insert request */ 
+</span>    <a href="checkpointer.c.html#LN1124"><span class='Ref_To_Local'>request</span></a> <span class='Operator'>= &</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN133"><span class='Ref_to_Member'>requests</span></a><span class='Delimiter'>[</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a><span class='Operator'>++</span><span class='Delimiter'>]; 
+</span>    <a href="checkpointer.c.html#LN1124"><span class='Ref_To_Local'>request</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN110"><span class='Ref_to_Member'>rnode</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN1122"><span class='Ref_to_Parameter'>rnode</span></a><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN1124"><span class='Ref_To_Local'>request</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN111"><span class='Ref_to_Member'>forknum</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN1122"><span class='Ref_to_Parameter'>forknum</span></a><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN1124"><span class='Ref_To_Local'>request</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN112"><span class='Ref_to_Member'>segno</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN1122"><span class='Ref_to_Parameter'>segno</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If queue is more than half full, nudge the checkpointer to empty it */ 
+</span>    <a href="checkpointer.c.html#LN1125"><span class='Ref_To_Local'>too_full</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a> <span class='Operator'>&GT;= 
+</span>                <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN132"><span class='Ref_to_Member'>max_requests</span></a> <span class='Operator'>/ </span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CheckpointerCommLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* ... but not till after we release the lock */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1125"><span class='Ref_To_Local'>too_full</span></a> <span class='Operator'>&& </span><a href="../storage/lmgr/proc.c.html#LN79"><span class='Ref_to_Global_Var'>ProcGlobal</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN247"><span class='Ref_to_Member'>checkpointerLatch</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../storage/lmgr/proc.c.html#LN79"><span class='Ref_to_Global_Var'>ProcGlobal</span></a><span class='Operator'>-&GT;</span><a href="../../include/storage/proc.h.html#LN247"><span class='Ref_to_Member'>checkpointerLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ForwardFsyncRequest &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * CompactCheckpointerRequestQueue 
+ *      Remove duplicates from the request queue to avoid backend fsyncs. 
+ *      Returns "true" if any entries were removed. 
+ * 
+ * Although a full fsync request queue is not common, it can lead to severe 
+ * performance problems when it does happen.  So far, this situation has 
+ * only been observed to occur when the system is under heavy write load, 
+ * and especially during the "sync" phase of a checkpoint.  Without this 
+ * logic, each backend begins doing an fsync for every block written, which 
+ * gets very expensive and can slow down the whole system. 
+ * 
+ * Trying to do this every time the queue is full could lose if there 
+ * aren't any removable entries.  But that should be vanishingly rare in 
+ * practice: there's one queue entry per shared buffer. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN1194"></a><span class='Declare_Function'>CompactCheckpointerRequestQueue</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1196"></a>    <span class='Control'>struct</span> <span class='Declare_Local'>CheckpointerSlotMapping</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN1198"></a>        <a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a> <span class='Declare_Member'>request</span><span class='Delimiter'>; 
+</span><a name="LN1199"></a>        <span class='Keyword'>int</span>         <span class='Declare_Member'>slot</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}; 
+</span> 
+<a name="LN1202"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>n</span><span class='Delimiter'>, 
+</span><a name="LN1203"></a>                <span class='Declare_Local'>preserve_count</span><span class='Delimiter'>; 
+</span><a name="LN1204"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>num_skipped</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN1205"></a>    <a href="../../include/utils/hsearch.h.html#LN64"><span class='Ref_to_Struct'>HASHCTL</span></a>     <span class='Declare_Local'>ctl</span><span class='Delimiter'>; 
+</span><a name="LN1206"></a>    <a href="../utils/hash/dynahash.c.html#LN192"><span class='Ref_to_Struct'>HTAB</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>htab</span><span class='Delimiter'>; 
+</span><a name="LN1207"></a>    <span class='Keyword'>bool</span>       <span class='Operator'>*</span><span class='Declare_Local'>skip_slot</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* must hold CheckpointerCommLock in exclusive mode */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../include/storage/lwlock.h.html#LN151"><span class='Ref_to_Proto'>LWLockHeldByMe</span></a><span class='Parentheses'>(</span>CheckpointerCommLock<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize skip_slot array */ 
+</span>    <a href="checkpointer.c.html#LN1207"><span class='Ref_To_Local'>skip_slot</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>bool</span><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize temporary hash table */ 
+</span>    <a href="../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN1205"><span class='Ref_To_Local'>ctl</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1205"><span class='Ref_To_Local'>ctl</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN1205"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../include/utils/hsearch.h.html#LN71"><span class='Ref_to_Member'>keysize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN1205"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../include/utils/hsearch.h.html#LN72"><span class='Ref_to_Member'>entrysize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Control'>struct</span> <a href="checkpointer.c.html#LN1196"><span class='Ref_to_Struct'>CheckpointerSlotMapping</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN1205"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../include/utils/hsearch.h.html#LN77"><span class='Ref_to_Member'>hcxt</span></a> <span class='Operator'>= </span><a href="../utils/mmgr/mcxt.c.html#LN36"><span class='Ref_to_Global_Var'>CurrentMemoryContext</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN1206"><span class='Ref_To_Local'>htab</span></a> <span class='Operator'>= </span><a href="../../include/utils/hsearch.h.html#LN121"><span class='Ref_to_Proto'>hash_create</span></a><span class='Parentheses'>(</span><span class='String'>"CompactCheckpointerRequestQueue"</span><span class='Delimiter'>, 
+</span>                       <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a><span class='Delimiter'>, 
+</span>                       <span class='Operator'>&</span><a href="checkpointer.c.html#LN1205"><span class='Ref_To_Local'>ctl</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../include/utils/hsearch.h.html#LN86"><span class='Ref_to_Const'>HASH_ELEM</span></a> <span class='Operator'>| </span><a href="../../include/utils/hsearch.h.html#LN87"><span class='Ref_to_Const'>HASH_BLOBS</span></a> <span class='Operator'>| </span><a href="../../include/utils/hsearch.h.html#LN92"><span class='Ref_to_Const'>HASH_CONTEXT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The basic idea here is that a request can be skipped if it's followed 
+     * by a later, identical request.  It might seem more sensible to work 
+     * backwards from the end of the queue and check whether a request is 
+     * *preceded* by an earlier, identical request, in the hopes of doing less 
+     * copying.  But that might change the semantics, if there's an 
+     * intervening FORGET_RELATION_FSYNC or FORGET_DATABASE_FSYNC request, so 
+     * we do it this way.  It would be possible to be even smarter if we made 
+     * the code below understand the specific semantics of such requests (it 
+     * could blow away preceding entries that would end up being canceled 
+     * anyhow), but it's not clear that the extra complexity would buy us 
+     * anything. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>&LT; </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a><span class='Delimiter'>; </span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN1241"></a>        <a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a> <span class='Operator'>*</span><span class='Declare_Local'>request</span><span class='Delimiter'>; 
+</span><a name="LN1242"></a>        <span class='Control'>struct</span> <a href="checkpointer.c.html#LN1196"><span class='Ref_to_Struct'>CheckpointerSlotMapping</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slotmap</span><span class='Delimiter'>; 
+</span><a name="LN1243"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * We use the request struct directly as a hashtable key.  This 
+         * assumes that any padding bytes in the structs are consistently the 
+         * same, which should be okay because we zeroed them in 
+         * CheckpointerShmemInit.  Note also that RelFileNode had better 
+         * contain no pad bytes. 
+         */ 
+</span>        <a href="checkpointer.c.html#LN1241"><span class='Ref_To_Local'>request</span></a> <span class='Operator'>= &</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN133"><span class='Ref_to_Member'>requests</span></a><span class='Delimiter'>[</span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>]; 
+</span>        <a href="checkpointer.c.html#LN1242"><span class='Ref_To_Local'>slotmap</span></a> <span class='Operator'>= </span><a href="../../include/utils/hsearch.h.html#LN125"><span class='Ref_to_Proto'>hash_search</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1206"><span class='Ref_To_Local'>htab</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN1241"><span class='Ref_To_Local'>request</span></a><span class='Delimiter'>, </span><a href="../../include/utils/hsearch.h.html#LN105"><span class='Ref_to_EnumConst'>HASH_ENTER</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="checkpointer.c.html#LN1243"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1243"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Duplicate, so mark the previous occurrence as skippable */ 
+</span>            <a href="checkpointer.c.html#LN1207"><span class='Ref_To_Local'>skip_slot</span></a><span class='Delimiter'>[</span><a href="checkpointer.c.html#LN1242"><span class='Ref_To_Local'>slotmap</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN1199"><span class='Ref_to_Member'>slot</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="checkpointer.c.html#LN1204"><span class='Ref_To_Local'>num_skipped</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Comment_Multi_Line'>/* Remember slot containing latest occurrence of this request value */ 
+</span>        <a href="checkpointer.c.html#LN1242"><span class='Ref_To_Local'>slotmap</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN1199"><span class='Ref_to_Member'>slot</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for n=0;n&LT;CheckpointerShm... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Done with the hash table. */ 
+</span>    <a href="../../include/utils/hsearch.h.html#LN123"><span class='Ref_to_Proto'>hash_destroy</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1206"><span class='Ref_To_Local'>htab</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If no duplicates, we're out of luck. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="checkpointer.c.html#LN1204"><span class='Ref_To_Local'>num_skipped</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1207"><span class='Ref_To_Local'>skip_slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* We found some duplicates; remove them. */ 
+</span>    <a href="checkpointer.c.html#LN1203"><span class='Ref_To_Local'>preserve_count</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>&LT; </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a><span class='Delimiter'>; </span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1207"><span class='Ref_To_Local'>skip_slot</span></a><span class='Delimiter'>[</span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>        <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN133"><span class='Ref_to_Member'>requests</span></a><span class='Delimiter'>[</span><a href="checkpointer.c.html#LN1203"><span class='Ref_To_Local'>preserve_count</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN133"><span class='Ref_to_Member'>requests</span></a><span class='Delimiter'>[</span><a href="checkpointer.c.html#LN1202"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>]; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, 
+</span>       <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"compacted fsync request queue from %d entries to %d entries"</span><span class='Delimiter'>, 
+</span>               <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN1203"><span class='Ref_To_Local'>preserve_count</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN1203"><span class='Ref_To_Local'>preserve_count</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Cleanup. */ 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1207"><span class='Ref_To_Local'>skip_slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end CompactCheckpointerRequestQueue &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * AbsorbFsyncRequests 
+ *      Retrieve queued fsync requests and pass them to local smgr. 
+ * 
+ * This is exported because it must be called during CreateCheckPoint; 
+ * we have to be sure we have accepted all pending requests just before 
+ * we start fsync'ing.  Since CreateCheckPoint sometimes runs in 
+ * non-checkpointer processes, do nothing if not checkpointer. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN1302"></a><span class='Declare_Function'>AbsorbFsyncRequests</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1304"></a>    <a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a> <span class='Operator'>*</span><span class='Declare_Local'>requests</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN1305"></a>    <a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a> <span class='Operator'>*</span><span class='Declare_Local'>request</span><span class='Delimiter'>; 
+</span><a name="LN1306"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>n</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/miscadmin.h.html#LN409"><span class='Ref_to_Macro'>AmCheckpointerProcess</span></a><span class='Parentheses'>())</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CheckpointerCommLock<span class='Delimiter'>, </span><a href="../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Transfer stats counts into pending pgstats message */ 
+</span>    <a href="pgstat.c.html#LN142"><span class='Ref_to_Global_Var'>BgWriterStats</span></a><span class='Operator'>.</span><a href="../../include/pgstat.h.html#LN417"><span class='Ref_to_Member'>m_buf_written_backend</span></a> <span class='Operator'>+= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN128"><span class='Ref_to_Member'>num_backend_writes</span></a><span class='Delimiter'>; 
+</span>    <a href="pgstat.c.html#LN142"><span class='Ref_to_Global_Var'>BgWriterStats</span></a><span class='Operator'>.</span><a href="../../include/pgstat.h.html#LN418"><span class='Ref_to_Member'>m_buf_fsync_backend</span></a> <span class='Operator'>+= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN129"><span class='Ref_to_Member'>num_backend_fsync</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN128"><span class='Ref_to_Member'>num_backend_writes</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN129"><span class='Ref_to_Member'>num_backend_fsync</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We try to avoid holding the lock for a long time by copying the request 
+     * array, and processing the requests after releasing the lock. 
+     * 
+     * Once we have cleared the requests from shared memory, we have to PANIC 
+     * if we then fail to absorb them (eg, because our hashtable runs out of 
+     * memory).  This is because the system cannot run safely if we are unable 
+     * to fsync what we have been told to fsync.  Fortunately, the hashtable 
+     * is so small that the problem is quite unlikely to arise in practice. 
+     */ 
+</span>    <a href="checkpointer.c.html#LN1306"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1306"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="checkpointer.c.html#LN1304"><span class='Ref_To_Local'>requests</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1306"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1304"><span class='Ref_To_Local'>requests</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN133"><span class='Ref_to_Member'>requests</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN1306"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN108"><span class='Ref_to_Typedef'>CheckpointerRequest</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../include/miscadmin.h.html#LN132"><span class='Ref_to_Macro'>START_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN131"><span class='Ref_to_Member'>num_requests</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CheckpointerCommLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1305"><span class='Ref_To_Local'>request</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN1304"><span class='Ref_To_Local'>requests</span></a><span class='Delimiter'>; </span><a href="checkpointer.c.html#LN1306"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="checkpointer.c.html#LN1305"><span class='Ref_To_Local'>request</span></a><span class='Operator'>++</span><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN1306"><span class='Ref_To_Local'>n</span></a><span class='Operator'>--</span><span class='Parentheses'>) 
+</span>        <a href="../../include/storage/smgr.h.html#LN141"><span class='Ref_to_Proto'>RememberFsyncRequest</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1305"><span class='Ref_To_Local'>request</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN110"><span class='Ref_to_Member'>rnode</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN1305"><span class='Ref_To_Local'>request</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN111"><span class='Ref_to_Member'>forknum</span></a><span class='Delimiter'>, </span><a href="checkpointer.c.html#LN1305"><span class='Ref_To_Local'>request</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN112"><span class='Ref_to_Member'>segno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/miscadmin.h.html#LN134"><span class='Ref_to_Macro'>END_CRIT_SECTION</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1304"><span class='Ref_To_Local'>requests</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1304"><span class='Ref_To_Local'>requests</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end AbsorbFsyncRequests &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Update any shared memory configurations based on config parameters 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN1356"></a><span class='Declare_Function'>UpdateSharedMemoryConfig</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* update global shmem state for sync rep */ 
+</span>    <a href="../../include/replication/syncrep.h.html#LN79"><span class='Ref_to_Proto'>SyncRepUpdateSyncStandbysDefined</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If full_page_writes has been changed by SIGHUP, we update it in shared 
+     * memory and write an XLOG_FPW_CHANGE record. 
+     */ 
+</span>    <a href="../../include/access/xlog.h.html#LN271"><span class='Ref_to_Proto'>UpdateFullPageWrites</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN23"><span class='Ref_to_Const'>DEBUG2</span></a><span class='Delimiter'>, </span><span class='String'>"checkpointer updated shared memory configuration values"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * FirstCallSinceLastCheckpoint allows a process to take an action once 
+ * per checkpoint cycle by asynchronously checking for checkpoint completion. 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN1375"></a><span class='Declare_Function'>FirstCallSinceLastCheckpoint</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1377"></a>    <span class='Keyword'>static int</span>  <span class='Declare_Local'>ckpt_done</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN1378"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>new_done</span><span class='Delimiter'>; 
+</span><a name="LN1379"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>FirstCall</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/storage/spin.h.html#LN61"><span class='Ref_to_Macro'>SpinLockAcquire</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="checkpointer.c.html#LN1378"><span class='Ref_To_Local'>new_done</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN123"><span class='Ref_to_Member'>ckpt_done</span></a><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/spin.h.html#LN63"><span class='Ref_to_Macro'>SpinLockRelease</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="checkpointer.c.html#LN136"><span class='Ref_to_Global_Var'>CheckpointerShmem</span></a><span class='Operator'>-&GT;</span><a href="checkpointer.c.html#LN120"><span class='Ref_to_Member'>ckpt_lck</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="checkpointer.c.html#LN1378"><span class='Ref_To_Local'>new_done</span></a> <span class='Operator'>!= </span><a href="checkpointer.c.html#LN1377"><span class='Ref_To_Local'>ckpt_done</span></a><span class='Parentheses'>) 
+</span>        <a href="checkpointer.c.html#LN1379"><span class='Ref_To_Local'>FirstCall</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <a href="checkpointer.c.html#LN1377"><span class='Ref_To_Local'>ckpt_done</span></a> <span class='Operator'>= </span><a href="checkpointer.c.html#LN1378"><span class='Ref_To_Local'>new_done</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="checkpointer.c.html#LN1379"><span class='Ref_To_Local'>FirstCall</span></a><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

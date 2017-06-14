@@ -1,0 +1,670 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\executor\nodeSetOp.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\executor\nodeSetOp.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:40 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * nodeSetOp.c 
+ *    Routines to handle INTERSECT and EXCEPT selection 
+ * 
+ * The input of a SetOp node consists of tuples from two relations, 
+ * which have been combined into one dataset, with a junk attribute added 
+ * that shows which relation each tuple came from.  In SETOP_SORTED mode, 
+ * the input has furthermore been sorted according to all the grouping 
+ * columns (ie, all the non-junk attributes).  The SetOp node scans each 
+ * group of identical tuples to determine how many came from each input 
+ * relation.  Then it is a simple matter to emit the output demanded by the 
+ * SQL spec for INTERSECT, INTERSECT ALL, EXCEPT, or EXCEPT ALL. 
+ * 
+ * In SETOP_HASHED mode, the input is delivered in no particular order, 
+ * except that we know all the tuples from one input relation will come before 
+ * all the tuples of the other.  The planner guarantees that the first input 
+ * relation is the left-hand one for EXCEPT, and tries to make the smaller 
+ * input relation come first for INTERSECT.  We build a hash table in memory 
+ * with one entry for each group of identical tuples, and count the number of 
+ * tuples in the group from each relation.  After seeing all the input, we 
+ * scan the hashtable and generate the correct output using those counts. 
+ * We can avoid making hashtable entries for any tuples appearing only in the 
+ * second input relation, since they cannot result in any output. 
+ * 
+ * This node type is not used for UNION or UNION ALL, since those can be 
+ * implemented more cheaply (there's no need for the junk attribute to 
+ * identify the source relation). 
+ * 
+ * Note that SetOp does no qual checking nor projection.  The delivered 
+ * output tuples are just copies of the first-to-arrive tuple in each 
+ * input group. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/executor/nodeSetOp.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/htup_details.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/executor.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeSetOp.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SetOpStatePerGroupData - per-group working state 
+ * 
+ * These values are working state that is initialized at the start of 
+ * an input tuple group and updated for each input tuple. 
+ * 
+ * In SETOP_SORTED mode, we need only one of these structs, and it's kept in 
+ * the plan state node.  In SETOP_HASHED mode, the hash table contains one 
+ * of these for each tuple group. 
+ */ 
+</span><a name="LN62"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>SetOpStatePerGroupData</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN64"></a>    <span class='Keyword'>long</span>        <span class='Declare_Member'>numLeft</span><span class='Delimiter'>;</span>        <span class='Comment_Single_Line'>/* number of left-input dups in group */ 
+</span><a name="LN65"></a>    <span class='Keyword'>long</span>        <span class='Declare_Member'>numRight</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* number of right-input dups in group */ 
+</span><a name="LN66"></a><span class='Delimiter'>}</span>   <span class='Declare_Typedef'>SetOpStatePerGroupData</span><span class='Delimiter'>; 
+</span> 
+ 
+<a name="LN69"></a><span class='Keyword'>static </span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>setop_retrieve_direct</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>setopstate</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN70"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>setop_fill_hash_table</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>setopstate</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN71"></a><span class='Keyword'>static </span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>setop_retrieve_hash_table</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>setopstate</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize state for a new group of input values. 
+ */ 
+</span><span class='Keyword'>static inline void 
+</span><a name="LN78"></a><span class='Declare_Function'>initialize_counts</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a> <span class='Declare_Parameter'>pergroup</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="nodeSetOp.c.html#LN78"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN64"><span class='Ref_to_Member'>numLeft</span></a> <span class='Operator'>= </span><a href="nodeSetOp.c.html#LN78"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN65"><span class='Ref_to_Member'>numRight</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Advance the appropriate counter for one input tuple. 
+ */ 
+</span><span class='Keyword'>static inline void 
+</span><a name="LN87"></a><span class='Declare_Function'>advance_counts</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a> <span class='Declare_Parameter'>pergroup</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>flag</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN87"><span class='Ref_to_Parameter'>flag</span></a><span class='Parentheses'>) 
+</span>        <a href="nodeSetOp.c.html#LN87"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN65"><span class='Ref_to_Member'>numRight</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="nodeSetOp.c.html#LN87"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN64"><span class='Ref_to_Member'>numLeft</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Fetch the "flag" column from an input tuple. 
+ * This is an integer column with value 0 for left side, 1 for right side. 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN100"></a><span class='Declare_Function'>fetch_tuple_flag</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>setopstate</span><span class='Delimiter'>, </span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>inputslot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN102"></a>    <a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>node</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN100"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Delimiter'>; 
+</span><a name="LN103"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>flag</span><span class='Delimiter'>; 
+</span><a name="LN104"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>isNull</span><span class='Delimiter'>; 
+</span> 
+    <a href="nodeSetOp.c.html#LN103"><span class='Ref_To_Local'>flag</span></a> <span class='Operator'>= </span><a href="../../include/postgres.h.html#LN477"><span class='Ref_to_Macro'>DatumGetInt32</span></a><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN167"><span class='Ref_to_Proto'>slot_getattr</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN100"><span class='Ref_to_Parameter'>inputslot</span></a><span class='Delimiter'>, 
+</span>                                      <a href="nodeSetOp.c.html#LN102"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN885"><span class='Ref_to_Member'>flagColIdx</span></a><span class='Delimiter'>, 
+</span>                                      <span class='Operator'>&</span><a href="nodeSetOp.c.html#LN104"><span class='Ref_To_Local'>isNull</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeSetOp.c.html#LN104"><span class='Ref_To_Local'>isNull</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN103"><span class='Ref_To_Local'>flag</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="nodeSetOp.c.html#LN103"><span class='Ref_To_Local'>flag</span></a> <span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="nodeSetOp.c.html#LN103"><span class='Ref_To_Local'>flag</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize the hash table to empty. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN118"></a><span class='Declare_Function'>build_hash_table</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>setopstate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN120"></a>    <a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>node</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN118"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN120"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN880"><span class='Ref_to_Member'>strategy</span></a> <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN788"><span class='Ref_to_EnumConst'>SETOP_HASHED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN120"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN887"><span class='Ref_to_Member'>numGroups</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="nodeSetOp.c.html#LN118"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1952"><span class='Ref_to_Member'>hashtable</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN132"><span class='Ref_to_Proto'>BuildTupleHashTable</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN120"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN881"><span class='Ref_to_Member'>numCols</span></a><span class='Delimiter'>, 
+</span>                                                <a href="nodeSetOp.c.html#LN120"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN883"><span class='Ref_to_Member'>dupColIdx</span></a><span class='Delimiter'>, 
+</span>                                                <a href="nodeSetOp.c.html#LN118"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1943"><span class='Ref_to_Member'>eqfunctions</span></a><span class='Delimiter'>, 
+</span>                                                <a href="nodeSetOp.c.html#LN118"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1944"><span class='Ref_to_Member'>hashfunctions</span></a><span class='Delimiter'>, 
+</span>                                                <a href="nodeSetOp.c.html#LN120"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN887"><span class='Ref_to_Member'>numGroups</span></a><span class='Delimiter'>, 
+</span>                                                <span class='Number'>0</span><span class='Delimiter'>, 
+</span>                                                <a href="nodeSetOp.c.html#LN118"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1953"><span class='Ref_to_Member'>tableContext</span></a><span class='Delimiter'>, 
+</span>                                                <a href="nodeSetOp.c.html#LN118"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1947"><span class='Ref_to_Member'>tempContext</span></a><span class='Delimiter'>, 
+</span>                                                <span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * We've completed processing a tuple group.  Decide how many copies (if any) 
+ * of its representative row to emit, and store the count into numOutput. 
+ * This logic is straight from the SQL92 specification. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN142"></a><span class='Declare_Function'>set_output_count</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>setopstate</span><span class='Delimiter'>, </span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a> <span class='Declare_Parameter'>pergroup</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN144"></a>    <a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>plannode</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN144"><span class='Ref_To_Local'>plannode</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN879"><span class='Ref_to_Member'>cmd</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN779"><span class='Ref_to_EnumConst'>SETOPCMD_INTERSECT</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN64"><span class='Ref_to_Member'>numLeft</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN65"><span class='Ref_to_Member'>numRight</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN780"><span class='Ref_to_EnumConst'>SETOPCMD_INTERSECT_ALL</span></a><span class='Operator'>: 
+</span>            <a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>= 
+</span>                <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN64"><span class='Ref_to_Member'>numLeft</span></a> <span class='Operator'>&LT; </span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN65"><span class='Ref_to_Member'>numRight</span></a><span class='Parentheses'>) </span><span class='Operator'>? 
+</span>                <a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN64"><span class='Ref_to_Member'>numLeft</span></a> <span class='Operator'>: </span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN65"><span class='Ref_to_Member'>numRight</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN781"><span class='Ref_to_EnumConst'>SETOPCMD_EXCEPT</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN64"><span class='Ref_to_Member'>numLeft</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN65"><span class='Ref_to_Member'>numRight</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../include/nodes/nodes.h.html#LN782"><span class='Ref_to_EnumConst'>SETOPCMD_EXCEPT_ALL</span></a><span class='Operator'>: 
+</span>            <a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>= 
+</span>                <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN64"><span class='Ref_to_Member'>numLeft</span></a> <span class='Operator'>&LT; </span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN65"><span class='Ref_to_Member'>numRight</span></a><span class='Parentheses'>) </span><span class='Operator'>? 
+</span>                <span class='Number'>0</span> <span class='Operator'>: </span><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN64"><span class='Ref_to_Member'>numLeft</span></a> <span class='Operator'>- </span><a href="nodeSetOp.c.html#LN142"><span class='Ref_to_Parameter'>pergroup</span></a><span class='Operator'>-&GT;</span><a href="nodeSetOp.c.html#LN65"><span class='Ref_to_Member'>numRight</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unrecognized set op: %d"</span><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN144"><span class='Ref_To_Local'>plannode</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN879"><span class='Ref_to_Member'>cmd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch plannode-&GT;cmd &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end set_output_count &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecSetOp 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span>                <span class='Comment_Single_Line'>/* return: a tuple or NULL */ 
+</span><a name="LN182"></a><span class='Declare_Function'>ExecSetOp</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN184"></a>    <a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>plannode</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN182"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Delimiter'>; 
+</span><a name="LN185"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>resultTupleSlot</span> <span class='Operator'>= </span><a href="nodeSetOp.c.html#LN182"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN841"><span class='Ref_to_Member'>ps_ResultTupleSlot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the previously-returned tuple needs to be returned more than once, 
+     * keep returning it. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN182"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="nodeSetOp.c.html#LN182"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <a href="nodeSetOp.c.html#LN185"><span class='Ref_To_Local'>resultTupleSlot</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Otherwise, we're done if we are out of groups */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN182"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1945"><span class='Ref_to_Member'>setop_done</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Fetch the next tuple group according to the correct strategy */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN184"><span class='Ref_To_Local'>plannode</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN880"><span class='Ref_to_Member'>strategy</span></a> <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN788"><span class='Ref_to_EnumConst'>SETOP_HASHED</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeSetOp.c.html#LN182"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1954"><span class='Ref_to_Member'>table_filled</span></a><span class='Parentheses'>) 
+</span>            <a href="nodeSetOp.c.html#LN70"><span class='Ref_to_Proto'>setop_fill_hash_table</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN182"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <a href="nodeSetOp.c.html#LN71"><span class='Ref_to_Proto'>setop_retrieve_hash_table</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN182"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <span class='Control'>return</span> <a href="nodeSetOp.c.html#LN69"><span class='Ref_to_Proto'>setop_retrieve_direct</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN182"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecSetOp &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ExecSetOp for non-hashed case 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN216"></a><span class='Declare_Function'>setop_retrieve_direct</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>setopstate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN218"></a>    <a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>node</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Delimiter'>; 
+</span><a name="LN219"></a>    <a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>outerPlan</span><span class='Delimiter'>; 
+</span><a name="LN220"></a>    <a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a> <span class='Declare_Local'>pergroup</span><span class='Delimiter'>; 
+</span><a name="LN221"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>outerslot</span><span class='Delimiter'>; 
+</span><a name="LN222"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>resultTupleSlot</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * get state info from node 
+     */ 
+</span>    <a href="nodeSetOp.c.html#LN219"><span class='Ref_To_Local'>outerPlan</span></a> <span class='Operator'>= </span><a href="../../include/nodes/execnodes.h.html#LN854"><span class='Ref_to_Macro'>outerPlanState</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN220"><span class='Ref_To_Local'>pergroup</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1949"><span class='Ref_to_Member'>pergroup</span></a><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN222"><span class='Ref_To_Local'>resultTupleSlot</span></a> <span class='Operator'>= </span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN841"><span class='Ref_to_Member'>ps_ResultTupleSlot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We loop retrieving groups until we find one we should return 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1945"><span class='Ref_to_Member'>setop_done</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * If we don't already have the first tuple of the new group, fetch it 
+         * from the outer plan. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1950"><span class='Ref_to_Member'>grp_firstTuple</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="nodeSetOp.c.html#LN221"><span class='Ref_To_Local'>outerslot</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN229"><span class='Ref_to_Proto'>ExecProcNode</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN219"><span class='Ref_To_Local'>outerPlan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN221"><span class='Ref_To_Local'>outerslot</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* Make a copy of the first input tuple */ 
+</span>                <a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1950"><span class='Ref_to_Member'>grp_firstTuple</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN157"><span class='Ref_to_Proto'>ExecCopySlotTuple</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN221"><span class='Ref_To_Local'>outerslot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* outer plan produced no tuples at all */ 
+</span>                <a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1945"><span class='Ref_to_Member'>setop_done</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Store the copied first input tuple in the tuple table slot reserved 
+         * for it.  The tuple will be deleted when it is cleared from the 
+         * slot. 
+         */ 
+</span>        <a href="../../include/executor/tuptable.h.html#LN147"><span class='Ref_to_Proto'>ExecStoreTuple</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1950"><span class='Ref_to_Member'>grp_firstTuple</span></a><span class='Delimiter'>, 
+</span>                       <a href="nodeSetOp.c.html#LN222"><span class='Ref_To_Local'>resultTupleSlot</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>, 
+</span>                       <span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1950"><span class='Ref_to_Member'>grp_firstTuple</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* don't keep two pointers */ 
+</span> 
+        <span class='Comment_Multi_Line'>/* Initialize working state for a new input tuple group */ 
+</span>        <a href="nodeSetOp.c.html#LN77"><span class='Ref_to_Func'>initialize_counts</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN220"><span class='Ref_To_Local'>pergroup</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Count the first input tuple */ 
+</span>        <a href="nodeSetOp.c.html#LN86"><span class='Ref_to_Func'>advance_counts</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN220"><span class='Ref_To_Local'>pergroup</span></a><span class='Delimiter'>, 
+</span>                       <a href="nodeSetOp.c.html#LN99"><span class='Ref_to_Func'>fetch_tuple_flag</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN222"><span class='Ref_To_Local'>resultTupleSlot</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Scan the outer plan until we exhaust it or cross a group boundary. 
+         */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="nodeSetOp.c.html#LN221"><span class='Ref_To_Local'>outerslot</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN229"><span class='Ref_to_Proto'>ExecProcNode</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN219"><span class='Ref_To_Local'>outerPlan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN221"><span class='Ref_To_Local'>outerslot</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* no more outer-plan tuples available */ 
+</span>                <a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1945"><span class='Ref_to_Member'>setop_done</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Check whether we've crossed a group boundary. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="execGrouping.c.html#LN67"><span class='Ref_to_Func'>execTuplesMatch</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN222"><span class='Ref_To_Local'>resultTupleSlot</span></a><span class='Delimiter'>, 
+</span>                                 <a href="nodeSetOp.c.html#LN221"><span class='Ref_To_Local'>outerslot</span></a><span class='Delimiter'>, 
+</span>                                 <a href="nodeSetOp.c.html#LN218"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN881"><span class='Ref_to_Member'>numCols</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN218"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN883"><span class='Ref_to_Member'>dupColIdx</span></a><span class='Delimiter'>, 
+</span>                                 <a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1943"><span class='Ref_to_Member'>eqfunctions</span></a><span class='Delimiter'>, 
+</span>                                 <a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1947"><span class='Ref_to_Member'>tempContext</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * Save the first input tuple of the next group. 
+                 */ 
+</span>                <a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1950"><span class='Ref_to_Member'>grp_firstTuple</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN157"><span class='Ref_to_Proto'>ExecCopySlotTuple</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN221"><span class='Ref_To_Local'>outerslot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* Still in same group, so count this tuple */ 
+</span>            <a href="nodeSetOp.c.html#LN86"><span class='Ref_to_Func'>advance_counts</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN220"><span class='Ref_To_Local'>pergroup</span></a><span class='Delimiter'>, 
+</span>                           <a href="nodeSetOp.c.html#LN99"><span class='Ref_to_Func'>fetch_tuple_flag</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN221"><span class='Ref_To_Local'>outerslot</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* 
+         * Done scanning input tuple group.  See if we should emit any copies 
+         * of result tuple, and if so return the first copy. 
+         */ 
+</span>        <a href="nodeSetOp.c.html#LN141"><span class='Ref_to_Func'>set_output_count</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN220"><span class='Ref_To_Local'>pergroup</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="nodeSetOp.c.html#LN216"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <a href="nodeSetOp.c.html#LN222"><span class='Ref_To_Local'>resultTupleSlot</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while !setopstate-&GT;setop_do... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* No more groups */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN222"><span class='Ref_To_Local'>resultTupleSlot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end setop_retrieve_direct &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ExecSetOp for hashed case: phase 1, read input and build hash table 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN330"></a><span class='Declare_Function'>setop_fill_hash_table</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>setopstate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN332"></a>    <a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>node</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Delimiter'>; 
+</span><a name="LN333"></a>    <a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>outerPlan</span><span class='Delimiter'>; 
+</span><a name="LN334"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>firstFlag</span><span class='Delimiter'>; 
+</span><a name="LN335"></a>    <span class='Keyword'>bool </span>in_first_rel <span class='Declare_Local'>PG_USED_FOR_ASSERTS_ONLY</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * get state info from node 
+     */ 
+</span>    <a href="nodeSetOp.c.html#LN333"><span class='Ref_To_Local'>outerPlan</span></a> <span class='Operator'>= </span><a href="../../include/nodes/execnodes.h.html#LN854"><span class='Ref_to_Macro'>outerPlanState</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN334"><span class='Ref_To_Local'>firstFlag</span></a> <span class='Operator'>= </span><a href="nodeSetOp.c.html#LN332"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN886"><span class='Ref_to_Member'>firstFlag</span></a><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* verify planner didn't mess up */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN334"><span class='Ref_To_Local'>firstFlag</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>           <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN334"><span class='Ref_To_Local'>firstFlag</span></a> <span class='Operator'>== </span><span class='Number'>1</span> <span class='Operator'>&& 
+</span>            <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN332"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN879"><span class='Ref_to_Member'>cmd</span></a> <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN779"><span class='Ref_to_EnumConst'>SETOPCMD_INTERSECT</span></a> <span class='Operator'>|| 
+</span>             <a href="nodeSetOp.c.html#LN332"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN879"><span class='Ref_to_Member'>cmd</span></a> <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN780"><span class='Ref_to_EnumConst'>SETOPCMD_INTERSECT_ALL</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Process each outer-plan tuple, and then fetch the next one, until we 
+     * exhaust the outer plan. 
+     */ 
+</span>    in_first_rel <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN355"></a>        <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>outerslot</span><span class='Delimiter'>; 
+</span><a name="LN356"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>flag</span><span class='Delimiter'>; 
+</span><a name="LN357"></a>        <a href="../../include/nodes/execnodes.h.html#LN563"><span class='Ref_to_Struct'>TupleHashEntryData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>entry</span><span class='Delimiter'>; 
+</span><a name="LN358"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>isnew</span><span class='Delimiter'>; 
+</span> 
+        <a href="nodeSetOp.c.html#LN355"><span class='Ref_To_Local'>outerslot</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN229"><span class='Ref_to_Proto'>ExecProcNode</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN333"><span class='Ref_To_Local'>outerPlan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN355"><span class='Ref_To_Local'>outerslot</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Identify whether it's left or right input */ 
+</span>        <a href="nodeSetOp.c.html#LN356"><span class='Ref_To_Local'>flag</span></a> <span class='Operator'>= </span><a href="nodeSetOp.c.html#LN99"><span class='Ref_to_Func'>fetch_tuple_flag</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN355"><span class='Ref_To_Local'>outerslot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN356"><span class='Ref_To_Local'>flag</span></a> <span class='Operator'>== </span><a href="nodeSetOp.c.html#LN334"><span class='Ref_To_Local'>firstFlag</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* (still) in first input relation */ 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span>in_first_rel<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Find or build hashtable entry for this tuple's group */ 
+</span>            <a href="nodeSetOp.c.html#LN357"><span class='Ref_To_Local'>entry</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN138"><span class='Ref_to_Proto'>LookupTupleHashEntry</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1952"><span class='Ref_to_Member'>hashtable</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN355"><span class='Ref_To_Local'>outerslot</span></a><span class='Delimiter'>, 
+</span>                                         <span class='Operator'>&</span><a href="nodeSetOp.c.html#LN358"><span class='Ref_To_Local'>isnew</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* If new tuple group, initialize counts */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN358"><span class='Ref_To_Local'>isnew</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="nodeSetOp.c.html#LN357"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN566"><span class='Ref_to_Member'>additional</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a><span class='Parentheses'>) 
+</span>                    <a href="../../include/utils/palloc.h.html#LN70"><span class='Ref_to_Proto'>MemoryContextAlloc</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1952"><span class='Ref_to_Member'>hashtable</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN586"><span class='Ref_to_Member'>tablecxt</span></a><span class='Delimiter'>, 
+</span>                                       <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN62"><span class='Ref_to_Struct'>SetOpStatePerGroupData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>                <a href="nodeSetOp.c.html#LN77"><span class='Ref_to_Func'>initialize_counts</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN357"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN566"><span class='Ref_to_Member'>additional</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* Advance the counts */ 
+</span>            <a href="nodeSetOp.c.html#LN86"><span class='Ref_to_Func'>advance_counts</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN357"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN566"><span class='Ref_to_Member'>additional</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN356"><span class='Ref_To_Local'>flag</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if flag==firstFlag &raquo; </span> 
+        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* reached second relation */ 
+</span>            in_first_rel <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* For tuples not seen previously, do not make hashtable entry */ 
+</span>            <a href="nodeSetOp.c.html#LN357"><span class='Ref_To_Local'>entry</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN138"><span class='Ref_to_Proto'>LookupTupleHashEntry</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1952"><span class='Ref_to_Member'>hashtable</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN355"><span class='Ref_To_Local'>outerslot</span></a><span class='Delimiter'>, 
+</span>                                         <span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Advance the counts if entry is already present */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN357"><span class='Ref_To_Local'>entry</span></a><span class='Parentheses'>) 
+</span>                <a href="nodeSetOp.c.html#LN86"><span class='Ref_to_Func'>advance_counts</span></a><span class='Parentheses'>((</span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN357"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN566"><span class='Ref_to_Member'>additional</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN356"><span class='Ref_To_Local'>flag</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Must reset temp context after each hashtable lookup */ 
+</span>        <a href="../../include/utils/memutils.h.html#LN73"><span class='Ref_to_Proto'>MemoryContextReset</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1947"><span class='Ref_to_Member'>tempContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1954"><span class='Ref_to_Member'>table_filled</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* Initialize to walk the hash table */ 
+</span>    <a href="../../include/nodes/execnodes.h.html#LN608"><span class='Ref_to_Macro'>ResetTupleHashIterator</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1952"><span class='Ref_to_Member'>hashtable</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeSetOp.c.html#LN330"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1955"><span class='Ref_to_Member'>hashiter</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end setop_fill_hash_table &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ExecSetOp for hashed case: phase 2, retrieving groups from hash table 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN415"></a><span class='Declare_Function'>setop_retrieve_hash_table</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>setopstate</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN417"></a>    <a href="../../include/nodes/execnodes.h.html#LN563"><span class='Ref_to_Struct'>TupleHashEntryData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>entry</span><span class='Delimiter'>; 
+</span><a name="LN418"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>resultTupleSlot</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * get state info from node 
+     */ 
+</span>    <a href="nodeSetOp.c.html#LN418"><span class='Ref_To_Local'>resultTupleSlot</span></a> <span class='Operator'>= </span><a href="nodeSetOp.c.html#LN415"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN841"><span class='Ref_to_Member'>ps_ResultTupleSlot</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We loop retrieving groups until we find one we should return 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeSetOp.c.html#LN415"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1945"><span class='Ref_to_Member'>setop_done</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Find the next entry in the hash table 
+         */ 
+</span>        <a href="nodeSetOp.c.html#LN417"><span class='Ref_To_Local'>entry</span></a> <span class='Operator'>= </span><a href="../../include/nodes/execnodes.h.html#LN610"><span class='Ref_to_Macro'>ScanTupleHashTable</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN415"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1952"><span class='Ref_to_Member'>hashtable</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeSetOp.c.html#LN415"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1955"><span class='Ref_to_Member'>hashiter</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN417"><span class='Ref_To_Local'>entry</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* No more entries in hashtable, so done */ 
+</span>            <a href="nodeSetOp.c.html#LN415"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1945"><span class='Ref_to_Member'>setop_done</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * See if we should emit any copies of this tuple, and if so return 
+         * the first copy. 
+         */ 
+</span>        <a href="nodeSetOp.c.html#LN141"><span class='Ref_to_Func'>set_output_count</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN415"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN417"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN566"><span class='Ref_to_Member'>additional</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN415"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="nodeSetOp.c.html#LN415"><span class='Ref_to_Parameter'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <a href="../../include/executor/tuptable.h.html#LN151"><span class='Ref_to_Proto'>ExecStoreMinimalTuple</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN417"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN565"><span class='Ref_to_Member'>firstTuple</span></a><span class='Delimiter'>, 
+</span>                                         <a href="nodeSetOp.c.html#LN418"><span class='Ref_To_Local'>resultTupleSlot</span></a><span class='Delimiter'>, 
+</span>                                         <span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while !setopstate-&GT;setop_do... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* No more groups */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN418"><span class='Ref_To_Local'>resultTupleSlot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end setop_retrieve_hash_table &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecInitSetOp 
+ * 
+ *      This initializes the setop node state structures and 
+ *      the node's subplan. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>* 
+</span><a name="LN469"></a><span class='Declare_Function'>ExecInitSetOp</span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>eflags</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN471"></a>    <a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Local'>setopstate</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* check for unsupported flags */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>eflags</span></a> <span class='Operator'>& </span><span class='Parentheses'>(</span><a href="../../include/executor/executor.h.html#LN59"><span class='Ref_to_Const'>EXEC_FLAG_BACKWARD</span></a> <span class='Operator'>| </span><a href="../../include/executor/executor.h.html#LN60"><span class='Ref_to_Const'>EXEC_FLAG_MARK</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * create state structure 
+     */ 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a> <span class='Operator'>= </span><a href="../../include/nodes/nodes.h.html#LN556"><span class='Ref_to_Macro'>makeNode</span></a><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN117"><span class='Ref_to_Struct'>Plan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN814"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>= </span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1943"><span class='Ref_to_Member'>eqfunctions</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1944"><span class='Ref_to_Member'>hashfunctions</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1945"><span class='Ref_to_Member'>setop_done</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1949"><span class='Ref_to_Member'>pergroup</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1950"><span class='Ref_to_Member'>grp_firstTuple</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1952"><span class='Ref_to_Member'>hashtable</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1953"><span class='Ref_to_Member'>tableContext</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Miscellaneous initialization 
+     * 
+     * SetOp nodes have no ExprContext initialization because they never call 
+     * ExecQual or ExecProject.  But they do need a per-tuple memory context 
+     * anyway for calling execTuplesMatch. 
+     */ 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1947"><span class='Ref_to_Member'>tempContext</span></a> <span class='Operator'>= 
+</span>        <a href="../../include/utils/memutils.h.html#LN145"><span class='Ref_to_Proto'>AllocSetContextCreate</span></a><span class='Parentheses'>(</span><a href="../utils/mmgr/mcxt.c.html#LN36"><span class='Ref_to_Global_Var'>CurrentMemoryContext</span></a><span class='Delimiter'>, 
+</span>                              <span class='String'>"SetOp"</span><span class='Delimiter'>, 
+</span>                              <a href="../../include/utils/memutils.h.html#LN164"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_SIZES</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If hashing, we also need a longer-lived context to store the hash 
+     * table.  The table can't just be kept in the per-query context because 
+     * we want to be able to throw it away in ExecReScanSetOp. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN880"><span class='Ref_to_Member'>strategy</span></a> <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN788"><span class='Ref_to_EnumConst'>SETOP_HASHED</span></a><span class='Parentheses'>) 
+</span>        <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1953"><span class='Ref_to_Member'>tableContext</span></a> <span class='Operator'>= 
+</span>            <a href="../../include/utils/memutils.h.html#LN145"><span class='Ref_to_Proto'>AllocSetContextCreate</span></a><span class='Parentheses'>(</span><a href="../utils/mmgr/mcxt.c.html#LN36"><span class='Ref_to_Global_Var'>CurrentMemoryContext</span></a><span class='Delimiter'>, 
+</span>                                  <span class='String'>"SetOp hash table"</span><span class='Delimiter'>, 
+</span>                                  <a href="../../include/utils/memutils.h.html#LN164"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_SIZES</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Tuple table initialization 
+     */ 
+</span>    <a href="../../include/executor/executor.h.html#LN400"><span class='Ref_to_Proto'>ExecInitResultTupleSlot</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * initialize child nodes 
+     * 
+     * If we are hashing then the child plan does not need to handle REWIND 
+     * efficiently; see ExecReScanSetOp. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN880"><span class='Ref_to_Member'>strategy</span></a> <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN788"><span class='Ref_to_EnumConst'>SETOP_HASHED</span></a><span class='Parentheses'>) 
+</span>        <a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>eflags</span></a> <span class='Operator'>&= ~</span><a href="../../include/executor/executor.h.html#LN58"><span class='Ref_to_Const'>EXEC_FLAG_REWIND</span></a><span class='Delimiter'>; 
+</span>    <a href="../../include/nodes/execnodes.h.html#LN854"><span class='Ref_to_Macro'>outerPlanState</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="execProcnode.c.html#LN138"><span class='Ref_to_Func'>ExecInitNode</span></a><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN173"><span class='Ref_to_Macro'>outerPlan</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * setop nodes do no projections, so initialize projection info for this 
+     * node appropriately 
+     */ 
+</span>    <a href="execUtils.c.html#LN438"><span class='Ref_to_Func'>ExecAssignResultTypeFromTL</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN843"><span class='Ref_to_Member'>ps_ProjInfo</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Precompute fmgr lookup data for inner loop. We need both equality and 
+     * hashing functions to do it by hashing, but only equality if not 
+     * hashing. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN880"><span class='Ref_to_Member'>strategy</span></a> <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN788"><span class='Ref_to_EnumConst'>SETOP_HASHED</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/executor/executor.h.html#LN128"><span class='Ref_to_Proto'>execTuplesHashPrepare</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN881"><span class='Ref_to_Member'>numCols</span></a><span class='Delimiter'>, 
+</span>                              <a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN884"><span class='Ref_to_Member'>dupOperators</span></a><span class='Delimiter'>, 
+</span>                              <span class='Operator'>&</span><a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1943"><span class='Ref_to_Member'>eqfunctions</span></a><span class='Delimiter'>, 
+</span>                              <span class='Operator'>&</span><a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1944"><span class='Ref_to_Member'>hashfunctions</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1943"><span class='Ref_to_Member'>eqfunctions</span></a> <span class='Operator'>= 
+</span>            <a href="../../include/executor/executor.h.html#LN126"><span class='Ref_to_Proto'>execTuplesMatchPrepare</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN881"><span class='Ref_to_Member'>numCols</span></a><span class='Delimiter'>, 
+</span>                                   <a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN884"><span class='Ref_to_Member'>dupOperators</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN469"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN880"><span class='Ref_to_Member'>strategy</span></a> <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN788"><span class='Ref_to_EnumConst'>SETOP_HASHED</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="nodeRecursiveunion.c.html#LN30"><span class='Ref_to_Func'>build_hash_table</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1954"><span class='Ref_to_Member'>table_filled</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1949"><span class='Ref_to_Member'>pergroup</span></a> <span class='Operator'>= 
+</span>            <span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1938"><span class='Ref_to_Typedef'>SetOpStatePerGroup</span></a><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN62"><span class='Ref_to_Struct'>SetOpStatePerGroupData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="nodeSetOp.c.html#LN471"><span class='Ref_To_Local'>setopstate</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecInitSetOp &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecEndSetOp 
+ * 
+ *      This shuts down the subplan and frees resources allocated 
+ *      to this node. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN574"></a><span class='Declare_Function'>ExecEndSetOp</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* clean up tuple table */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN574"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN841"><span class='Ref_to_Member'>ps_ResultTupleSlot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* free subsidiary stuff including hashtable */ 
+</span>    <a href="../../include/utils/memutils.h.html#LN74"><span class='Ref_to_Proto'>MemoryContextDelete</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN574"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1947"><span class='Ref_to_Member'>tempContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN574"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1953"><span class='Ref_to_Member'>tableContext</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/memutils.h.html#LN74"><span class='Ref_to_Proto'>MemoryContextDelete</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN574"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1953"><span class='Ref_to_Member'>tableContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/executor/executor.h.html#LN231"><span class='Ref_to_Proto'>ExecEndNode</span></a><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN854"><span class='Ref_to_Macro'>outerPlanState</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN574"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Keyword'>void 
+</span><a name="LN589"></a><span class='Declare_Function'>ExecReScanSetOp</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1940"><span class='Ref_to_Struct'>SetOpState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN841"><span class='Ref_to_Member'>ps_ResultTupleSlot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1945"><span class='Ref_to_Member'>setop_done</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1946"><span class='Ref_to_Member'>numOutput</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(((</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>strategy <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN788"><span class='Ref_to_EnumConst'>SETOP_HASHED</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * In the hashed case, if we haven't yet built the hash table then we 
+         * can just return; nothing done yet, so nothing to undo. If subnode's 
+         * chgParam is not NULL then it will be re-scanned by ExecProcNode, 
+         * else no reason to re-scan it at all. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1954"><span class='Ref_to_Member'>table_filled</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If we do have the hash table and the subplan does not have any 
+         * parameter changes, then we can just rescan the existing hash table; 
+         * no need to build it again. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN827"><span class='Ref_to_Member'>lefttree</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN836"><span class='Ref_to_Member'>chgParam</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../include/nodes/execnodes.h.html#LN608"><span class='Ref_to_Macro'>ResetTupleHashIterator</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1952"><span class='Ref_to_Member'>hashtable</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1955"><span class='Ref_to_Member'>hashiter</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if ((SetOp*)node-&GT;ps.pla... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Release first tuple of group, if we have made a copy */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1950"><span class='Ref_to_Member'>grp_firstTuple</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/access/htup_details.h.html#LN815"><span class='Ref_to_Proto'>heap_freetuple</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1950"><span class='Ref_to_Member'>grp_firstTuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1950"><span class='Ref_to_Member'>grp_firstTuple</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Release any hashtable storage */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1953"><span class='Ref_to_Member'>tableContext</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/memutils.h.html#LN66"><span class='Ref_to_Macro'>MemoryContextResetAndDeleteChildren</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1953"><span class='Ref_to_Member'>tableContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* And rebuild empty hashtable if needed */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(((</span><a href="../../include/nodes/plannodes.h.html#LN876"><span class='Ref_to_Struct'>SetOp</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>strategy <span class='Operator'>== </span><a href="../../include/nodes/nodes.h.html#LN788"><span class='Ref_to_EnumConst'>SETOP_HASHED</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="nodeRecursiveunion.c.html#LN30"><span class='Ref_to_Func'>build_hash_table</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1954"><span class='Ref_to_Member'>table_filled</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * if chgParam of subnode is not null then plan will be re-scanned by 
+     * first ExecProcNode. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN827"><span class='Ref_to_Member'>lefttree</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN836"><span class='Ref_to_Member'>chgParam</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="execAmi.c.html#LN73"><span class='Ref_to_Func'>ExecReScan</span></a><span class='Parentheses'>(</span><a href="nodeSetOp.c.html#LN589"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1942"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN827"><span class='Ref_to_Member'>lefttree</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecReScanSetOp &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

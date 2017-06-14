@@ -1,0 +1,682 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\optimizer\prep\prepqual.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\optimizer\prep\prepqual.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:42 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * prepqual.c 
+ *    Routines for preprocessing qualification expressions 
+ * 
+ * 
+ * While the parser will produce flattened (N-argument) AND/OR trees from 
+ * simple sequences of AND'ed or OR'ed clauses, there might be an AND clause 
+ * directly underneath another AND, or OR underneath OR, if the input was 
+ * oddly parenthesized.  Also, rule expansion and subquery flattening could 
+ * produce such parsetrees.  The planner wants to flatten all such cases 
+ * to ensure consistent optimization behavior. 
+ * 
+ * Formerly, this module was responsible for doing the initial flattening, 
+ * but now we leave it to eval_const_expressions to do that since it has to 
+ * make a complete pass over the expression tree anyway.  Instead, we just 
+ * have to ensure that our manipulations preserve AND/OR flatness. 
+ * pull_ands() and pull_ors() are used to maintain flatness of the AND/OR 
+ * tree after local transformations that might introduce nested AND/ORs. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/optimizer/prep/prepqual.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"nodes/makefuncs.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"optimizer/clauses.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"optimizer/prep.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/lsyscache.h"</span> 
+ 
+ 
+<a name="LN39"></a><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>pull_ands</span><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>andlist</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN40"></a><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>pull_ors</span><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>orlist</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN41"></a><span class='Keyword'>static </span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>find_duplicate_ors</span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>qual</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN42"></a><span class='Keyword'>static </span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>process_duplicate_ors</span><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>orlist</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * negate_clause 
+ *    Negate a Boolean expression. 
+ * 
+ * Input is a clause to be negated (e.g., the argument of a NOT clause). 
+ * Returns a new clause equivalent to the negation of the given clause. 
+ * 
+ * Although this can be invoked on its own, it's mainly intended as a helper 
+ * for eval_const_expressions(), and that context drives several design 
+ * decisions.  In particular, if the input is already AND/OR flat, we must 
+ * preserve that property.  We also don't bother to recurse in situations 
+ * where we can assume that lower-level executions of eval_const_expressions 
+ * would already have simplified sub-clauses of the input. 
+ * 
+ * The difference between this and a simple make_notclause() is that this 
+ * tries to get rid of the NOT node by logical simplification.  It's clearly 
+ * always a win if the NOT node can be eliminated altogether.  However, our 
+ * use of DeMorgan's laws could result in having more NOT nodes rather than 
+ * fewer.  We do that unconditionally anyway, because in WHERE clauses it's 
+ * important to expose as much top-level AND/OR structure as possible. 
+ * Also, eliminating an intermediate NOT may allow us to flatten two levels 
+ * of AND or OR together that we couldn't have otherwise.  Finally, one of 
+ * the motivations for doing this is to ensure that logically equivalent 
+ * expressions will be seen as physically equal(), so we should always apply 
+ * the same transformations. 
+ */ 
+</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>* 
+</span><a name="LN72"></a><span class='Declare_Function'>negate_clause</span><span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN72"><span class='Ref_to_Parameter'>node</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span>           <span class='Comment_Single_Line'>/* should not happen */ 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"can't negate an empty subexpression"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN513"><span class='Ref_to_Macro'>nodeTag</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN72"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="../../../include/nodes/nodes.h.html#LN146"><span class='Ref_to_EnumConst'>T_Const</span></a><span class='Operator'>: 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN80"></a>                <a href="../../../include/nodes/primnodes.h.html#LN188"><span class='Ref_to_Struct'>Const</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>c</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN188"><span class='Ref_to_Struct'>Const</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN72"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* NOT NULL is still NULL */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN80"><span class='Ref_To_Local'>c</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN196"><span class='Ref_to_Member'>constisnull</span></a><span class='Parentheses'>) 
+</span>                    <span class='Control'>return</span> <a href="../../../include/nodes/makefuncs.h.html#LN59"><span class='Ref_to_Proto'>makeBoolConst</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Comment_Multi_Line'>/* otherwise pretty easy */ 
+</span>                <span class='Control'>return</span> <a href="../../../include/nodes/makefuncs.h.html#LN59"><span class='Ref_to_Proto'>makeBoolConst</span></a><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/postgres.h.html#LN398"><span class='Ref_to_Macro'>DatumGetBool</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN80"><span class='Ref_To_Local'>c</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN195"><span class='Ref_to_Member'>constvalue</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../../include/nodes/nodes.h.html#LN154"><span class='Ref_to_EnumConst'>T_OpExpr</span></a><span class='Operator'>: 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * Negate operator if possible: (NOT (&LT; A B)) =&GT; (&GT;= A B) 
+                 */ 
+</span><a name="LN94"></a>                <a href="../../../include/nodes/primnodes.h.html#LN491"><span class='Ref_to_Struct'>OpExpr</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>opexpr</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN491"><span class='Ref_to_Struct'>OpExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN72"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>; 
+</span><a name="LN95"></a>                <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>negator</span> <span class='Operator'>= </span><a href="../../../include/utils/lsyscache.h.html#LN107"><span class='Ref_to_Proto'>get_negator</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN94"><span class='Ref_To_Local'>opexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN494"><span class='Ref_to_Member'>opno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN95"><span class='Ref_To_Local'>negator</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span><a name="LN99"></a>                    <a href="../../../include/nodes/primnodes.h.html#LN491"><span class='Ref_to_Struct'>OpExpr</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>newopexpr</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN556"><span class='Ref_to_Macro'>makeNode</span></a><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN491"><span class='Ref_to_Struct'>OpExpr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                    <a href="prepqual.c.html#LN99"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN494"><span class='Ref_to_Member'>opno</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN95"><span class='Ref_To_Local'>negator</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN99"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN495"><span class='Ref_to_Member'>opfuncid</span></a> <span class='Operator'>= </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN99"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN496"><span class='Ref_to_Member'>opresulttype</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN94"><span class='Ref_To_Local'>opexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN496"><span class='Ref_to_Member'>opresulttype</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN99"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN497"><span class='Ref_to_Member'>opretset</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN94"><span class='Ref_To_Local'>opexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN497"><span class='Ref_to_Member'>opretset</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN99"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN498"><span class='Ref_to_Member'>opcollid</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN94"><span class='Ref_To_Local'>opexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN498"><span class='Ref_to_Member'>opcollid</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN99"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN499"><span class='Ref_to_Member'>inputcollid</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN94"><span class='Ref_To_Local'>opexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN499"><span class='Ref_to_Member'>inputcollid</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN99"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN500"><span class='Ref_to_Member'>args</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN94"><span class='Ref_To_Local'>opexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN500"><span class='Ref_to_Member'>args</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN99"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN501"><span class='Ref_to_Member'>location</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN94"><span class='Ref_To_Local'>opexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN501"><span class='Ref_to_Member'>location</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN99"><span class='Ref_To_Local'>newopexpr</span></a><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../../include/nodes/nodes.h.html#LN157"><span class='Ref_to_EnumConst'>T_ScalarArrayOpExpr</span></a><span class='Operator'>: 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * Negate a ScalarArrayOpExpr if its operator has a negator; 
+                 * for example x = ANY (list) becomes x &LT;&GT; ALL (list) 
+                 */ 
+</span><a name="LN119"></a>                <a href="../../../include/nodes/primnodes.h.html#LN534"><span class='Ref_to_Struct'>ScalarArrayOpExpr</span></a> <span class='Operator'>*</span><span class='Declare_Local'>saopexpr</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN534"><span class='Ref_to_Struct'>ScalarArrayOpExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN72"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>; 
+</span><a name="LN120"></a>                <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>negator</span> <span class='Operator'>= </span><a href="../../../include/utils/lsyscache.h.html#LN107"><span class='Ref_to_Proto'>get_negator</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN119"><span class='Ref_To_Local'>saopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN537"><span class='Ref_to_Member'>opno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN120"><span class='Ref_To_Local'>negator</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span><a name="LN124"></a>                    <a href="../../../include/nodes/primnodes.h.html#LN534"><span class='Ref_to_Struct'>ScalarArrayOpExpr</span></a> <span class='Operator'>*</span><span class='Declare_Local'>newopexpr</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN556"><span class='Ref_to_Macro'>makeNode</span></a><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN534"><span class='Ref_to_Struct'>ScalarArrayOpExpr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                    <a href="prepqual.c.html#LN124"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN537"><span class='Ref_to_Member'>opno</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN120"><span class='Ref_To_Local'>negator</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN124"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN538"><span class='Ref_to_Member'>opfuncid</span></a> <span class='Operator'>= </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN124"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN539"><span class='Ref_to_Member'>useOr</span></a> <span class='Operator'>= !</span><a href="prepqual.c.html#LN119"><span class='Ref_To_Local'>saopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN539"><span class='Ref_to_Member'>useOr</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN124"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN540"><span class='Ref_to_Member'>inputcollid</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN119"><span class='Ref_To_Local'>saopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN540"><span class='Ref_to_Member'>inputcollid</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN124"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN541"><span class='Ref_to_Member'>args</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN119"><span class='Ref_To_Local'>saopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN541"><span class='Ref_to_Member'>args</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN124"><span class='Ref_To_Local'>newopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN542"><span class='Ref_to_Member'>location</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN119"><span class='Ref_To_Local'>saopexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN542"><span class='Ref_to_Member'>location</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN124"><span class='Ref_To_Local'>newopexpr</span></a><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../../include/nodes/nodes.h.html#LN158"><span class='Ref_to_EnumConst'>T_BoolExpr</span></a><span class='Operator'>: 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN138"></a>                <a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>expr</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN72"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN138"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN560"><span class='Ref_to_Member'>boolop</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                        <span class='Comment_Multi_Line'>/*-------------------- 
+                         * Apply DeMorgan's Laws: 
+                         *      (NOT (AND A B)) =&GT; (OR (NOT A) (NOT B)) 
+                         *      (NOT (OR A B))  =&GT; (AND (NOT A) (NOT B)) 
+                         * i.e., swap AND for OR and negate each subclause. 
+                         * 
+                         * If the input is already AND/OR flat and has no NOT 
+                         * directly above AND or OR, this transformation preserves 
+                         * those properties.  For example, if no direct child of 
+                         * the given AND clause is an AND or a NOT-above-OR, then 
+                         * the recursive calls of negate_clause() can't return any 
+                         * OR clauses.  So we needn't call pull_ors() before 
+                         * building a new OR clause.  Similarly for the OR case. 
+                         *-------------------- 
+                         */ 
+</span>                    <span class='Control'>case</span> <a href="../../../include/nodes/primnodes.h.html#LN554"><span class='Ref_to_EnumConst'>AND_EXPR</span></a><span class='Operator'>: 
+</span>                        <span class='Delimiter'>{ 
+</span><a name="LN159"></a>                            <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>nargs</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN160"></a>                            <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>lc</span><span class='Delimiter'>; 
+</span> 
+                            <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN160"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN138"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN561"><span class='Ref_to_Member'>args</span></a><span class='Parentheses'>) 
+</span>                            <span class='Delimiter'>{ 
+</span>                                <a href="prepqual.c.html#LN159"><span class='Ref_To_Local'>nargs</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN159"><span class='Ref_To_Local'>nargs</span></a><span class='Delimiter'>, 
+</span>                                                <a href="../../../include/optimizer/prep.h.html#LN34"><span class='Ref_to_Proto'>negate_clause</span></a><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN160"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                            <span class='Delimiter'>} 
+</span>                            <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/optimizer/clauses.h.html#LN40"><span class='Ref_to_Proto'>make_orclause</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN159"><span class='Ref_To_Local'>nargs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                        <span class='Delimiter'>} 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>case</span> <a href="../../../include/nodes/primnodes.h.html#LN554"><span class='Ref_to_EnumConst'>OR_EXPR</span></a><span class='Operator'>: 
+</span>                        <span class='Delimiter'>{ 
+</span><a name="LN172"></a>                            <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>nargs</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN173"></a>                            <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>lc</span><span class='Delimiter'>; 
+</span> 
+                            <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN173"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN138"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN561"><span class='Ref_to_Member'>args</span></a><span class='Parentheses'>) 
+</span>                            <span class='Delimiter'>{ 
+</span>                                <a href="prepqual.c.html#LN172"><span class='Ref_To_Local'>nargs</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN172"><span class='Ref_To_Local'>nargs</span></a><span class='Delimiter'>, 
+</span>                                                <a href="../../../include/optimizer/prep.h.html#LN34"><span class='Ref_to_Proto'>negate_clause</span></a><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN173"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                            <span class='Delimiter'>} 
+</span>                            <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/optimizer/clauses.h.html#LN43"><span class='Ref_to_Proto'>make_andclause</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN172"><span class='Ref_To_Local'>nargs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                        <span class='Delimiter'>} 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>case</span> <a href="../../../include/nodes/primnodes.h.html#LN554"><span class='Ref_to_EnumConst'>NOT_EXPR</span></a><span class='Operator'>: 
+</span> 
+                        <span class='Comment_Multi_Line'>/* 
+                         * NOT underneath NOT: they cancel.  We assume the 
+                         * input is already simplified, so no need to recurse. 
+                         */ 
+</span>                        <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN110"><span class='Ref_to_Macro'>linitial</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN138"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN561"><span class='Ref_to_Member'>args</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>default</span><span class='Operator'>: 
+</span>                        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unrecognized boolop: %d"</span><span class='Delimiter'>, 
+</span>                             <span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN138"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN560"><span class='Ref_to_Member'>boolop</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch expr-&GT;boolop &raquo; </span> 
+            <span class='Delimiter'>} 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../../include/nodes/nodes.h.html#LN179"><span class='Ref_to_EnumConst'>T_NullTest</span></a><span class='Operator'>: 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN199"></a>                <a href="../../../include/nodes/primnodes.h.html#LN1175"><span class='Ref_to_Struct'>NullTest</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>expr</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN1175"><span class='Ref_to_Struct'>NullTest</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN72"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * In the rowtype case, the two flavors of NullTest are *not* 
+                 * logical inverses, so we can't simplify.  But it does work 
+                 * for scalar datatypes. 
+                 */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="prepqual.c.html#LN199"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1180"><span class='Ref_to_Member'>argisrow</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span><a name="LN208"></a>                    <a href="../../../include/nodes/primnodes.h.html#LN1175"><span class='Ref_to_Struct'>NullTest</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>newexpr</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN556"><span class='Ref_to_Macro'>makeNode</span></a><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN1175"><span class='Ref_to_Struct'>NullTest</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                    <a href="prepqual.c.html#LN208"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1178"><span class='Ref_to_Member'>arg</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN199"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1178"><span class='Ref_to_Member'>arg</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN208"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1179"><span class='Ref_to_Member'>nulltesttype</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="prepqual.c.html#LN199"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1179"><span class='Ref_to_Member'>nulltesttype</span></a> <span class='Operator'>== </span><a href="../../../include/nodes/primnodes.h.html#LN1172"><span class='Ref_to_EnumConst'>IS_NULL</span></a> <span class='Operator'>? 
+</span>                                             <a href="../../../include/nodes/primnodes.h.html#LN1172"><span class='Ref_to_EnumConst'>IS_NOT_NULL</span></a> <span class='Operator'>: </span><a href="../../../include/nodes/primnodes.h.html#LN1172"><span class='Ref_to_EnumConst'>IS_NULL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN208"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1180"><span class='Ref_to_Member'>argisrow</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN199"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1180"><span class='Ref_to_Member'>argisrow</span></a><span class='Delimiter'>; 
+</span>                    <a href="prepqual.c.html#LN208"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1181"><span class='Ref_to_Member'>location</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN199"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1181"><span class='Ref_to_Member'>location</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN208"><span class='Ref_To_Local'>newexpr</span></a><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>case</span> <a href="../../../include/nodes/nodes.h.html#LN180"><span class='Ref_to_EnumConst'>T_BooleanTest</span></a><span class='Operator'>: 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN221"></a>                <a href="../../../include/nodes/primnodes.h.html#LN1198"><span class='Ref_to_Struct'>BooleanTest</span></a> <span class='Operator'>*</span><span class='Declare_Local'>expr</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN1198"><span class='Ref_to_Struct'>BooleanTest</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN72"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>; 
+</span><a name="LN222"></a>                <a href="../../../include/nodes/primnodes.h.html#LN1198"><span class='Ref_to_Struct'>BooleanTest</span></a> <span class='Operator'>*</span><span class='Declare_Local'>newexpr</span> <span class='Operator'>= </span><a href="../../../include/nodes/nodes.h.html#LN556"><span class='Ref_to_Macro'>makeNode</span></a><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN1198"><span class='Ref_to_Struct'>BooleanTest</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="prepqual.c.html#LN222"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1201"><span class='Ref_to_Member'>arg</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN221"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1201"><span class='Ref_to_Member'>arg</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN221"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1202"><span class='Ref_to_Member'>booltesttype</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <span class='Control'>case</span> <a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_TRUE</span></a><span class='Operator'>: 
+</span>                        <a href="prepqual.c.html#LN222"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1202"><span class='Ref_to_Member'>booltesttype</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_NOT_TRUE</span></a><span class='Delimiter'>; 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>case</span> <a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_NOT_TRUE</span></a><span class='Operator'>: 
+</span>                        <a href="prepqual.c.html#LN222"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1202"><span class='Ref_to_Member'>booltesttype</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_TRUE</span></a><span class='Delimiter'>; 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>case</span> <a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_FALSE</span></a><span class='Operator'>: 
+</span>                        <a href="prepqual.c.html#LN222"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1202"><span class='Ref_to_Member'>booltesttype</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_NOT_FALSE</span></a><span class='Delimiter'>; 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>case</span> <a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_NOT_FALSE</span></a><span class='Operator'>: 
+</span>                        <a href="prepqual.c.html#LN222"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1202"><span class='Ref_to_Member'>booltesttype</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_FALSE</span></a><span class='Delimiter'>; 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>case</span> <a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_UNKNOWN</span></a><span class='Operator'>: 
+</span>                        <a href="prepqual.c.html#LN222"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1202"><span class='Ref_to_Member'>booltesttype</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_NOT_UNKNOWN</span></a><span class='Delimiter'>; 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>case</span> <a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_NOT_UNKNOWN</span></a><span class='Operator'>: 
+</span>                        <a href="prepqual.c.html#LN222"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1202"><span class='Ref_to_Member'>booltesttype</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/primnodes.h.html#LN1195"><span class='Ref_to_EnumConst'>IS_UNKNOWN</span></a><span class='Delimiter'>; 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>default</span><span class='Operator'>: 
+</span>                        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unrecognized booltesttype: %d"</span><span class='Delimiter'>, 
+</span>                             <span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN221"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1202"><span class='Ref_to_Member'>booltesttype</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch expr-&GT;booltesttype &raquo; </span> 
+                <a href="prepqual.c.html#LN222"><span class='Ref_To_Local'>newexpr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1203"><span class='Ref_to_Member'>location</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN221"><span class='Ref_To_Local'>expr</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN1203"><span class='Ref_to_Member'>location</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN222"><span class='Ref_To_Local'>newexpr</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <span class='Comment_Multi_Line'>/* else fall through */ 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch nodeTag(node) &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Otherwise we don't know how to simplify this, so just tack on an 
+     * explicit NOT node. 
+     */ 
+</span>    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/optimizer/clauses.h.html#LN36"><span class='Ref_to_Proto'>make_notclause</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN72"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end negate_clause &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * canonicalize_qual 
+ *    Convert a qualification expression to the most useful form. 
+ * 
+ * The name of this routine is a holdover from a time when it would try to 
+ * force the expression into canonical AND-of-ORs or OR-of-ANDs form. 
+ * Eventually, we recognized that that had more theoretical purity than 
+ * actual usefulness, and so now the transformation doesn't involve any 
+ * notion of reaching a canonical form. 
+ * 
+ * NOTE: we assume the input has already been through eval_const_expressions 
+ * and therefore possesses AND/OR flatness.  Formerly this function included 
+ * its own flattening logic, but that requires a useless extra pass over the 
+ * tree. 
+ * 
+ * Returns the modified qualification. 
+ */ 
+</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>* 
+</span><a name="LN285"></a><span class='Declare_Function'>canonicalize_qual</span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>qual</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN287"></a>    <a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>newqual</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Quick exit for empty qual */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN285"><span class='Ref_to_Parameter'>qual</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Pull up redundant subclauses in OR-of-AND trees.  We do this only 
+     * within the top-level AND/OR structure; there's no point in looking 
+     * deeper.  Also remove any NULL constants in the top-level structure. 
+     */ 
+</span>    <a href="prepqual.c.html#LN287"><span class='Ref_To_Local'>newqual</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN41"><span class='Ref_to_Proto'>find_duplicate_ors</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN285"><span class='Ref_to_Parameter'>qual</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="prepqual.c.html#LN287"><span class='Ref_To_Local'>newqual</span></a><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * pull_ands 
+ *    Recursively flatten nested AND clauses into a single and-clause list. 
+ * 
+ * Input is the arglist of an AND clause. 
+ * Returns the rebuilt arglist (note original list structure is not touched). 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN312"></a><span class='Declare_Function'>pull_ands</span><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>andlist</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN314"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>out_list</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN315"></a>    <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>arg</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN315"><span class='Ref_To_Local'>arg</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN312"><span class='Ref_to_Parameter'>andlist</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN319"></a>        <a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>subexpr</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN315"><span class='Ref_To_Local'>arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Note: we can destructively concat the subexpression's arglist 
+         * because we know the recursive invocation of pull_ands will have 
+         * built a new arglist not shared with any other expr. Otherwise we'd 
+         * need a list_copy here. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN42"><span class='Ref_to_Proto'>and_clause</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN319"><span class='Ref_To_Local'>subexpr</span></a><span class='Parentheses'>))</span> 
+            <a href="prepqual.c.html#LN314"><span class='Ref_To_Local'>out_list</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN219"><span class='Ref_to_Proto'>list_concat</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN314"><span class='Ref_To_Local'>out_list</span></a><span class='Delimiter'>, 
+</span>                                   <a href="prepqual.c.html#LN39"><span class='Ref_to_Proto'>pull_ands</span></a><span class='Parentheses'>(((</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN319"><span class='Ref_To_Local'>subexpr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>args<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="prepqual.c.html#LN314"><span class='Ref_To_Local'>out_list</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN314"><span class='Ref_To_Local'>out_list</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN319"><span class='Ref_To_Local'>subexpr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <a href="prepqual.c.html#LN314"><span class='Ref_To_Local'>out_list</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pull_ands &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * pull_ors 
+ *    Recursively flatten nested OR clauses into a single or-clause list. 
+ * 
+ * Input is the arglist of an OR clause. 
+ * Returns the rebuilt arglist (note original list structure is not touched). 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN344"></a><span class='Declare_Function'>pull_ors</span><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>orlist</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN346"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>out_list</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN347"></a>    <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>arg</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN347"><span class='Ref_To_Local'>arg</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN344"><span class='Ref_to_Parameter'>orlist</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN351"></a>        <a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>subexpr</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN347"><span class='Ref_To_Local'>arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Note: we can destructively concat the subexpression's arglist 
+         * because we know the recursive invocation of pull_ors will have 
+         * built a new arglist not shared with any other expr. Otherwise we'd 
+         * need a list_copy here. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN39"><span class='Ref_to_Proto'>or_clause</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN351"><span class='Ref_To_Local'>subexpr</span></a><span class='Parentheses'>))</span> 
+            <a href="prepqual.c.html#LN346"><span class='Ref_To_Local'>out_list</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN219"><span class='Ref_to_Proto'>list_concat</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN346"><span class='Ref_To_Local'>out_list</span></a><span class='Delimiter'>, 
+</span>                                   <a href="prepqual.c.html#LN40"><span class='Ref_to_Proto'>pull_ors</span></a><span class='Parentheses'>(((</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN351"><span class='Ref_To_Local'>subexpr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>args<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="prepqual.c.html#LN346"><span class='Ref_To_Local'>out_list</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN346"><span class='Ref_To_Local'>out_list</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN351"><span class='Ref_To_Local'>subexpr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <a href="prepqual.c.html#LN346"><span class='Ref_To_Local'>out_list</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pull_ors &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/*-------------------- 
+ * The following code attempts to apply the inverse OR distributive law: 
+ *      ((A AND B) OR (A AND C))  =&GT;  (A AND (B OR C)) 
+ * That is, locate OR clauses in which every subclause contains an 
+ * identical term, and pull out the duplicated terms. 
+ * 
+ * This may seem like a fairly useless activity, but it turns out to be 
+ * applicable to many machine-generated queries, and there are also queries 
+ * in some of the TPC benchmarks that need it.  This was in fact almost the 
+ * sole useful side-effect of the old prepqual code that tried to force 
+ * the query into canonical AND-of-ORs form: the canonical equivalent of 
+ *      ((A AND B) OR (A AND C)) 
+ * is 
+ *      ((A OR A) AND (A OR C) AND (B OR A) AND (B OR C)) 
+ * which the code was able to simplify to 
+ *      (A AND (A OR C) AND (B OR A) AND (B OR C)) 
+ * thus successfully extracting the common condition A --- but at the cost 
+ * of cluttering the qual with many redundant clauses. 
+ *-------------------- 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * find_duplicate_ors 
+ *    Given a qualification tree with the NOTs pushed down, search for 
+ *    OR clauses to which the inverse OR distributive law might apply. 
+ *    Only the top-level AND/OR structure is searched. 
+ * 
+ * While at it, we remove any NULL constants within the top-level AND/OR 
+ * structure, eg "x OR NULL::boolean" is reduced to "x".  In general that 
+ * would change the result, so eval_const_expressions can't do it; but at 
+ * top level of WHERE, we don't need to distinguish between FALSE and NULL 
+ * results, so it's valid to treat NULL::boolean the same as FALSE and then 
+ * simplify AND/OR accordingly. 
+ * 
+ * Returns the modified qualification.  AND/OR flatness is preserved. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>* 
+</span><a name="LN406"></a><span class='Declare_Function'>find_duplicate_ors</span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>qual</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN39"><span class='Ref_to_Proto'>or_clause</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN406"><span class='Ref_to_Parameter'>qual</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN410"></a>        <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>orlist</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN411"></a>        <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>temp</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Recurse */ 
+</span>        <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN411"><span class='Ref_To_Local'>temp</span></a><span class='Delimiter'>, </span><span class='Parentheses'>((</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN406"><span class='Ref_to_Parameter'>qual</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>args<span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN416"></a>            <a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>arg</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN411"><span class='Ref_To_Local'>temp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="prepqual.c.html#LN416"><span class='Ref_To_Local'>arg</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN41"><span class='Ref_to_Proto'>find_duplicate_ors</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN416"><span class='Ref_To_Local'>arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Get rid of any constant inputs */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN416"><span class='Ref_To_Local'>arg</span></a> <span class='Operator'>&& </span><a href="../../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN416"><span class='Ref_To_Local'>arg</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/primnodes.h.html#LN188"><span class='Ref_to_Struct'>Const</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span><a name="LN423"></a>                <a href="../../../include/nodes/primnodes.h.html#LN188"><span class='Ref_to_Struct'>Const</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>carg</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN188"><span class='Ref_to_Struct'>Const</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN416"><span class='Ref_To_Local'>arg</span></a><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* Drop constant FALSE or NULL */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN423"><span class='Ref_To_Local'>carg</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN196"><span class='Ref_to_Member'>constisnull</span></a> <span class='Operator'>|| !</span><a href="../../../include/postgres.h.html#LN398"><span class='Ref_to_Macro'>DatumGetBool</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN423"><span class='Ref_To_Local'>carg</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN195"><span class='Ref_to_Member'>constvalue</span></a><span class='Parentheses'>))</span> 
+                    <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>                <span class='Comment_Multi_Line'>/* constant TRUE, so OR reduces to TRUE */ 
+</span>                <span class='Control'>return</span> <a href="prepqual.c.html#LN416"><span class='Ref_To_Local'>arg</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <a href="prepqual.c.html#LN410"><span class='Ref_To_Local'>orlist</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN410"><span class='Ref_To_Local'>orlist</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN416"><span class='Ref_To_Local'>arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Flatten any ORs pulled up to just below here */ 
+</span>        <a href="prepqual.c.html#LN410"><span class='Ref_To_Local'>orlist</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN40"><span class='Ref_to_Proto'>pull_ors</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN410"><span class='Ref_To_Local'>orlist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Now we can look for duplicate ORs */ 
+</span>        <span class='Control'>return</span> <a href="prepqual.c.html#LN42"><span class='Ref_to_Proto'>process_duplicate_ors</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN410"><span class='Ref_To_Local'>orlist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if or_clause((Node*)qual... &raquo; </span> 
+    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN42"><span class='Ref_to_Proto'>and_clause</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN406"><span class='Ref_to_Parameter'>qual</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN443"></a>        <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>andlist</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN444"></a>        <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>temp</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Recurse */ 
+</span>        <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN444"><span class='Ref_To_Local'>temp</span></a><span class='Delimiter'>, </span><span class='Parentheses'>((</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN406"><span class='Ref_to_Parameter'>qual</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>args<span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN449"></a>            <a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>arg</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN444"><span class='Ref_To_Local'>temp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="prepqual.c.html#LN449"><span class='Ref_To_Local'>arg</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN41"><span class='Ref_to_Proto'>find_duplicate_ors</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN449"><span class='Ref_To_Local'>arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Get rid of any constant inputs */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN449"><span class='Ref_To_Local'>arg</span></a> <span class='Operator'>&& </span><a href="../../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN449"><span class='Ref_To_Local'>arg</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/primnodes.h.html#LN188"><span class='Ref_to_Struct'>Const</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span><a name="LN456"></a>                <a href="../../../include/nodes/primnodes.h.html#LN188"><span class='Ref_to_Struct'>Const</span></a>      <span class='Operator'>*</span><span class='Declare_Local'>carg</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN188"><span class='Ref_to_Struct'>Const</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN449"><span class='Ref_To_Local'>arg</span></a><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* Drop constant TRUE */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="prepqual.c.html#LN456"><span class='Ref_To_Local'>carg</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN196"><span class='Ref_to_Member'>constisnull</span></a> <span class='Operator'>&& </span><a href="../../../include/postgres.h.html#LN398"><span class='Ref_to_Macro'>DatumGetBool</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN456"><span class='Ref_To_Local'>carg</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN195"><span class='Ref_to_Member'>constvalue</span></a><span class='Parentheses'>))</span> 
+                    <span class='Control'>continue</span><span class='Delimiter'>; 
+</span>                <span class='Comment_Multi_Line'>/* constant FALSE or NULL, so AND reduces to FALSE */ 
+</span>                <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/makefuncs.h.html#LN59"><span class='Ref_to_Proto'>makeBoolConst</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <a href="prepqual.c.html#LN443"><span class='Ref_To_Local'>andlist</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN443"><span class='Ref_To_Local'>andlist</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN449"><span class='Ref_To_Local'>arg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Flatten any ANDs introduced just below here */ 
+</span>        <a href="prepqual.c.html#LN443"><span class='Ref_To_Local'>andlist</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN39"><span class='Ref_to_Proto'>pull_ands</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN443"><span class='Ref_To_Local'>andlist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* AND of no inputs reduces to TRUE */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN443"><span class='Ref_To_Local'>andlist</span></a> <span class='Operator'>== </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/makefuncs.h.html#LN59"><span class='Ref_to_Proto'>makeBoolConst</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Single-expression AND just reduces to that expression */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN443"><span class='Ref_To_Local'>andlist</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+            <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN110"><span class='Ref_to_Macro'>linitial</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN443"><span class='Ref_To_Local'>andlist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Else we still need an AND node */ 
+</span>        <span class='Control'>return</span> <a href="../../../include/optimizer/clauses.h.html#LN43"><span class='Ref_to_Proto'>make_andclause</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN443"><span class='Ref_To_Local'>andlist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if and_clause((Node*)qua... &raquo; </span> 
+    <span class='Control'>else</span> 
+        <span class='Control'>return</span> <a href="prepqual.c.html#LN406"><span class='Ref_to_Parameter'>qual</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end find_duplicate_ors &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * process_duplicate_ors 
+ *    Given a list of exprs which are ORed together, try to apply 
+ *    the inverse OR distributive law. 
+ * 
+ * Returns the resulting expression (could be an AND clause, an OR 
+ * clause, or maybe even a single subexpression). 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>* 
+</span><a name="LN495"></a><span class='Declare_Function'>process_duplicate_ors</span><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>orlist</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN497"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>reference</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN498"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>num_subclauses</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN499"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>winners</span><span class='Delimiter'>; 
+</span><a name="LN500"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>neworlist</span><span class='Delimiter'>; 
+</span><a name="LN501"></a>    <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>temp</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* OR of no inputs reduces to FALSE */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN495"><span class='Ref_to_Parameter'>orlist</span></a> <span class='Operator'>== </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/makefuncs.h.html#LN59"><span class='Ref_to_Proto'>makeBoolConst</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Single-expression OR just reduces to that expression */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN495"><span class='Ref_to_Parameter'>orlist</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN110"><span class='Ref_to_Macro'>linitial</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN495"><span class='Ref_to_Parameter'>orlist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Choose the shortest AND clause as the reference list --- obviously, any 
+     * subclause not in this clause isn't in all the clauses. If we find a 
+     * clause that's not an AND, we can treat it as a one-element AND clause, 
+     * which necessarily wins as shortest. 
+     */ 
+</span>    <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN501"><span class='Ref_To_Local'>temp</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN495"><span class='Ref_to_Parameter'>orlist</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN519"></a>        <a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>clause</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN501"><span class='Ref_To_Local'>temp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN42"><span class='Ref_to_Proto'>and_clause</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN519"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN523"></a>            <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>subclauses</span> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN519"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>args<span class='Delimiter'>; 
+</span><a name="LN524"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>nclauses</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN523"><span class='Ref_To_Local'>subclauses</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN497"><span class='Ref_To_Local'>reference</span></a> <span class='Operator'>== </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a> <span class='Operator'>|| </span><a href="prepqual.c.html#LN524"><span class='Ref_To_Local'>nclauses</span></a> <span class='Operator'>&LT; </span><a href="prepqual.c.html#LN498"><span class='Ref_To_Local'>num_subclauses</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="prepqual.c.html#LN497"><span class='Ref_To_Local'>reference</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN523"><span class='Ref_To_Local'>subclauses</span></a><span class='Delimiter'>; 
+</span>                <a href="prepqual.c.html#LN498"><span class='Ref_To_Local'>num_subclauses</span></a> <span class='Operator'>= </span><a href="prepqual.c.html#LN524"><span class='Ref_To_Local'>nclauses</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="prepqual.c.html#LN497"><span class='Ref_To_Local'>reference</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN138"><span class='Ref_to_Macro'>list_make1</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN519"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Just in case, eliminate any duplicates in the reference list. 
+     */ 
+</span>    <a href="prepqual.c.html#LN497"><span class='Ref_To_Local'>reference</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN240"><span class='Ref_to_Proto'>list_union</span></a><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN497"><span class='Ref_To_Local'>reference</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check each element of the reference list to see if it's in all the OR 
+     * clauses.  Build a new list of winning clauses. 
+     */ 
+</span>    <a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN501"><span class='Ref_To_Local'>temp</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN497"><span class='Ref_To_Local'>reference</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN551"></a>        <a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>refclause</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN501"><span class='Ref_To_Local'>temp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN552"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>win</span> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span><a name="LN553"></a>        <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>temp2</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN553"><span class='Ref_To_Local'>temp2</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN495"><span class='Ref_to_Parameter'>orlist</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN557"></a>            <a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>clause</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN553"><span class='Ref_To_Local'>temp2</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN42"><span class='Ref_to_Proto'>and_clause</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN557"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/nodes/pg_list.h.html#LN228"><span class='Ref_to_Proto'>list_member</span></a><span class='Parentheses'>(((</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN557"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>args<span class='Delimiter'>, </span><a href="prepqual.c.html#LN551"><span class='Ref_To_Local'>refclause</span></a><span class='Parentheses'>))</span> 
+                <span class='Delimiter'>{ 
+</span>                    <a href="prepqual.c.html#LN552"><span class='Ref_To_Local'>win</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/nodes/nodes.h.html#LN626"><span class='Ref_to_Proto'>equal</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN551"><span class='Ref_To_Local'>refclause</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN557"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>))</span> 
+                <span class='Delimiter'>{ 
+</span>                    <a href="prepqual.c.html#LN552"><span class='Ref_To_Local'>win</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN552"><span class='Ref_To_Local'>win</span></a><span class='Parentheses'>) 
+</span>            <a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN551"><span class='Ref_To_Local'>refclause</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If no winners, we can't transform the OR 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a> <span class='Operator'>== </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <a href="../../../include/optimizer/clauses.h.html#LN40"><span class='Ref_to_Proto'>make_orclause</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN495"><span class='Ref_to_Parameter'>orlist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Generate new OR list consisting of the remaining sub-clauses. 
+     * 
+     * If any clause degenerates to empty, then we have a situation like (A 
+     * AND B) OR (A), which can be reduced to just A --- that is, the 
+     * additional conditions in other arms of the OR are irrelevant. 
+     * 
+     * Note that because we use list_difference, any multiple occurrences of a 
+     * winning clause in an AND sub-clause will be removed automatically. 
+     */ 
+</span>    <a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN501"><span class='Ref_To_Local'>temp</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN495"><span class='Ref_to_Parameter'>orlist</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN600"></a>        <a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>clause</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN501"><span class='Ref_To_Local'>temp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN42"><span class='Ref_to_Proto'>and_clause</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN600"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN604"></a>            <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>subclauses</span> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="prepqual.c.html#LN600"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>args<span class='Delimiter'>; 
+</span> 
+            <a href="prepqual.c.html#LN604"><span class='Ref_To_Local'>subclauses</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN250"><span class='Ref_to_Proto'>list_difference</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN604"><span class='Ref_To_Local'>subclauses</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN604"><span class='Ref_To_Local'>subclauses</span></a> <span class='Operator'>!= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN604"><span class='Ref_To_Local'>subclauses</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+                    <a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/pg_list.h.html#LN110"><span class='Ref_to_Macro'>linitial</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN604"><span class='Ref_To_Local'>subclauses</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>                <span class='Control'>else</span> 
+                    <a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a><span class='Delimiter'>, </span><a href="../../../include/optimizer/clauses.h.html#LN43"><span class='Ref_to_Proto'>make_andclause</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN604"><span class='Ref_To_Local'>subclauses</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* degenerate case, see above */ 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/nodes/pg_list.h.html#LN228"><span class='Ref_to_Proto'>list_member</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN600"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>))</span> 
+                <a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a><span class='Delimiter'>, </span><a href="prepqual.c.html#LN600"><span class='Ref_To_Local'>clause</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* degenerate case, see above */ 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Append reduced OR to the winners list, if it's not degenerate, handling 
+     * the special case of one element correctly (can that really happen?). 
+     * Also be careful to maintain AND/OR flatness in case we pulled up a 
+     * sub-sub-OR-clause. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a> <span class='Operator'>!= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+            <a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/pg_list.h.html#LN110"><span class='Ref_to_Macro'>linitial</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a><span class='Delimiter'>, </span><a href="../../../include/optimizer/clauses.h.html#LN40"><span class='Ref_to_Proto'>make_orclause</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN40"><span class='Ref_to_Proto'>pull_ors</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN500"><span class='Ref_To_Local'>neworlist</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * And return the constructed AND clause, again being wary of a single 
+     * element and AND/OR flatness. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN131"><span class='Ref_to_Struct'>Expr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN110"><span class='Ref_to_Macro'>linitial</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <span class='Control'>return</span> <a href="../../../include/optimizer/clauses.h.html#LN43"><span class='Ref_to_Proto'>make_andclause</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN39"><span class='Ref_to_Proto'>pull_ands</span></a><span class='Parentheses'>(</span><a href="prepqual.c.html#LN499"><span class='Ref_To_Local'>winners</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end process_duplicate_ors &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

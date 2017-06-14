@@ -1,0 +1,1046 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\replication\logical\launcher.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\replication\logical\launcher.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:46 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * launcher.c 
+ *     PostgreSQL logical replication worker launcher process 
+ * 
+ * Copyright (c) 2016-2017, PostgreSQL Global Development Group 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/replication/logical/launcher.c 
+ * 
+ * NOTES 
+ *    This module contains the logical replication worker launcher which 
+ *    uses the background worker infrastructure to start the logical 
+ *    replication workers for every enabled subscription. 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"funcapi.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/heapam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/htup.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/htup_details.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_subscription.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_subscription_rel.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"libpq/pqsignal.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/bgworker.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/fork_process.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/postmaster.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"replication/logicallauncher.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/logicalworker.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/slot.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/walreceiver.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"replication/worker_internal.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/proc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/procarray.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/procsignal.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"tcop/tcopprot.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/pg_lsn.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/ps_status.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/timeout.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/snapmgr.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* max sleep time between cycles (3min) */ 
+</span><a name="LN57"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>DEFAULT_NAPTIME_PER_CYCLE</span> <span class='Number'>180000L</span> 
+ 
+<a name="LN59"></a><span class='Keyword'>int</span>         <span class='Declare_Var'>max_logical_replication_workers</span> <span class='Operator'>= </span><span class='Number'>4</span><span class='Delimiter'>; 
+</span><a name="LN60"></a><span class='Keyword'>int</span>         <span class='Declare_Var'>max_sync_workers_per_subscription</span> <span class='Operator'>= </span><span class='Number'>2</span><span class='Delimiter'>; 
+</span> 
+<a name="LN62"></a><a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Var'>MyLogicalRepWorker</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+<a name="LN64"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>LogicalRepCtxStruct</span> 
+<span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Supervisor process. */ 
+</span><a name="LN67"></a>    <a href="../../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Member'>launcher_pid</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Background workers. */ 
+</span><a name="LN70"></a>    <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Declare_Member'>workers</span><span class='Delimiter'>[</span>FLEXIBLE_ARRAY_MEMBER<span class='Delimiter'>]; 
+</span><a name="LN71"></a>} <span class='Declare_Typedef'>LogicalRepCtxStruct</span><span class='Delimiter'>; 
+</span> 
+<a name="LN73"></a><a href="launcher.c.html#LN64"><span class='Ref_to_Struct'>LogicalRepCtxStruct</span></a> <span class='Operator'>*</span><span class='Declare_Var'>LogicalRepCtx</span><span class='Delimiter'>; 
+</span> 
+<a name="LN75"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>ApplyLauncherWakeup</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN76"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>logicalrep_launcher_onexit</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>code</span><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN77"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>logicalrep_worker_onexit</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>code</span><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN78"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>logicalrep_worker_detach</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN79"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>logicalrep_worker_cleanup</span><span class='Parentheses'>(</span><a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>worker</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* Flags set by signal handlers */ 
+</span><a name="LN82"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>got_SIGHUP</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<a name="LN84"></a><span class='Keyword'>static bool </span><span class='Declare_Var'>on_commit_launcher_wakeup</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<a name="LN86"></a><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Prototype'>pg_stat_get_subscription</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Load the list of subscriptions. 
+ * 
+ * Only the fields interesting for worker start/stop functions are filled for 
+ * each subscription. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN96"></a><span class='Declare_Function'>get_subscription_list</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN98"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>res</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN99"></a>    <a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a>    <span class='Declare_Local'>rel</span><span class='Delimiter'>; 
+</span><a name="LN100"></a>    <a href="../../../include/access/heapam.h.html#LN99"><span class='Ref_to_Typedef'>HeapScanDesc</span></a> <span class='Declare_Local'>scan</span><span class='Delimiter'>; 
+</span><a name="LN101"></a>    <a href="../../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>tup</span><span class='Delimiter'>; 
+</span><a name="LN102"></a>    <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>resultcxt</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* This is the context that we will allocate our output data in */ 
+</span>    <a href="launcher.c.html#LN102"><span class='Ref_To_Local'>resultcxt</span></a> <span class='Operator'>= </span><a href="../../utils/mmgr/mcxt.c.html#LN36"><span class='Ref_to_Global_Var'>CurrentMemoryContext</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Start a transaction so we can access pg_database, and get a snapshot. 
+     * We don't have a use for the snapshot itself, but we're interested in 
+     * the secondary effect that it sets RecentGlobalXmin.  (This is critical 
+     * for anything that reads heap pages, because HOT may decide to prune 
+     * them even if the process doesn't attempt to modify any tuples.) 
+     */ 
+</span>    <a href="../../../include/access/xact.h.html#LN348"><span class='Ref_to_Proto'>StartTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="../../../include/utils/snapmgr.h.html#LN63"><span class='Ref_to_Proto'>GetTransactionSnapshot</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN99"><span class='Ref_To_Local'>rel</span></a> <span class='Operator'>= </span><a href="../../../include/access/heapam.h.html#LN91"><span class='Ref_to_Proto'>heap_open</span></a><span class='Parentheses'>(</span><a href="../../../include/catalog/pg_subscription.h.html#LN21"><span class='Ref_to_Const'>SubscriptionRelationId</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN35"><span class='Ref_to_Const'>AccessShareLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN100"><span class='Ref_To_Local'>scan</span></a> <span class='Operator'>= </span><a href="../../../include/access/heapam.h.html#LN110"><span class='Ref_to_Proto'>heap_beginscan_catalog</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN99"><span class='Ref_To_Local'>rel</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="../../../include/access/htup.h.html#LN76"><span class='Ref_to_Macro'>HeapTupleIsValid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN101"><span class='Ref_To_Local'>tup</span></a> <span class='Operator'>= </span><a href="../../../include/access/heapam.h.html#LN127"><span class='Ref_to_Proto'>heap_getnext</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN100"><span class='Ref_To_Local'>scan</span></a><span class='Delimiter'>, </span><a href="../../../include/access/sdir.h.html#LN25"><span class='Ref_to_EnumConst'>ForwardScanDirection</span></a><span class='Parentheses'>)))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN122"></a>        <a href="../../../include/catalog/pg_subscription.h.html#LN57"><span class='Ref_to_Typedef'>Form_pg_subscription</span></a> <span class='Declare_Local'>subform</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/catalog/pg_subscription.h.html#LN57"><span class='Ref_to_Typedef'>Form_pg_subscription</span></a><span class='Parentheses'>) </span><a href="../../../include/access/htup_details.h.html#LN655"><span class='Ref_to_Macro'>GETSTRUCT</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN101"><span class='Ref_To_Local'>tup</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN123"></a>        <a href="../../../include/catalog/pg_subscription.h.html#LN74"><span class='Ref_to_Struct'>Subscription</span></a> <span class='Operator'>*</span><span class='Declare_Local'>sub</span><span class='Delimiter'>; 
+</span><a name="LN124"></a>        <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldcxt</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Allocate our results in the caller's context, not the 
+         * transaction's. We do this inside the loop, and restore the original 
+         * context at the end, so that leaky things like heap_getnext() are 
+         * not called in a potentially long-lived context. 
+         */ 
+</span>        <a href="launcher.c.html#LN124"><span class='Ref_To_Local'>oldcxt</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN102"><span class='Ref_To_Local'>resultcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="launcher.c.html#LN123"><span class='Ref_To_Local'>sub</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/catalog/pg_subscription.h.html#LN74"><span class='Ref_to_Struct'>Subscription</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/catalog/pg_subscription.h.html#LN74"><span class='Ref_to_Struct'>Subscription</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="launcher.c.html#LN123"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN76"><span class='Ref_to_Member'>oid</span></a> <span class='Operator'>= </span><a href="../../../include/access/htup_details.h.html#LN694"><span class='Ref_to_Macro'>HeapTupleGetOid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN101"><span class='Ref_To_Local'>tup</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="launcher.c.html#LN123"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN77"><span class='Ref_to_Member'>dbid</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN122"><span class='Ref_To_Local'>subform</span></a><span class='Operator'>-&GT;</span>subdbid<span class='Delimiter'>; 
+</span>        <a href="launcher.c.html#LN123"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN80"><span class='Ref_to_Member'>owner</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN122"><span class='Ref_To_Local'>subform</span></a><span class='Operator'>-&GT;</span>subowner<span class='Delimiter'>; 
+</span>        <a href="launcher.c.html#LN123"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN81"><span class='Ref_to_Member'>enabled</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN122"><span class='Ref_To_Local'>subform</span></a><span class='Operator'>-&GT;</span>subenabled<span class='Delimiter'>; 
+</span>        <a href="launcher.c.html#LN123"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN79"><span class='Ref_to_Member'>name</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN32"><span class='Ref_to_Proto'>pstrdup</span></a><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN498"><span class='Ref_to_Macro'>NameStr</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN122"><span class='Ref_To_Local'>subform</span></a><span class='Operator'>-&GT;</span>subname<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* We don't fill fields we are not interested in. */ 
+</span> 
+        <a href="launcher.c.html#LN98"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="../../nodes/list.c.html#LN126"><span class='Ref_to_Func'>lappend</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN98"><span class='Ref_To_Local'>res</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN123"><span class='Ref_To_Local'>sub</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN124"><span class='Ref_To_Local'>oldcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while HeapTupleIsValid(tup=... &raquo; </span> 
+ 
+    <a href="../../../include/access/heapam.h.html#LN126"><span class='Ref_to_Proto'>heap_endscan</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN100"><span class='Ref_To_Local'>scan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/heapam.h.html#LN96"><span class='Ref_to_Macro'>heap_close</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN99"><span class='Ref_To_Local'>rel</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/lockdefs.h.html#LN35"><span class='Ref_to_Const'>AccessShareLock</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xact.h.html#LN349"><span class='Ref_to_Proto'>CommitTransactionCommand</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="launcher.c.html#LN98"><span class='Ref_To_Local'>res</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end get_subscription_list &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Wait for a background worker to start up and attach to the shmem context. 
+ * 
+ * This is only needed for cleaning up the shared memory in case the worker 
+ * fails to attach. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN161"></a><span class='Declare_Function'>WaitForReplicationWorkerAttach</span><span class='Parentheses'>(</span><a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>worker</span><span class='Delimiter'>, 
+</span><a name="LN162"></a>                               <a href="../../postmaster/bgworker.c.html#LN104"><span class='Ref_to_Struct'>BackgroundWorkerHandle</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>handle</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN164"></a>    <a href="../../../include/postmaster/bgworker.h.html#LN100"><span class='Ref_to_Enum'>BgwHandleStatus</span></a> <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span><a name="LN165"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span><a name="LN166"></a>    <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>generation</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Remember generation for future identification. */ 
+</span>    <a href="launcher.c.html#LN166"><span class='Ref_To_Local'>generation</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN161"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN30"><span class='Ref_to_Member'>generation</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN173"></a>        <a href="../../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Local'>pid</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Worker either died or has started; no need to do anything. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN161"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN27"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>|| </span><a href="launcher.c.html#LN161"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Check if worker has died before attaching, and clean up after it. */ 
+</span>        <a href="launcher.c.html#LN164"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN119"><span class='Ref_to_Proto'>GetBackgroundWorkerPid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN162"><span class='Ref_to_Parameter'>handle</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="launcher.c.html#LN173"><span class='Ref_To_Local'>pid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN164"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>== </span><a href="../../../include/postmaster/bgworker.h.html#LN104"><span class='Ref_to_EnumConst'>BGWH_STOPPED</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* Ensure that this was indeed the worker we waited for. */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN166"><span class='Ref_To_Local'>generation</span></a> <span class='Operator'>== </span><a href="launcher.c.html#LN161"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN30"><span class='Ref_to_Member'>generation</span></a><span class='Parentheses'>) 
+</span>                <a href="launcher.c.html#LN79"><span class='Ref_to_Proto'>logicalrep_worker_cleanup</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN161"><span class='Ref_to_Parameter'>worker</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * We need timeout because we generally don't get notified via latch 
+         * about the worker attach. 
+         */ 
+</span>        <a href="launcher.c.html#LN165"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                       <span class='Number'>1000L</span><span class='Delimiter'>, </span><a href="../../../include/pgstat.h.html#LN801"><span class='Ref_to_EnumConst'>WAIT_EVENT_BGWORKER_STARTUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* emergency bailout if postmaster has died */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN165"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN165"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Control'>return</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end WaitForReplicationWorkerAttach &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Walks the workers array and searches for one that matches given 
+ * subscription id and relid. 
+ */ 
+</span><a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>* 
+</span><a name="LN228"></a><span class='Declare_Function'>logicalrep_worker_find</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>subid</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relid</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>only_running</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN230"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN231"></a>    <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>res</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/lwlock.h.html#LN151"><span class='Ref_to_Proto'>LWLockHeldByMe</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Search for attached worker for a given subscription id. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN230"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="launcher.c.html#LN230"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="launcher.c.html#LN59"><span class='Ref_to_Global_Var'>max_logical_replication_workers</span></a><span class='Delimiter'>; </span><a href="launcher.c.html#LN230"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN238"></a>        <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>w</span> <span class='Operator'>= &</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN70"><span class='Ref_to_Member'>workers</span></a><span class='Delimiter'>[</span><a href="launcher.c.html#LN230"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN238"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN27"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>&& </span><a href="launcher.c.html#LN238"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a> <span class='Operator'>== </span><a href="launcher.c.html#LN228"><span class='Ref_to_Parameter'>subid</span></a> <span class='Operator'>&& </span><a href="launcher.c.html#LN238"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a> <span class='Operator'>== </span><a href="launcher.c.html#LN228"><span class='Ref_to_Parameter'>relid</span></a> <span class='Operator'>&& 
+</span>            <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN228"><span class='Ref_to_Parameter'>only_running</span></a> <span class='Operator'>|| </span><a href="launcher.c.html#LN238"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="launcher.c.html#LN231"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN238"><span class='Ref_To_Local'>w</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="launcher.c.html#LN231"><span class='Ref_To_Local'>res</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end logicalrep_worker_find &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Start new apply background worker. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN255"></a><span class='Declare_Function'>logicalrep_worker_launch</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>dbid</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>subid</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>subname</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>userid</span><span class='Delimiter'>, 
+</span><a name="LN256"></a>                         <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN258"></a>    <a href="../../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Declare_Local'>bgw</span><span class='Delimiter'>; 
+</span><a name="LN259"></a>    <a href="../../postmaster/bgworker.c.html#LN104"><span class='Ref_to_Struct'>BackgroundWorkerHandle</span></a> <span class='Operator'>*</span><span class='Declare_Local'>bgw_handle</span><span class='Delimiter'>; 
+</span><a name="LN260"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN261"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slot</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN262"></a>    <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>worker</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN263"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nsyncworkers</span><span class='Delimiter'>; 
+</span><a name="LN264"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>now</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, 
+</span>       <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"starting logical replication worker for subscription \"%s\""</span><span class='Delimiter'>, 
+</span>               <a href="launcher.c.html#LN255"><span class='Ref_to_Parameter'>subname</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Report this after the initial starting message for consistency. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../slot.c.html#LN98"><span class='Ref_to_Global_Var'>max_replication_slots</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_CONFIGURATION_LIMIT_EXCEEDED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"cannot start logical replication workers when max_replication_slots = 0"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We need to do the modification of the shared memory under lock so that 
+     * we have consistent view. 
+     */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN282"></a><span class='Label'>retry</span><span class='Operator'>: 
+</span>    <span class='Comment_Multi_Line'>/* Find unused worker slot. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN260"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="launcher.c.html#LN260"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="launcher.c.html#LN59"><span class='Ref_to_Global_Var'>max_logical_replication_workers</span></a><span class='Delimiter'>; </span><a href="launcher.c.html#LN260"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN286"></a>        <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>w</span> <span class='Operator'>= &</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN70"><span class='Ref_to_Member'>workers</span></a><span class='Delimiter'>[</span><a href="launcher.c.html#LN260"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN286"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN27"><span class='Ref_to_Member'>in_use</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN286"><span class='Ref_To_Local'>w</span></a><span class='Delimiter'>; 
+</span>            <a href="launcher.c.html#LN261"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN260"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="launcher.c.html#LN263"><span class='Ref_To_Local'>nsyncworkers</span></a> <span class='Operator'>= </span><a href="../../../include/replication/worker_internal.h.html#LN79"><span class='Ref_to_Proto'>logicalrep_sync_worker_count</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN255"><span class='Ref_to_Parameter'>subid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN264"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we didn't find a free slot, try to do garbage collection.  The 
+     * reason we do this is because if some worker failed to start up and its 
+     * parent has crashed while waiting, the in_use state was never cleared. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL </span><span class='Operator'>|| </span><a href="launcher.c.html#LN263"><span class='Ref_To_Local'>nsyncworkers</span></a> <span class='Operator'>&GT;= </span><a href="launcher.c.html#LN60"><span class='Ref_to_Global_Var'>max_sync_workers_per_subscription</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN307"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>did_cleanup</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN260"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="launcher.c.html#LN260"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="launcher.c.html#LN59"><span class='Ref_to_Global_Var'>max_logical_replication_workers</span></a><span class='Delimiter'>; </span><a href="launcher.c.html#LN260"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN311"></a>            <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>w</span> <span class='Operator'>= &</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN70"><span class='Ref_to_Member'>workers</span></a><span class='Delimiter'>[</span><a href="launcher.c.html#LN260"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * If the worker was marked in use but didn't manage to attach in 
+             * time, clean it up. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN311"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN27"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>&& !</span><a href="launcher.c.html#LN311"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a> <span class='Operator'>&& 
+</span>                <a href="../../../include/utils/timestamp.h.html#LN74"><span class='Ref_to_Proto'>TimestampDifferenceExceeds</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN311"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN24"><span class='Ref_to_Member'>launch_time</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN264"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, 
+</span>                                           <a href="../walreceiver.c.html#LN74"><span class='Ref_to_Global_Var'>wal_receiver_timeout</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>                     <span class='String'>"logical replication worker for subscription %u took too long to start; canceled"</span><span class='Delimiter'>, 
+</span>                     <a href="launcher.c.html#LN311"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <a href="launcher.c.html#LN79"><span class='Ref_to_Proto'>logicalrep_worker_cleanup</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN311"><span class='Ref_To_Local'>w</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="launcher.c.html#LN307"><span class='Ref_To_Local'>did_cleanup</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;max_logical_rep... &raquo; </span> 
+ 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN307"><span class='Ref_To_Local'>did_cleanup</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>goto</span> <span class='Symbol_Characters'>&uarr;</span><a href="launcher.c.html#LN282"><span class='Ref_to_Label'>retry</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if worker==NULL||nsyncwo... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * If we reached the sync worker limit per subscription, just exit 
+     * silently as we might get here because of an otherwise harmless race 
+     * condition. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN263"><span class='Ref_To_Local'>nsyncworkers</span></a> <span class='Operator'>&GT;= </span><a href="launcher.c.html#LN60"><span class='Ref_to_Global_Var'>max_sync_workers_per_subscription</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * However if there are no more free worker slots, inform user about it 
+     * before exiting. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_CONFIGURATION_LIMIT_EXCEEDED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"out of logical replication worker slots"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"You might need to increase max_logical_replication_workers."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Prepare the worker slot. */ 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN24"><span class='Ref_to_Member'>launch_time</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN264"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN27"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN30"><span class='Ref_to_Member'>generation</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN36"><span class='Ref_to_Member'>dbid</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN255"><span class='Ref_to_Parameter'>dbid</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN39"><span class='Ref_to_Member'>userid</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN255"><span class='Ref_to_Parameter'>userid</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN255"><span class='Ref_to_Parameter'>subid</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN256"><span class='Ref_to_Parameter'>relid</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN46"><span class='Ref_to_Member'>relstate</span></a> <span class='Operator'>= </span><a href="../../../include/catalog/pg_subscription_rel.h.html#LN61"><span class='Ref_to_Const'>SUBREL_STATE_UNKNOWN</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN47"><span class='Ref_to_Member'>relstate_lsn</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN51"><span class='Ref_to_Member'>last_lsn</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/datatype/timestamp.h.html#LN111"><span class='Ref_to_Macro'>TIMESTAMP_NOBEGIN</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN52"><span class='Ref_to_Member'>last_send_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/datatype/timestamp.h.html#LN111"><span class='Ref_to_Macro'>TIMESTAMP_NOBEGIN</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN53"><span class='Ref_to_Member'>last_recv_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN54"><span class='Ref_to_Member'>reply_lsn</span></a> <span class='Operator'>= </span><a href="../../../include/access/xlogdefs.h.html#LN27"><span class='Ref_to_Const'>InvalidXLogRecPtr</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/datatype/timestamp.h.html#LN111"><span class='Ref_to_Macro'>TIMESTAMP_NOBEGIN</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN55"><span class='Ref_to_Member'>reply_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Register the new dynamic worker. */ 
+</span>    memset<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN51"><span class='Ref_to_Const'>BGWORKER_SHMEM_ACCESS</span></a> <span class='Operator'>| 
+</span>        <a href="../../../include/postmaster/bgworker.h.html#LN58"><span class='Ref_to_Const'>BGWORKER_BACKEND_DATABASE_CONNECTION</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN91"><span class='Ref_to_Member'>bgw_start_time</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN79"><span class='Ref_to_EnumConst'>BgWorkerStart_RecoveryFinished</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN93"><span class='Ref_to_Member'>bgw_library_name</span></a><span class='Delimiter'>, </span><a href="../../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Delimiter'>, </span><span class='String'>"postgres"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN94"><span class='Ref_to_Member'>bgw_function_name</span></a><span class='Delimiter'>, </span><a href="../../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Delimiter'>, </span><span class='String'>"ApplyWorkerMain"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN537"><span class='Ref_to_Macro'>OidIsValid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN256"><span class='Ref_to_Parameter'>relid</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Delimiter'>, </span><a href="../../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Delimiter'>, 
+</span>                 <span class='String'>"logical replication worker for subscription %u sync %u"</span><span class='Delimiter'>, </span><a href="launcher.c.html#LN255"><span class='Ref_to_Parameter'>subid</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN256"><span class='Ref_to_Parameter'>relid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Delimiter'>, </span><a href="../../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Delimiter'>, 
+</span>                 <span class='String'>"logical replication worker for subscription %u"</span><span class='Delimiter'>, </span><a href="launcher.c.html#LN255"><span class='Ref_to_Parameter'>subid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN83"><span class='Ref_to_Const'>BGW_NEVER_RESTART</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>= </span><a href="../../utils/init/globals.c.html#LN38"><span class='Ref_to_Global_Var'>MyProcPid</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN95"><span class='Ref_to_Member'>bgw_main_arg</span></a> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN484"><span class='Ref_to_Macro'>Int32GetDatum</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN261"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/postmaster/bgworker.h.html#LN115"><span class='Ref_to_Proto'>RegisterDynamicBackgroundWorker</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN258"><span class='Ref_To_Local'>bgw</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="launcher.c.html#LN259"><span class='Ref_To_Local'>bgw_handle</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_CONFIGURATION_LIMIT_EXCEEDED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"out of background worker slots"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>               <a href="../../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"You might need to increase max_worker_processes."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now wait until it attaches. */ 
+</span>    <a href="launcher.c.html#LN160"><span class='Ref_to_Func'>WaitForReplicationWorkerAttach</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN262"><span class='Ref_To_Local'>worker</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN259"><span class='Ref_To_Local'>bgw_handle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end logicalrep_worker_launch &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Stop the logical replication worker and wait until it detaches from the 
+ * slot. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN414"></a><span class='Declare_Function'>logicalrep_worker_stop</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>subid</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN416"></a>    <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>worker</span><span class='Delimiter'>; 
+</span><a name="LN417"></a>    <a href="../../../include/c.h.html#LN266"><span class='Ref_to_Typedef'>uint16</span></a>      <span class='Declare_Local'>generation</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a> <span class='Operator'>= </span><a href="../../../include/replication/worker_internal.h.html#LN71"><span class='Ref_to_Proto'>logicalrep_worker_find</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN414"><span class='Ref_to_Parameter'>subid</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN414"><span class='Ref_to_Parameter'>relid</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* No worker, nothing to do. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Remember which generation was our worker so we can check if what we see 
+     * is still the same one. 
+     */ 
+</span>    <a href="launcher.c.html#LN417"><span class='Ref_To_Local'>generation</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN30"><span class='Ref_to_Member'>generation</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we found worker but it does not have proc set it is starting up, 
+     * wait for it to finish and then kill it. 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN27"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>&& !</span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN442"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Wait for signal. */ 
+</span>        <a href="launcher.c.html#LN442"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                       <span class='Number'>1000L</span><span class='Delimiter'>, </span><a href="../../../include/pgstat.h.html#LN801"><span class='Ref_to_EnumConst'>WAIT_EVENT_BGWORKER_STARTUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* emergency bailout if postmaster has died */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN442"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN442"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Check worker status. */ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Check whether the worker slot is no longer used, which would mean 
+         * that the worker has exited, or whether the worker generation is 
+         * different, meaning that a different worker has taken the slot. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN27"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>|| </span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN30"><span class='Ref_to_Member'>generation</span></a> <span class='Operator'>!= </span><a href="launcher.c.html#LN417"><span class='Ref_To_Local'>generation</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Worker has assigned proc, so it has started. */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while worker-&GT;in_use&&!work... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Now terminate the worker ... */ 
+</span>    <a href="../../../include/port.h.html#LN210"><span class='Ref_to_Macro'>kill</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN107"><span class='Ref_to_Member'>pid</span></a><span class='Delimiter'>, </span>SIGTERM<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* ... and wait for it to die. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN487"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a> <span class='Operator'>|| </span><a href="launcher.c.html#LN416"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN30"><span class='Ref_to_Member'>generation</span></a> <span class='Operator'>!= </span><a href="launcher.c.html#LN417"><span class='Ref_To_Local'>generation</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Wait for more work. */ 
+</span>        <a href="launcher.c.html#LN487"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                       <span class='Number'>1000L</span><span class='Delimiter'>, </span><a href="../../../include/pgstat.h.html#LN800"><span class='Ref_to_EnumConst'>WAIT_EVENT_BGWORKER_SHUTDOWN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* emergency bailout if postmaster has died */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN487"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN487"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end logicalrep_worker_stop &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Wake up (using latch) the logical replication worker. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN520"></a><span class='Declare_Function'>logicalrep_worker_wakeup</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>subid</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>relid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN522"></a>    <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>worker</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN522"><span class='Ref_To_Local'>worker</span></a> <span class='Operator'>= </span><a href="../../../include/replication/worker_internal.h.html#LN71"><span class='Ref_to_Proto'>logicalrep_worker_find</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN520"><span class='Ref_to_Parameter'>subid</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN520"><span class='Ref_to_Parameter'>relid</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN522"><span class='Ref_To_Local'>worker</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/replication/worker_internal.h.html#LN77"><span class='Ref_to_Proto'>logicalrep_worker_wakeup_ptr</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN522"><span class='Ref_To_Local'>worker</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Wake up (using latch) the logical replication worker. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN536"></a><span class='Declare_Function'>logicalrep_worker_wakeup_ptr</span><span class='Parentheses'>(</span><a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>worker</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN536"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN102"><span class='Ref_to_Member'>procLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Attach to a slot. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN545"></a><span class='Declare_Function'>logicalrep_worker_attach</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>slot</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Block concurrent access. */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="launcher.c.html#LN545"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="launcher.c.html#LN545"><span class='Ref_to_Parameter'>slot</span></a> <span class='Operator'>&LT; </span><a href="launcher.c.html#LN59"><span class='Ref_to_Global_Var'>max_logical_replication_workers</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a> <span class='Operator'>= &</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN70"><span class='Ref_to_Member'>workers</span></a><span class='Delimiter'>[</span><a href="launcher.c.html#LN545"><span class='Ref_to_Parameter'>slot</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN27"><span class='Ref_to_Member'>in_use</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>         <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"logical replication worker slot %d is empty, cannot attach"</span><span class='Delimiter'>, 
+</span>                <a href="launcher.c.html#LN545"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>              <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"logical replication worker slot %d is already used by "</span> 
+                     <span class='String'>"another worker, cannot attach"</span><span class='Delimiter'>, </span><a href="launcher.c.html#LN545"><span class='Ref_to_Parameter'>slot</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a> <span class='Operator'>= </span><a href="../../storage/lmgr/proc.c.html#LN66"><span class='Ref_to_Global_Var'>MyProc</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/ipc.h.html#LN70"><span class='Ref_to_Proto'>before_shmem_exit</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN77"><span class='Ref_to_Proto'>logicalrep_worker_onexit</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>) </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end logicalrep_worker_attach &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Detach the worker (cleans up the worker info). 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN581"></a><span class='Declare_Function'>logicalrep_worker_detach</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Block concurrent access. */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN79"><span class='Ref_to_Proto'>logicalrep_worker_cleanup</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN62"><span class='Ref_to_Global_Var'>MyLogicalRepWorker</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Clean up worker info. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN595"></a><span class='Declare_Function'>logicalrep_worker_cleanup</span><span class='Parentheses'>(</span><a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>worker</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/lwlock.h.html#LN152"><span class='Ref_to_Proto'>LWLockHeldByMeInMode</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN595"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN27"><span class='Ref_to_Member'>in_use</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN595"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN595"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN36"><span class='Ref_to_Member'>dbid</span></a> <span class='Operator'>= </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN595"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN39"><span class='Ref_to_Member'>userid</span></a> <span class='Operator'>= </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN595"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a> <span class='Operator'>= </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN595"><span class='Ref_to_Parameter'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a> <span class='Operator'>= </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Cleanup function for logical replication launcher. 
+ * 
+ * Called on logical replication launcher exit. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN613"></a><span class='Declare_Function'>logicalrep_launcher_onexit</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>code</span><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN67"><span class='Ref_to_Member'>launcher_pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Cleanup function. 
+ * 
+ * Called on logical replication worker exit. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN624"></a><span class='Declare_Function'>logicalrep_worker_onexit</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>code</span><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Disconnect gracefully from the remote side. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/replication/walreceiver.h.html#LN263"><span class='Ref_to_Macro'>walrcv_disconnect</span></a><span class='Parentheses'>(</span><a href="../walreceiver.c.html#LN78"><span class='Ref_to_Global_Var'>wrconn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN78"><span class='Ref_to_Proto'>logicalrep_worker_detach</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN75"><span class='Ref_to_Proto'>ApplyLauncherWakeup</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGHUP: set flag to reload configuration at next convenient time */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN637"></a><span class='Declare_Function'>logicalrep_launcher_sighup</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN639"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <a href="../../postmaster/startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Waken anything waiting on the process latch */ 
+</span>    <a href="../../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="launcher.c.html#LN639"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Count the number of registered (not necessarily running) sync workers 
+ * for a subscription. 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN654"></a><span class='Declare_Function'>logicalrep_sync_worker_count</span><span class='Parentheses'>(</span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>subid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN656"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN657"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>res</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/lwlock.h.html#LN151"><span class='Ref_to_Proto'>LWLockHeldByMe</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Search for attached worker for a given subscription id. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN656"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="launcher.c.html#LN656"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="launcher.c.html#LN59"><span class='Ref_to_Global_Var'>max_logical_replication_workers</span></a><span class='Delimiter'>; </span><a href="launcher.c.html#LN656"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN664"></a>        <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>w</span> <span class='Operator'>= &</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN70"><span class='Ref_to_Member'>workers</span></a><span class='Delimiter'>[</span><a href="launcher.c.html#LN656"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN664"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a> <span class='Operator'>== </span><a href="launcher.c.html#LN654"><span class='Ref_to_Parameter'>subid</span></a> <span class='Operator'>&& </span><a href="../../../include/c.h.html#LN537"><span class='Ref_to_Macro'>OidIsValid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN664"><span class='Ref_To_Local'>w</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Parentheses'>))</span> 
+            <a href="launcher.c.html#LN657"><span class='Ref_To_Local'>res</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <a href="launcher.c.html#LN657"><span class='Ref_To_Local'>res</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * ApplyLauncherShmemSize 
+ *      Compute space needed for replication launcher shared memory 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN678"></a><span class='Declare_Function'>ApplyLauncherShmemSize</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN680"></a>    <a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a>        <span class='Declare_Local'>size</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Need the fixed struct and the array of LogicalRepWorker. 
+     */ 
+</span>    <a href="launcher.c.html#LN680"><span class='Ref_To_Local'>size</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="launcher.c.html#LN64"><span class='Ref_to_Struct'>LogicalRepCtxStruct</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN680"><span class='Ref_To_Local'>size</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN587"><span class='Ref_to_Macro'>MAXALIGN</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN680"><span class='Ref_To_Local'>size</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN680"><span class='Ref_To_Local'>size</span></a> <span class='Operator'>= </span><a href="../../../include/storage/shmem.h.html#LN44"><span class='Ref_to_Proto'>add_size</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN680"><span class='Ref_To_Local'>size</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/shmem.h.html#LN45"><span class='Ref_to_Proto'>mul_size</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN59"><span class='Ref_to_Global_Var'>max_logical_replication_workers</span></a><span class='Delimiter'>, 
+</span>                                   <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="launcher.c.html#LN680"><span class='Ref_To_Local'>size</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * ApplyLauncherRegister 
+ *      Register a background worker running the logical replication launcher. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN697"></a><span class='Declare_Function'>ApplyLauncherRegister</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN699"></a>    <a href="../../../include/postmaster/bgworker.h.html#LN87"><span class='Ref_to_Struct'>BackgroundWorker</span></a> <span class='Declare_Local'>bgw</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN59"><span class='Ref_to_Global_Var'>max_logical_replication_workers</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    memset<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN90"><span class='Ref_to_Member'>bgw_flags</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN51"><span class='Ref_to_Const'>BGWORKER_SHMEM_ACCESS</span></a> <span class='Operator'>| 
+</span>        <a href="../../../include/postmaster/bgworker.h.html#LN58"><span class='Ref_to_Const'>BGWORKER_BACKEND_DATABASE_CONNECTION</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN91"><span class='Ref_to_Member'>bgw_start_time</span></a> <span class='Operator'>= </span><a href="../../../include/postmaster/bgworker.h.html#LN79"><span class='Ref_to_EnumConst'>BgWorkerStart_RecoveryFinished</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN93"><span class='Ref_to_Member'>bgw_library_name</span></a><span class='Delimiter'>, </span><a href="../../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Delimiter'>, </span><span class='String'>"postgres"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN94"><span class='Ref_to_Member'>bgw_function_name</span></a><span class='Delimiter'>, </span><a href="../../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Delimiter'>, </span><span class='String'>"ApplyLauncherMain"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN89"><span class='Ref_to_Member'>bgw_name</span></a><span class='Delimiter'>, </span><a href="../../../include/postmaster/bgworker.h.html#LN84"><span class='Ref_to_Const'>BGW_MAXLEN</span></a><span class='Delimiter'>, 
+</span>             <span class='String'>"logical replication launcher"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN92"><span class='Ref_to_Member'>bgw_restart_time</span></a> <span class='Operator'>= </span><span class='Number'>5</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN97"><span class='Ref_to_Member'>bgw_notify_pid</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Operator'>.</span><a href="../../../include/postmaster/bgworker.h.html#LN95"><span class='Ref_to_Member'>bgw_main_arg</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>) </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/postmaster/bgworker.h.html#LN112"><span class='Ref_to_Proto'>RegisterBackgroundWorker</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN699"><span class='Ref_To_Local'>bgw</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ApplyLauncherRegister &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ApplyLauncherShmemInit 
+ *      Allocate and initialize replication launcher shared memory 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN724"></a><span class='Declare_Function'>ApplyLauncherShmemInit</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN726"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="launcher.c.html#LN64"><span class='Ref_to_Struct'>LogicalRepCtxStruct</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/shmem.h.html#LN43"><span class='Ref_to_Proto'>ShmemInitStruct</span></a><span class='Parentheses'>(</span><span class='String'>"Logical Replication Launcher Data"</span><span class='Delimiter'>, 
+</span>                        <a href="../../../include/replication/logicallauncher.h.html#LN20"><span class='Ref_to_Proto'>ApplyLauncherShmemSize</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="launcher.c.html#LN726"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN726"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN735"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span> 
+        memset<span class='Parentheses'>(</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="../../../include/replication/logicallauncher.h.html#LN20"><span class='Ref_to_Proto'>ApplyLauncherShmemSize</span></a><span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Initialize memory and spin locks for each worker slot. */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN735"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="launcher.c.html#LN735"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>&LT; </span><a href="launcher.c.html#LN59"><span class='Ref_to_Global_Var'>max_logical_replication_workers</span></a><span class='Delimiter'>; </span><a href="launcher.c.html#LN735"><span class='Ref_To_Local'>slot</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN742"></a>            <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>worker</span> <span class='Operator'>= &</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN70"><span class='Ref_to_Member'>workers</span></a><span class='Delimiter'>[</span><a href="launcher.c.html#LN735"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>]; 
+</span> 
+            memset<span class='Parentheses'>(</span><a href="launcher.c.html#LN742"><span class='Ref_To_Local'>worker</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/spin.h.html#LN59"><span class='Ref_to_Macro'>SpinLockInit</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN742"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>-&GT;</span><a href="../../../include/replication/worker_internal.h.html#LN48"><span class='Ref_to_Member'>relmutex</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end ApplyLauncherShmemInit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Wakeup the launcher on commit if requested. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN754"></a><span class='Declare_Function'>AtEOXact_ApplyLauncher</span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Declare_Parameter'>isCommit</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN754"><span class='Ref_to_Parameter'>isCommit</span></a> <span class='Operator'>&& </span><a href="launcher.c.html#LN84"><span class='Ref_to_Global_Var'>on_commit_launcher_wakeup</span></a><span class='Parentheses'>) 
+</span>        <a href="launcher.c.html#LN75"><span class='Ref_to_Proto'>ApplyLauncherWakeup</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN84"><span class='Ref_to_Global_Var'>on_commit_launcher_wakeup</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Request wakeup of the launcher on commit of the transaction. 
+ * 
+ * This is used to send launcher signal to stop sleeping and process the 
+ * subscriptions when current transaction commits. Should be used when new 
+ * tuple was added to the pg_subscription catalog. 
+*/ 
+</span><span class='Keyword'>void 
+</span><a name="LN770"></a><span class='Declare_Function'>ApplyLauncherWakeupAtCommit</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN84"><span class='Ref_to_Global_Var'>on_commit_launcher_wakeup</span></a><span class='Parentheses'>) 
+</span>        <a href="launcher.c.html#LN84"><span class='Ref_to_Global_Var'>on_commit_launcher_wakeup</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>static void 
+</span><a name="LN777"></a><span class='Declare_Function'>ApplyLauncherWakeup</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN67"><span class='Ref_to_Member'>launcher_pid</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/port.h.html#LN210"><span class='Ref_to_Macro'>kill</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN67"><span class='Ref_to_Member'>launcher_pid</span></a><span class='Delimiter'>, </span><a href="../../../include/port/win32.h.html#LN201"><span class='Ref_to_Const'>SIGUSR1</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Main loop for the apply launcher process. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN787"></a><span class='Declare_Function'>ApplyLauncherMain</span><span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>main_arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN789"></a>    <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>last_start_time</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"logical replication launcher started"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/ipc.h.html#LN70"><span class='Ref_to_Proto'>before_shmem_exit</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN76"><span class='Ref_to_Proto'>logicalrep_launcher_onexit</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>) </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN67"><span class='Ref_to_Member'>launcher_pid</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN67"><span class='Ref_to_Member'>launcher_pid</span></a> <span class='Operator'>= </span><a href="../../utils/init/globals.c.html#LN38"><span class='Ref_to_Global_Var'>MyProcPid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Establish signal handlers. */ 
+</span>    <a href="../../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32.h.html#LN187"><span class='Ref_to_Const'>SIGHUP</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN636"><span class='Ref_to_Func'>logicalrep_launcher_sighup</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGTERM<span class='Delimiter'>, </span><a href="../../../include/tcop/tcopprot.h.html#LN67"><span class='Ref_to_Proto'>die</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/postmaster/bgworker.h.html#LN149"><span class='Ref_to_Proto'>BackgroundWorkerUnblockSignals</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Establish connection to nailed catalogs (we only ever access 
+     * pg_subscription). 
+     */ 
+</span>    <a href="../../../include/postmaster/bgworker.h.html#LN142"><span class='Ref_to_Proto'>BackgroundWorkerInitializeConnection</span></a><span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Enter main loop */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN813"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span><a name="LN814"></a>        <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>sublist</span><span class='Delimiter'>; 
+</span><a name="LN815"></a>        <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>lc</span><span class='Delimiter'>; 
+</span><a name="LN816"></a>        <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>subctx</span><span class='Delimiter'>; 
+</span><a name="LN817"></a>        <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldctx</span><span class='Delimiter'>; 
+</span><a name="LN818"></a>        <a href="../../../interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>now</span><span class='Delimiter'>; 
+</span><a name="LN819"></a>        <span class='Keyword'>long</span>        <span class='Declare_Local'>wait_time</span> <span class='Operator'>= </span><a href="launcher.c.html#LN57"><span class='Ref_to_Const'>DEFAULT_NAPTIME_PER_CYCLE</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <a href="launcher.c.html#LN818"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Limit the start retry to once a wal_retrieve_retry_interval */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/utils/timestamp.h.html#LN74"><span class='Ref_to_Proto'>TimestampDifferenceExceeds</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN789"><span class='Ref_To_Local'>last_start_time</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN818"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, 
+</span>                                       <a href="../../access/transam/xlog.c.html#LN106"><span class='Ref_to_Global_Var'>wal_retrieve_retry_interval</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Use temporary context for the database list and worker info. */ 
+</span>            <a href="launcher.c.html#LN816"><span class='Ref_To_Local'>subctx</span></a> <span class='Operator'>= </span><a href="../../../include/utils/memutils.h.html#LN145"><span class='Ref_to_Proto'>AllocSetContextCreate</span></a><span class='Parentheses'>(</span><a href="../../utils/mmgr/mcxt.c.html#LN42"><span class='Ref_to_Global_Var'>TopMemoryContext</span></a><span class='Delimiter'>, 
+</span>                                      <span class='String'>"Logical Replication Launcher sublist"</span><span class='Delimiter'>, 
+</span>                                           <a href="../../../include/utils/memutils.h.html#LN161"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_MINSIZE</span></a><span class='Delimiter'>, 
+</span>                                           <a href="../../../include/utils/memutils.h.html#LN162"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_INITSIZE</span></a><span class='Delimiter'>, 
+</span>                                           <a href="../../../include/utils/memutils.h.html#LN163"><span class='Ref_to_Const'>ALLOCSET_DEFAULT_MAXSIZE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="launcher.c.html#LN817"><span class='Ref_To_Local'>oldctx</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN816"><span class='Ref_To_Local'>subctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* search for subscriptions to start or stop. */ 
+</span>            <a href="launcher.c.html#LN814"><span class='Ref_To_Local'>sublist</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN95"><span class='Ref_to_Func'>get_subscription_list</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Start the missing workers for enabled subscriptions. */ 
+</span>            <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN815"><span class='Ref_To_Local'>lc</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN814"><span class='Ref_To_Local'>sublist</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN843"></a>                <a href="../../../include/catalog/pg_subscription.h.html#LN74"><span class='Ref_to_Struct'>Subscription</span></a> <span class='Operator'>*</span><span class='Declare_Local'>sub</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/catalog/pg_subscription.h.html#LN74"><span class='Ref_to_Struct'>Subscription</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN815"><span class='Ref_To_Local'>lc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN844"></a>                <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Operator'>*</span><span class='Declare_Local'>w</span><span class='Delimiter'>; 
+</span> 
+                <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="launcher.c.html#LN844"><span class='Ref_To_Local'>w</span></a> <span class='Operator'>= </span><a href="../../../include/replication/worker_internal.h.html#LN71"><span class='Ref_to_Proto'>logicalrep_worker_find</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN843"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN76"><span class='Ref_to_Member'>oid</span></a><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN843"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN81"><span class='Ref_to_Member'>enabled</span></a> <span class='Operator'>&& </span><a href="launcher.c.html#LN844"><span class='Ref_To_Local'>w</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="launcher.c.html#LN789"><span class='Ref_To_Local'>last_start_time</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN818"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>; 
+</span>                    <a href="launcher.c.html#LN819"><span class='Ref_To_Local'>wait_time</span></a> <span class='Operator'>= </span><a href="../../access/transam/xlog.c.html#LN106"><span class='Ref_to_Global_Var'>wal_retrieve_retry_interval</span></a><span class='Delimiter'>; 
+</span> 
+                    <a href="../../../include/replication/worker_internal.h.html#LN73"><span class='Ref_to_Proto'>logicalrep_worker_launch</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN843"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN77"><span class='Ref_to_Member'>dbid</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN843"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN76"><span class='Ref_to_Member'>oid</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN843"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN79"><span class='Ref_to_Member'>name</span></a><span class='Delimiter'>, 
+</span>                                             <a href="launcher.c.html#LN843"><span class='Ref_To_Local'>sub</span></a><span class='Operator'>-&GT;</span><a href="../../../include/catalog/pg_subscription.h.html#LN80"><span class='Ref_to_Member'>owner</span></a><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* Switch back to original memory context. */ 
+</span>            <a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN817"><span class='Ref_To_Local'>oldctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Comment_Multi_Line'>/* Clean the temporary memory. */ 
+</span>            <a href="../../../include/utils/memutils.h.html#LN74"><span class='Ref_to_Proto'>MemoryContextDelete</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN816"><span class='Ref_To_Local'>subctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if TimestampDifferenceEx... &raquo; </span> 
+        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * The wait in previous cycle was interrupted in less than 
+             * wal_retrieve_retry_interval since last worker was started, this 
+             * usually means crash of the worker, so we should retry in 
+             * wal_retrieve_retry_interval again. 
+             */ 
+</span>            <a href="launcher.c.html#LN819"><span class='Ref_To_Local'>wait_time</span></a> <span class='Operator'>= </span><a href="../../access/transam/xlog.c.html#LN106"><span class='Ref_to_Global_Var'>wal_retrieve_retry_interval</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Wait for more work. */ 
+</span>        <a href="launcher.c.html#LN813"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                       <a href="launcher.c.html#LN819"><span class='Ref_To_Local'>wait_time</span></a><span class='Delimiter'>, 
+</span>                       <a href="../../../include/pgstat.h.html#LN768"><span class='Ref_to_EnumConst'>WAIT_EVENT_LOGICAL_LAUNCHER_MAIN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* emergency bailout if postmaster has died */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN813"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Parentheses'>) 
+</span>            <a href="../../storage/ipc/ipc.c.html#LN97"><span class='Ref_to_Func'>proc_exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN813"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../postmaster/startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../postmaster/startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="../../utils/misc/guc-file.l.html#LN107"><span class='Ref_to_Func'>ProcessConfigFile</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/guc.h.html#LN71"><span class='Ref_to_EnumConst'>PGC_SIGHUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Not reachable */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end ApplyLauncherMain &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Is current process the logical replication launcher? 
+ */ 
+</span><span class='Keyword'>bool 
+</span><a name="LN906"></a><span class='Declare_Function'>IsLogicalLauncher</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN67"><span class='Ref_to_Member'>launcher_pid</span></a> <span class='Operator'>== </span><a href="../../utils/init/globals.c.html#LN38"><span class='Ref_to_Global_Var'>MyProcPid</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Returns state of the subscriptions. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN915"></a><span class='Declare_Function'>pg_stat_get_subscription</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN917"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PG_STAT_GET_SUBSCRIPTION_COLS</span>   <span class='Number'>8</span> 
+<a name="LN918"></a>    <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a>         <span class='Declare_Local'>subid</span> <span class='Operator'>= </span><a href="../../../include/fmgr.h.html#LN173"><span class='Ref_to_Macro'>PG_ARGISNULL</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>) </span><span class='Operator'>? </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a> <span class='Operator'>: </span><a href="../../../include/fmgr.h.html#LN239"><span class='Ref_to_Macro'>PG_GETARG_OID</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN919"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN920"></a>    <a href="../../../include/nodes/execnodes.h.html#LN261"><span class='Ref_to_Struct'>ReturnSetInfo</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rsinfo</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/execnodes.h.html#LN261"><span class='Ref_to_Struct'>ReturnSetInfo</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span>fcinfo<span class='Operator'>-&GT;</span>resultinfo<span class='Delimiter'>; 
+</span><a name="LN921"></a>    <a href="../../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a>   <span class='Declare_Local'>tupdesc</span><span class='Delimiter'>; 
+</span><a name="LN922"></a>    <a href="../../utils/sort/tuplestore.c.html#LN102"><span class='Ref_to_Struct'>Tuplestorestate</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tupstore</span><span class='Delimiter'>; 
+</span><a name="LN923"></a>    <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>per_query_ctx</span><span class='Delimiter'>; 
+</span><a name="LN924"></a>    <a href="../../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldcontext</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* check to see if caller supports us returning a tuplestore */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN920"><span class='Ref_To_Local'>rsinfo</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL </span><span class='Operator'>|| !</span><a href="../../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN920"><span class='Ref_To_Local'>rsinfo</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/execnodes.h.html#LN261"><span class='Ref_to_Struct'>ReturnSetInfo</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"set-valued function called in context that cannot accept a set"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>(</span><a href="launcher.c.html#LN920"><span class='Ref_To_Local'>rsinfo</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/execnodes.h.html#LN267"><span class='Ref_to_Member'>allowedModes</span></a> <span class='Operator'>& </span><a href="../../../include/nodes/execnodes.h.html#LN250"><span class='Ref_to_EnumConst'>SFRM_Materialize</span></a><span class='Parentheses'>))</span> 
+        <a href="../../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"materialize mode required, but it is not "</span> <span class='Operator'>\ 
+</span>                        <span class='String'>"allowed in this context"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Build a tuple descriptor for our result type */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/funcapi.h.html#LN157"><span class='Ref_to_Proto'>get_call_result_type</span></a><span class='Parentheses'>(</span>fcinfo<span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="launcher.c.html#LN921"><span class='Ref_To_Local'>tupdesc</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../../include/funcapi.h.html#LN152"><span class='Ref_to_EnumConst'>TYPEFUNC_COMPOSITE</span></a><span class='Parentheses'>)</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"return type must be a row type"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN923"><span class='Ref_To_Local'>per_query_ctx</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN920"><span class='Ref_To_Local'>rsinfo</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/execnodes.h.html#LN265"><span class='Ref_to_Member'>econtext</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/execnodes.h.html#LN201"><span class='Ref_to_Member'>ecxt_per_query_memory</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN924"><span class='Ref_To_Local'>oldcontext</span></a> <span class='Operator'>= </span><a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN923"><span class='Ref_To_Local'>per_query_ctx</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="launcher.c.html#LN922"><span class='Ref_To_Local'>tupstore</span></a> <span class='Operator'>= </span><a href="../../../include/utils/tuplestore.h.html#LN46"><span class='Ref_to_Proto'>tuplestore_begin_heap</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="../../utils/init/globals.c.html#LN112"><span class='Ref_to_Global_Var'>work_mem</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN920"><span class='Ref_To_Local'>rsinfo</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/execnodes.h.html#LN269"><span class='Ref_to_Member'>returnMode</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/execnodes.h.html#LN250"><span class='Ref_to_EnumConst'>SFRM_Materialize</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN920"><span class='Ref_To_Local'>rsinfo</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/execnodes.h.html#LN272"><span class='Ref_to_Member'>setResult</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN922"><span class='Ref_To_Local'>tupstore</span></a><span class='Delimiter'>; 
+</span>    <a href="launcher.c.html#LN920"><span class='Ref_To_Local'>rsinfo</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/execnodes.h.html#LN273"><span class='Ref_to_Member'>setDesc</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN921"><span class='Ref_To_Local'>tupdesc</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN924"><span class='Ref_To_Local'>oldcontext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Make sure we get consistent view of the workers. */ 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN134"><span class='Ref_to_EnumConst'>LW_SHARED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN919"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="launcher.c.html#LN919"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="launcher.c.html#LN59"><span class='Ref_to_Global_Var'>max_logical_replication_workers</span></a><span class='Delimiter'>; </span><a href="launcher.c.html#LN919"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* for each row */ 
+</span><a name="LN957"></a>        <a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Local'>values</span><span class='Delimiter'>[</span><a href="launcher.c.html#LN917"><span class='Ref_to_Const'>PG_STAT_GET_SUBSCRIPTION_COLS</span></a><span class='Delimiter'>]; 
+</span><a name="LN958"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>nulls</span><span class='Delimiter'>[</span><a href="launcher.c.html#LN917"><span class='Ref_to_Const'>PG_STAT_GET_SUBSCRIPTION_COLS</span></a><span class='Delimiter'>]; 
+</span><a name="LN959"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>worker_pid</span><span class='Delimiter'>; 
+</span><a name="LN960"></a>        <a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a> <span class='Declare_Local'>worker</span><span class='Delimiter'>; 
+</span> 
+        memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="launcher.c.html#LN73"><span class='Ref_to_Global_Var'>LogicalRepCtx</span></a><span class='Operator'>-&GT;</span><a href="launcher.c.html#LN70"><span class='Ref_to_Member'>workers</span></a><span class='Delimiter'>[</span><a href="launcher.c.html#LN919"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>               <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/replication/worker_internal.h.html#LN21"><span class='Ref_to_Struct'>LogicalRepWorker</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a> <span class='Operator'>|| !</span><a href="../../../include/storage/procarray.h.html#LN101"><span class='Ref_to_Proto'>IsBackendPid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN107"><span class='Ref_to_Member'>pid</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN537"><span class='Ref_to_Macro'>OidIsValid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN918"><span class='Ref_To_Local'>subid</span></a><span class='Parentheses'>) </span><span class='Operator'>&& </span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a> <span class='Operator'>!= </span><a href="launcher.c.html#LN918"><span class='Ref_To_Local'>subid</span></a><span class='Parentheses'>)</span> 
+            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <a href="launcher.c.html#LN959"><span class='Ref_To_Local'>worker_pid</span></a> <span class='Operator'>= </span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN33"><span class='Ref_to_Member'>proc</span></a><span class='Operator'>-&GT;</span><a href="../../../include/storage/proc.h.html#LN107"><span class='Ref_to_Member'>pid</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN958"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="launcher.c.html#LN958"><span class='Ref_To_Local'>nulls</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN512"><span class='Ref_to_Macro'>ObjectIdGetDatum</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN42"><span class='Ref_to_Member'>subid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN537"><span class='Ref_to_Macro'>OidIsValid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Parentheses'>))</span> 
+            <a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN512"><span class='Ref_to_Macro'>ObjectIdGetDatum</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN45"><span class='Ref_to_Member'>relid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="launcher.c.html#LN958"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>2</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN484"><span class='Ref_to_Macro'>Int32GetDatum</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN959"><span class='Ref_To_Local'>worker_pid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN51"><span class='Ref_to_Member'>last_lsn</span></a><span class='Parentheses'>))</span> 
+            <a href="launcher.c.html#LN958"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><span class='Number'>3</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>3</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/utils/pg_lsn.h.html#LN21"><span class='Ref_to_Macro'>LSNGetDatum</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN51"><span class='Ref_to_Member'>last_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN52"><span class='Ref_to_Member'>last_send_time</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="launcher.c.html#LN958"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><span class='Number'>4</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>4</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN31"><span class='Ref_to_Macro'>TimestampTzGetDatum</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN52"><span class='Ref_to_Member'>last_send_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN53"><span class='Ref_to_Member'>last_recv_time</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="launcher.c.html#LN958"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><span class='Number'>5</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>5</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN31"><span class='Ref_to_Macro'>TimestampTzGetDatum</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN53"><span class='Ref_to_Member'>last_recv_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN54"><span class='Ref_to_Member'>reply_lsn</span></a><span class='Parentheses'>))</span> 
+            <a href="launcher.c.html#LN958"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><span class='Number'>6</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>6</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/utils/pg_lsn.h.html#LN21"><span class='Ref_to_Macro'>LSNGetDatum</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN54"><span class='Ref_to_Member'>reply_lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN55"><span class='Ref_to_Member'>reply_time</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="launcher.c.html#LN958"><span class='Ref_To_Local'>nulls</span></a><span class='Delimiter'>[</span><span class='Number'>7</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><span class='Number'>7</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../../include/utils/timestamp.h.html#LN31"><span class='Ref_to_Macro'>TimestampTzGetDatum</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN960"><span class='Ref_To_Local'>worker</span></a><span class='Operator'>.</span><a href="../../../include/replication/worker_internal.h.html#LN55"><span class='Ref_to_Member'>reply_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/utils/tuplestore.h.html#LN55"><span class='Ref_to_Proto'>tuplestore_putvalues</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN922"><span class='Ref_To_Local'>tupstore</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN921"><span class='Ref_To_Local'>tupdesc</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN957"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>, </span><a href="launcher.c.html#LN958"><span class='Ref_To_Local'>nulls</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If only a single subscription was requested, and we found it, 
+         * break. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN537"><span class='Ref_to_Macro'>OidIsValid</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN918"><span class='Ref_To_Local'>subid</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=0;i&LT;=max_logical_re... &raquo; </span> 
+ 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>LogicalRepWorkerLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* clean up and return the tuplestore */ 
+</span>    <a href="../../../include/utils/tuplestore.h.html#LN59"><span class='Ref_to_Macro'>tuplestore_donestoring</span></a><span class='Parentheses'>(</span><a href="launcher.c.html#LN922"><span class='Ref_To_Local'>tupstore</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>) </span><span class='Number'>0</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pg_stat_get_subscription &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

@@ -1,0 +1,1110 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>contrib\postgres_fdw\connection.c</title>
+<LINK REL=StyleSheet HREF="../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>contrib\postgres_fdw\connection.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:26 2017
+</td></tr>
+<tr><td><a href='../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * connection.c 
+ *        Connection management functions for postgres_fdw 
+ * 
+ * Portions Copyright (c) 2012-2017, PostgreSQL Global Development Group 
+ * 
+ * IDENTIFICATION 
+ *        contrib/postgres_fdw/connection.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"postgres_fdw.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/htup_details.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_user_mapping.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"mb/pg_wchar.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/latch.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/hsearch.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/syscache.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Connection cache hash table entry 
+ * 
+ * The lookup key in this hash table is the user mapping OID. We use just one 
+ * connection per user mapping ID, which ensures that all the scans use the 
+ * same snapshot during a query.  Using the user mapping OID rather than 
+ * the foreign server OID + user OID avoids creating multiple connections when 
+ * the public user mapping applies to all user OIDs. 
+ * 
+ * The "conn" pointer can be NULL if we don't currently have a live connection. 
+ * When we do have a connection, xact_depth tracks the current depth of 
+ * transactions and subtransactions open on the remote side.  We need to issue 
+ * commands at the same nesting depth on the remote as we're executing at 
+ * ourselves, so that rolling back a subtransaction will kill the right 
+ * queries and not the wrong ones. 
+ */ 
+</span><a name="LN44"></a><span class='Control'>typedef</span> <a href="../../src/include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Typedef'>ConnCacheKey</span><span class='Delimiter'>; 
+</span> 
+<a name="LN46"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>ConnCacheEntry</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN48"></a>    <a href="connection.c.html#LN44"><span class='Ref_to_Typedef'>ConnCacheKey</span></a> <span class='Declare_Member'>key</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* hash key (must be first) */ 
+</span><a name="LN49"></a>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a>     <span class='Operator'>*</span><span class='Declare_Member'>conn</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* connection to foreign server, or NULL */ 
+</span><a name="LN50"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>xact_depth</span><span class='Delimiter'>;</span>     <span class='Comment_Multi_Line'>/* 0 = no xact open, 1 = main xact open, 2 = 
+                                 * one level of subxact open, etc */ 
+</span><a name="LN52"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>have_prep_stmt</span><span class='Delimiter'>; </span><span class='Comment_Single_Line'>/* have we prepared any stmts in this xact? */ 
+</span><a name="LN53"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>have_error</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* have any subxacts aborted in this xact? */ 
+</span><a name="LN54"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>changing_xact_state</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* xact state change in process */ 
+</span><a name="LN55"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>ConnCacheEntry</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Connection cache (initialized on first use) 
+ */ 
+</span><a name="LN60"></a><span class='Keyword'>static </span><a href="../../src/backend/utils/hash/dynahash.c.html#LN192"><span class='Ref_to_Struct'>HTAB</span></a> <span class='Operator'>*</span><span class='Declare_Var'>ConnectionHash</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* for assigning cursor numbers and prepared statement numbers */ 
+</span><a name="LN63"></a><span class='Keyword'>static unsigned int </span><span class='Declare_Var'>cursor_number</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN64"></a><span class='Keyword'>static unsigned int </span><span class='Declare_Var'>prep_stmt_number</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* tracks whether any work is needed in callback functions */ 
+</span><a name="LN67"></a><span class='Keyword'>static bool </span><span class='Declare_Var'>xact_got_connection</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* prototypes of private functions */ 
+</span><a name="LN70"></a><span class='Keyword'>static </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>connect_pg_server</span><span class='Parentheses'>(</span><a href="../../src/include/foreign/foreign.h.html#LN44"><span class='Ref_to_Struct'>ForeignServer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>server</span><span class='Delimiter'>, </span><a href="../../src/include/foreign/foreign.h.html#LN55"><span class='Ref_to_Struct'>UserMapping</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>user</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN71"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>check_conn_params</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>**</span><span class='Declare_Parameter'>keywords</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>**</span><span class='Declare_Parameter'>values</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN72"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>configure_remote_session</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN73"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>do_sql_command</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>sql</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN74"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>begin_remote_xact</span><span class='Parentheses'>(</span><a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>entry</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN75"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>pgfdw_xact_callback</span><span class='Parentheses'>(</span><a href="../../src/include/access/xact.h.html#LN98"><span class='Ref_to_Typedef'>XactEvent</span></a> <span class='Declare_Parameter'>event</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>arg</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN76"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>pgfdw_subxact_callback</span><span class='Parentheses'>(</span><a href="../../src/include/access/xact.h.html#LN112"><span class='Ref_to_Typedef'>SubXactEvent</span></a> <span class='Declare_Parameter'>event</span><span class='Delimiter'>, 
+</span><a name="LN77"></a>                       <a href="../../src/include/c.h.html#LN400"><span class='Ref_to_Typedef'>SubTransactionId</span></a> <span class='Declare_Parameter'>mySubid</span><span class='Delimiter'>, 
+</span><a name="LN78"></a>                       <a href="../../src/include/c.h.html#LN400"><span class='Ref_to_Typedef'>SubTransactionId</span></a> <span class='Declare_Parameter'>parentSubid</span><span class='Delimiter'>, 
+</span><a name="LN79"></a>                       <span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>arg</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN80"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>pgfdw_reject_incomplete_xact_state_change</span><span class='Parentheses'>(</span><a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>entry</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN81"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>pgfdw_cancel_query</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN82"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>pgfdw_exec_cleanup_query</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>query</span><span class='Delimiter'>, 
+</span><a name="LN83"></a>                         <span class='Keyword'>bool </span><span class='Declare_Parameter'>ignore_errors</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN84"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>pgfdw_get_cleanup_result</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Delimiter'>, </span><a href="../../src/interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>endtime</span><span class='Delimiter'>, 
+</span><a name="LN85"></a>                         <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a> <span class='Operator'>**</span><span class='Declare_Parameter'>result</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Get a PGconn which can be used to execute queries on the remote PostgreSQL 
+ * server with the user's authorization.  A new connection is established 
+ * if we don't already have a suitable one, and a transaction is opened at 
+ * the right subtransaction nesting depth if we didn't do that already. 
+ * 
+ * will_prep_stmt must be true if caller intends to create any prepared 
+ * statements.  Since those don't go away automatically at transaction end 
+ * (not even on error), we need this flag to cue manual cleanup. 
+ * 
+ * XXX Note that caching connections theoretically requires a mechanism to 
+ * detect change of FDW objects to invalidate already established connections. 
+ * We could manage that by watching for invalidation events on the relevant 
+ * syscaches.  For the moment, though, it's not clear that this would really 
+ * be useful and not mere pedantry.  We could not flush any active connections 
+ * mid-transaction anyway. 
+ */ 
+</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>* 
+</span><a name="LN106"></a><span class='Declare_Function'>GetConnection</span><span class='Parentheses'>(</span><a href="../../src/include/foreign/foreign.h.html#LN55"><span class='Ref_to_Struct'>UserMapping</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>user</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>will_prep_stmt</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN108"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span><a name="LN109"></a>    <a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a> <span class='Operator'>*</span><span class='Declare_Local'>entry</span><span class='Delimiter'>; 
+</span><a name="LN110"></a>    <a href="connection.c.html#LN44"><span class='Ref_to_Typedef'>ConnCacheKey</span></a> <span class='Declare_Local'>key</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* First time through, initialize connection cache hashtable */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN60"><span class='Ref_to_Global_Var'>ConnectionHash</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN115"></a>        <a href="../../src/include/utils/hsearch.h.html#LN64"><span class='Ref_to_Struct'>HASHCTL</span></a>     <span class='Declare_Local'>ctl</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../src/include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="connection.c.html#LN115"><span class='Ref_To_Local'>ctl</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="connection.c.html#LN115"><span class='Ref_To_Local'>ctl</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN115"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../src/include/utils/hsearch.h.html#LN71"><span class='Ref_to_Member'>keysize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="connection.c.html#LN44"><span class='Ref_to_Typedef'>ConnCacheKey</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN115"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../src/include/utils/hsearch.h.html#LN72"><span class='Ref_to_Member'>entrysize</span></a> <span class='Operator'>= </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* allocate ConnectionHash in the cache context */ 
+</span>        <a href="connection.c.html#LN115"><span class='Ref_To_Local'>ctl</span></a><span class='Operator'>.</span><a href="../../src/include/utils/hsearch.h.html#LN77"><span class='Ref_to_Member'>hcxt</span></a> <span class='Operator'>= </span><a href="../../src/backend/utils/mmgr/mcxt.c.html#LN45"><span class='Ref_to_Global_Var'>CacheMemoryContext</span></a><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN60"><span class='Ref_to_Global_Var'>ConnectionHash</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/hsearch.h.html#LN121"><span class='Ref_to_Proto'>hash_create</span></a><span class='Parentheses'>(</span><span class='String'>"postgres_fdw connections"</span><span class='Delimiter'>, </span><span class='Number'>8</span><span class='Delimiter'>, 
+</span>                                     <span class='Operator'>&</span><a href="connection.c.html#LN115"><span class='Ref_To_Local'>ctl</span></a><span class='Delimiter'>, 
+</span>                                     <a href="../../src/include/utils/hsearch.h.html#LN86"><span class='Ref_to_Const'>HASH_ELEM</span></a> <span class='Operator'>| </span><a href="../../src/include/utils/hsearch.h.html#LN87"><span class='Ref_to_Const'>HASH_BLOBS</span></a> <span class='Operator'>| </span><a href="../../src/include/utils/hsearch.h.html#LN92"><span class='Ref_to_Const'>HASH_CONTEXT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Register some callback functions that manage connection cleanup. 
+         * This should be done just once in each backend. 
+         */ 
+</span>        <a href="../../src/include/access/xact.h.html#LN374"><span class='Ref_to_Proto'>RegisterXactCallback</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN75"><span class='Ref_to_Proto'>pgfdw_xact_callback</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../src/include/access/xact.h.html#LN376"><span class='Ref_to_Proto'>RegisterSubXactCallback</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN76"><span class='Ref_to_Proto'>pgfdw_subxact_callback</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if ConnectionHash==NULL &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Set flag that we did GetConnection during the current transaction */ 
+</span>    <a href="connection.c.html#LN67"><span class='Ref_to_Global_Var'>xact_got_connection</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Create hash key for the entry.  Assume no pad bytes in key struct */ 
+</span>    <a href="connection.c.html#LN110"><span class='Ref_To_Local'>key</span></a> <span class='Operator'>= </span><a href="connection.c.html#LN106"><span class='Ref_to_Parameter'>user</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN57"><span class='Ref_to_Member'>umid</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Find or create cached entry for requested connection. 
+     */ 
+</span>    <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/hsearch.h.html#LN125"><span class='Ref_to_Proto'>hash_search</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN60"><span class='Ref_to_Global_Var'>ConnectionHash</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="connection.c.html#LN110"><span class='Ref_To_Local'>key</span></a><span class='Delimiter'>, </span><a href="../../src/include/utils/hsearch.h.html#LN105"><span class='Ref_to_EnumConst'>HASH_ENTER</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="connection.c.html#LN108"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="connection.c.html#LN108"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* initialize new hashtable entry (key is already filled in) */ 
+</span>        <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN52"><span class='Ref_to_Member'>have_prep_stmt</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN53"><span class='Ref_to_Member'>have_error</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Reject further use of connections which failed abort cleanup. */ 
+</span>    <a href="connection.c.html#LN80"><span class='Ref_to_Proto'>pgfdw_reject_incomplete_xact_state_change</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We don't check the health of cached connection here, because it would 
+     * require some overhead.  Broken connection will be detected when the 
+     * connection is actually used. 
+     */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If cache entry doesn't have a connection, we have to establish a new 
+     * connection.  (If connect_pg_server throws an error, the cache entry 
+     * will be left in a valid empty state.) 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN170"></a>        <a href="../../src/include/foreign/foreign.h.html#LN44"><span class='Ref_to_Struct'>ForeignServer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>server</span> <span class='Operator'>= </span><a href="../../src/include/foreign/foreign.h.html#LN71"><span class='Ref_to_Proto'>GetForeignServer</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN106"><span class='Ref_to_Parameter'>user</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN59"><span class='Ref_to_Member'>serverid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>;</span>  <span class='Comment_Single_Line'>/* just to be sure */ 
+</span>        <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN52"><span class='Ref_to_Member'>have_prep_stmt</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN53"><span class='Ref_to_Member'>have_error</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a> <span class='Operator'>= </span><a href="connection.c.html#LN70"><span class='Ref_to_Proto'>connect_pg_server</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN170"><span class='Ref_To_Local'>server</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN106"><span class='Ref_to_Parameter'>user</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, </span><span class='String'>"new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)"</span><span class='Delimiter'>, 
+</span>             <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN170"><span class='Ref_To_Local'>server</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN49"><span class='Ref_to_Member'>servername</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN106"><span class='Ref_to_Parameter'>user</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN57"><span class='Ref_to_Member'>umid</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN106"><span class='Ref_to_Parameter'>user</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN58"><span class='Ref_to_Member'>userid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Start a new transaction or subtransaction if needed. 
+     */ 
+</span>    <a href="connection.c.html#LN74"><span class='Ref_to_Proto'>begin_remote_xact</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Remember if caller will prepare statements */ 
+</span>    <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN52"><span class='Ref_to_Member'>have_prep_stmt</span></a> <span class='Operator'>|= </span><a href="connection.c.html#LN106"><span class='Ref_to_Parameter'>will_prep_stmt</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="connection.c.html#LN109"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end GetConnection &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Connect to remote server using specified server and user mapping properties. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>* 
+</span><a name="LN196"></a><span class='Declare_Function'>connect_pg_server</span><span class='Parentheses'>(</span><a href="../../src/include/foreign/foreign.h.html#LN44"><span class='Ref_to_Struct'>ForeignServer</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>server</span><span class='Delimiter'>, </span><a href="../../src/include/foreign/foreign.h.html#LN55"><span class='Ref_to_Struct'>UserMapping</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>user</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN198"></a>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a>     <span class='Operator'>*</span><span class='Keyword'>volatile </span><span class='Declare_Local'>conn</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Use PG_TRY block to ensure closing connection on error. 
+     */ 
+</span>    <a href="../../src/include/utils/elog.h.html#LN283"><span class='Ref_to_Macro'>PG_TRY</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN205"></a>        <span class='Keyword'>const char </span><span class='Operator'>**</span><span class='Declare_Local'>keywords</span><span class='Delimiter'>; 
+</span><a name="LN206"></a>        <span class='Keyword'>const char </span><span class='Operator'>**</span><span class='Declare_Local'>values</span><span class='Delimiter'>; 
+</span><a name="LN207"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>n</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Construct connection params from generic options of ForeignServer 
+         * and UserMapping.  (Some of them might not be libpq options, in 
+         * which case we'll just waste a few array slots.)  Add 3 extra slots 
+         * for fallback_application_name, client_encoding, end marker. 
+         */ 
+</span>        <a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>= </span><a href="../../src/include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN196"><span class='Ref_to_Parameter'>server</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN52"><span class='Ref_to_Member'>options</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><a href="../../src/include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN196"><span class='Ref_to_Parameter'>user</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN60"><span class='Ref_to_Member'>options</span></a><span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Number'>3</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN205"><span class='Ref_To_Local'>keywords</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>**</span><span class='Parentheses'>) </span><a href="../../src/include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN206"><span class='Ref_To_Local'>values</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>**</span><span class='Parentheses'>) </span><a href="../../src/include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>+= </span><a href="postgres_fdw.h.html#LN127"><span class='Ref_to_Proto'>ExtractConnectionOptions</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN196"><span class='Ref_to_Parameter'>server</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN52"><span class='Ref_to_Member'>options</span></a><span class='Delimiter'>, 
+</span>                                      <a href="connection.c.html#LN205"><span class='Ref_To_Local'>keywords</span></a> <span class='Operator'>+ </span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN206"><span class='Ref_To_Local'>values</span></a> <span class='Operator'>+ </span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a> <span class='Operator'>+= </span><a href="postgres_fdw.h.html#LN127"><span class='Ref_to_Proto'>ExtractConnectionOptions</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN196"><span class='Ref_to_Parameter'>user</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN60"><span class='Ref_to_Member'>options</span></a><span class='Delimiter'>, 
+</span>                                      <a href="connection.c.html#LN205"><span class='Ref_To_Local'>keywords</span></a> <span class='Operator'>+ </span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN206"><span class='Ref_To_Local'>values</span></a> <span class='Operator'>+ </span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Use "postgres_fdw" as fallback_application_name. */ 
+</span>        <a href="connection.c.html#LN205"><span class='Ref_To_Local'>keywords</span></a><span class='Delimiter'>[</span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>"fallback_application_name"</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN206"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>"postgres_fdw"</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Set client_encoding so that libpq can convert encoding properly. */ 
+</span>        <a href="connection.c.html#LN205"><span class='Ref_To_Local'>keywords</span></a><span class='Delimiter'>[</span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>"client_encoding"</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN206"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../src/include/mb/pg_wchar.h.html#LN546"><span class='Ref_to_Proto'>GetDatabaseEncodingName</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+        <a href="connection.c.html#LN205"><span class='Ref_To_Local'>keywords</span></a><span class='Delimiter'>[</span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="connection.c.html#LN206"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>[</span><a href="connection.c.html#LN207"><span class='Ref_To_Local'>n</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* verify connection parameters and make connection */ 
+</span>        <a href="connection.c.html#LN71"><span class='Ref_to_Proto'>check_conn_params</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN205"><span class='Ref_To_Local'>keywords</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN206"><span class='Ref_To_Local'>values</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="connection.c.html#LN198"><span class='Ref_To_Local'>conn</span></a> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN261"><span class='Ref_to_Proto'>PQconnectdbParams</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN205"><span class='Ref_To_Local'>keywords</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN206"><span class='Ref_To_Local'>values</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="connection.c.html#LN198"><span class='Ref_To_Local'>conn</span></a> <span class='Operator'>|| </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN317"><span class='Ref_to_Proto'>PQstatus</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN198"><span class='Ref_To_Local'>conn</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN48"><span class='Ref_to_EnumConst'>CONNECTION_OK</span></a><span class='Parentheses'>)</span> 
+            <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>               <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not connect to server \"%s\""</span><span class='Delimiter'>, 
+</span>                       <a href="connection.c.html#LN196"><span class='Ref_to_Parameter'>server</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN49"><span class='Ref_to_Member'>servername</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                <a href="../../src/backend/utils/error/elog.c.html#LN898"><span class='Ref_to_Func'>errdetail_internal</span></a><span class='Parentheses'>(</span><span class='String'>"%s"</span><span class='Delimiter'>, </span><a href="../../src/include/utils/palloc.h.html#LN129"><span class='Ref_to_Proto'>pchomp</span></a><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN323"><span class='Ref_to_Proto'>PQerrorMessage</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN198"><span class='Ref_To_Local'>conn</span></a><span class='Parentheses'>)))))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Check that non-superuser has used password to establish connection; 
+         * otherwise, he's piggybacking on the postgres server's user 
+         * identity. See also dblink_security_check() in contrib/dblink. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../src/backend/utils/misc/superuser.c.html#LN45"><span class='Ref_to_Func'>superuser</span></a><span class='Parentheses'>() </span><span class='Operator'>&& !</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN327"><span class='Ref_to_Proto'>PQconnectionUsedPassword</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN198"><span class='Ref_To_Local'>conn</span></a><span class='Parentheses'>))</span> 
+            <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                  <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                   <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"password is required"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                   <a href="../../src/backend/utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Non-superuser cannot connect if the server does not request a password."</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                   <a href="../../src/backend/utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"Target server's authentication method must be changed."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Prepare new session for use */ 
+</span>        <a href="connection.c.html#LN72"><span class='Ref_to_Proto'>configure_remote_session</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN198"><span class='Ref_To_Local'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../src/include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN205"><span class='Ref_To_Local'>keywords</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../src/include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN206"><span class='Ref_To_Local'>values</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../src/include/utils/elog.h.html#LN292"><span class='Ref_to_Macro'>PG_CATCH</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Release PGconn data structure if we managed to create one */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN198"><span class='Ref_To_Local'>conn</span></a><span class='Parentheses'>) 
+</span>            <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN272"><span class='Ref_to_Proto'>PQfinish</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN198"><span class='Ref_To_Local'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../src/include/utils/elog.h.html#LN310"><span class='Ref_to_Macro'>PG_RE_THROW</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../src/include/utils/elog.h.html#LN299"><span class='Ref_to_Macro'>PG_END_TRY</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="connection.c.html#LN198"><span class='Ref_To_Local'>conn</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end connect_pg_server &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * For non-superusers, insist that the connstr specify a password.  This 
+ * prevents a password from being picked up from .pgpass, a service file, 
+ * the environment, etc.  We don't want the postgres user's passwords 
+ * to be accessible to non-superusers.  (See also dblink_connstr_check in 
+ * contrib/dblink.) 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN286"></a><span class='Declare_Function'>check_conn_params</span><span class='Parentheses'>(</span><span class='Keyword'>const char </span><span class='Operator'>**</span><span class='Declare_Parameter'>keywords</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>**</span><span class='Declare_Parameter'>values</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN288"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* no check required if superuser */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../src/backend/utils/misc/superuser.c.html#LN45"><span class='Ref_to_Func'>superuser</span></a><span class='Parentheses'>())</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* ok if params contain a non-empty password */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN288"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="connection.c.html#LN286"><span class='Ref_to_Parameter'>keywords</span></a><span class='Delimiter'>[</span><a href="connection.c.html#LN288"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; </span><a href="connection.c.html#LN288"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="connection.c.html#LN286"><span class='Ref_to_Parameter'>keywords</span></a><span class='Delimiter'>[</span><a href="connection.c.html#LN288"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], </span><span class='String'>"password"</span><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="connection.c.html#LN286"><span class='Ref_to_Parameter'>values</span></a><span class='Delimiter'>[</span><a href="connection.c.html#LN288"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>][</span><span class='Number'>0</span><span class='Delimiter'>] </span><span class='Operator'>!= </span><span class='String'>'\0'</span><span class='Parentheses'>)</span> 
+            <span class='Control'>return</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"password is required"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="../../src/backend/utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"Non-superusers must provide a password in the user mapping."</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end check_conn_params &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Issue SET commands to make sure remote session is configured properly. 
+ * 
+ * We do this just once at connection, assuming nothing will change the 
+ * values later.  Since we'll never send volatile function calls to the 
+ * remote, there shouldn't be any way to break this assumption from our end. 
+ * It's possible to think of ways to break it at the remote end, eg making 
+ * a foreign table point to a view that includes a set_config call --- 
+ * but once you admit the possibility of a malicious view definition, 
+ * there are any number of ways to break things. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN319"></a><span class='Declare_Function'>configure_remote_session</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN321"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>remoteversion</span> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN322"><span class='Ref_to_Proto'>PQserverVersion</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN319"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Force the search path to contain only pg_catalog (see deparse.c) */ 
+</span>    <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN319"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='String'>"SET search_path = pg_catalog"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Set remote timezone; this is basically just cosmetic, since all 
+     * transmitted and returned timestamptzs should specify a zone explicitly 
+     * anyway.  However it makes the regression test outputs more predictable. 
+     * 
+     * We don't risk setting remote zone equal to ours, since the remote 
+     * server might use a different timezone database.  Instead, use UTC 
+     * (quoted, because very old servers are picky about case). 
+     */ 
+</span>    <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN319"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='String'>"SET timezone = 'UTC'"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Set values needed to ensure unambiguous data output from remote.  (This 
+     * logic should match what pg_dump does.  See also set_transmission_modes 
+     * in postgres_fdw.c.) 
+     */ 
+</span>    <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN319"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='String'>"SET datestyle = ISO"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN321"><span class='Ref_To_Local'>remoteversion</span></a> <span class='Operator'>&GT;= </span><span class='Number'>80400</span><span class='Parentheses'>) 
+</span>        <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN319"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='String'>"SET intervalstyle = postgres"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN321"><span class='Ref_To_Local'>remoteversion</span></a> <span class='Operator'>&GT;= </span><span class='Number'>90000</span><span class='Parentheses'>) 
+</span>        <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN319"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='String'>"SET extra_float_digits = 3"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>else</span> 
+        <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN319"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='String'>"SET extra_float_digits = 2"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end configure_remote_session &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Convenience subroutine to issue a non-data-returning SQL command to remote 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN355"></a><span class='Declare_Function'>do_sql_command</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>sql</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN357"></a>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>res</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN401"><span class='Ref_to_Proto'>PQsendQuery</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN355"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN355"><span class='Ref_to_Parameter'>sql</span></a><span class='Parentheses'>))</span> 
+        <a href="postgres_fdw.h.html#LN123"><span class='Ref_to_Proto'>pgfdw_report_error</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><a href="connection.c.html#LN355"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="connection.c.html#LN355"><span class='Ref_to_Parameter'>sql</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="connection.c.html#LN357"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="postgres_fdw.h.html#LN121"><span class='Ref_to_Proto'>pgfdw_get_result</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN355"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN355"><span class='Ref_to_Parameter'>sql</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN466"><span class='Ref_to_Proto'>PQresultStatus</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN357"><span class='Ref_To_Local'>res</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN84"><span class='Ref_to_EnumConst'>PGRES_COMMAND_OK</span></a><span class='Parentheses'>)</span> 
+        <a href="postgres_fdw.h.html#LN123"><span class='Ref_to_Proto'>pgfdw_report_error</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN357"><span class='Ref_To_Local'>res</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN355"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><a href="connection.c.html#LN355"><span class='Ref_to_Parameter'>sql</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN501"><span class='Ref_to_Proto'>PQclear</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN357"><span class='Ref_To_Local'>res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Start remote transaction or subtransaction, if needed. 
+ * 
+ * Note that we always use at least REPEATABLE READ in the remote session. 
+ * This is so that, if a query initiates multiple scans of the same or 
+ * different foreign tables, we will get snapshot-consistent results from 
+ * those scans.  A disadvantage is that we can't provide sane emulation of 
+ * READ COMMITTED behavior --- it would be nice if we had some other way to 
+ * control which remote queries share a snapshot. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN378"></a><span class='Declare_Function'>begin_remote_xact</span><span class='Parentheses'>(</span><a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>entry</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN380"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>curlevel</span> <span class='Operator'>= </span><a href="../../src/include/access/xact.h.html#LN344"><span class='Ref_to_Proto'>GetCurrentTransactionNestLevel</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Start main transaction if we haven't yet */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN385"></a>        <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>sql</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, </span><span class='String'>"starting remote transaction on connection %p"</span><span class='Delimiter'>, 
+</span>             <a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../src/include/access/xact.h.html#LN43"><span class='Ref_to_Macro'>IsolationIsSerializable</span></a><span class='Parentheses'>())</span> 
+            <a href="connection.c.html#LN385"><span class='Ref_To_Local'>sql</span></a> <span class='Operator'>= </span><span class='String'>"START TRANSACTION ISOLATION LEVEL SERIALIZABLE"</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="connection.c.html#LN385"><span class='Ref_To_Local'>sql</span></a> <span class='Operator'>= </span><span class='String'>"START TRANSACTION ISOLATION LEVEL REPEATABLE READ"</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN385"><span class='Ref_To_Local'>sql</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we're in a subtransaction, stack up savepoints to match our level. 
+     * This ensures we can rollback just the desired effects when a 
+     * subtransaction aborts. 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>&LT; </span><a href="connection.c.html#LN380"><span class='Ref_To_Local'>curlevel</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN407"></a>        <span class='Keyword'>char</span>        <span class='Declare_Local'>sql</span><span class='Delimiter'>[</span><span class='Number'>64</span><span class='Delimiter'>]; 
+</span> 
+        <a href="../../src/pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN407"><span class='Ref_To_Local'>sql</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="connection.c.html#LN407"><span class='Ref_To_Local'>sql</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"SAVEPOINT s%d"</span><span class='Delimiter'>, </span><a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN407"><span class='Ref_To_Local'>sql</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN378"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end begin_remote_xact &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Release connection reference count created by calling GetConnection. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN421"></a><span class='Declare_Function'>ReleaseConnection</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Currently, we don't actually track connection references because all 
+     * cleanup is managed on a transaction or subtransaction basis instead. So 
+     * there's nothing to do here. 
+     */ 
+</span><span class='Delimiter'>} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Assign a "unique" number for a cursor. 
+ * 
+ * These really only need to be unique per connection within a transaction. 
+ * For the moment we ignore the per-connection point and assign them across 
+ * all connections in the transaction, but we ask for the connection to be 
+ * supplied in case we want to refine that. 
+ * 
+ * Note that even if wraparound happens in a very long transaction, actual 
+ * collisions are highly improbable; just be sure to use %u not %d to print. 
+ */ 
+</span><span class='Keyword'>unsigned int 
+</span><a name="LN442"></a><span class='Declare_Function'>GetCursorNumber</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <span class='Operator'>++</span><a href="connection.c.html#LN63"><span class='Ref_to_Global_Var'>cursor_number</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Assign a "unique" number for a prepared statement. 
+ * 
+ * This works much like GetCursorNumber, except that we never reset the counter 
+ * within a session.  That's because we can't be 100% sure we've gotten rid 
+ * of all prepared statements on all connections, and it's not really worth 
+ * increasing the risk of prepared-statement name collisions by resetting. 
+ */ 
+</span><span class='Keyword'>unsigned int 
+</span><a name="LN456"></a><span class='Declare_Function'>GetPrepStmtNumber</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <span class='Operator'>++</span><a href="connection.c.html#LN64"><span class='Ref_to_Global_Var'>prep_stmt_number</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Submit a query and wait for the result. 
+ * 
+ * This function is interruptible by signals. 
+ * 
+ * Caller is responsible for the error handling on the result. 
+ */ 
+</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a> <span class='Operator'>* 
+</span><a name="LN469"></a><span class='Declare_Function'>pgfdw_exec_query</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>query</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Submit a query.  Since we don't use non-blocking mode, this also can 
+     * block.  But its risk is relatively small, so we ignore that for now. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN401"><span class='Ref_to_Proto'>PQsendQuery</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN469"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN469"><span class='Ref_to_Parameter'>query</span></a><span class='Parentheses'>))</span> 
+        <a href="postgres_fdw.h.html#LN123"><span class='Ref_to_Proto'>pgfdw_report_error</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><a href="connection.c.html#LN469"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="connection.c.html#LN469"><span class='Ref_to_Parameter'>query</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Wait for the result. */ 
+</span>    <span class='Control'>return</span> <a href="postgres_fdw.h.html#LN121"><span class='Ref_to_Proto'>pgfdw_get_result</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN469"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN469"><span class='Ref_to_Parameter'>query</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Wait for the result from a prior asynchronous execution function call. 
+ * 
+ * This function offers quick responsiveness by checking for any interruptions. 
+ * 
+ * This function emulates the PQexec()'s behavior of returning the last result 
+ * when there are many. 
+ * 
+ * Caller is responsible for the error handling on the result. 
+ */ 
+</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a> <span class='Operator'>* 
+</span><a name="LN493"></a><span class='Declare_Function'>pgfdw_get_result</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>query</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN495"></a>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>last_res</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN499"></a>        <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>res</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN424"><span class='Ref_to_Proto'>PQisBusy</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN493"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN503"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>wc</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Sleep until there's something to do */ 
+</span>            <a href="connection.c.html#LN503"><span class='Ref_To_Local'>wc</span></a> <span class='Operator'>= </span><a href="../../src/include/storage/latch.h.html#LN165"><span class='Ref_to_Proto'>WaitLatchOrSocket</span></a><span class='Parentheses'>(</span><a href="../../src/backend/utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                                   <a href="../../src/include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../src/include/storage/latch.h.html#LN124"><span class='Ref_to_Const'>WL_SOCKET_READABLE</span></a><span class='Delimiter'>, 
+</span>                                   <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN324"><span class='Ref_to_Proto'>PQsocket</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN493"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                   <span class='Operator'>-</span><span class='Number'>1L</span><span class='Delimiter'>, </span><a href="../../src/include/pgstat.h.html#LN741"><span class='Ref_to_Const'>PG_WAIT_EXTENSION</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../src/include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../src/backend/utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../src/include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Data available in socket */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN503"><span class='Ref_To_Local'>wc</span></a> <span class='Operator'>& </span><a href="../../src/include/storage/latch.h.html#LN124"><span class='Ref_to_Const'>WL_SOCKET_READABLE</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN425"><span class='Ref_to_Proto'>PQconsumeInput</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN493"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>))</span> 
+                    <a href="postgres_fdw.h.html#LN123"><span class='Ref_to_Proto'>pgfdw_report_error</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><a href="connection.c.html#LN493"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="connection.c.html#LN493"><span class='Ref_to_Parameter'>query</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while PQisBusy(conn) &raquo; </span> 
+ 
+        <a href="connection.c.html#LN499"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN421"><span class='Ref_to_Proto'>PQgetResult</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN493"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN499"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>;</span>              <span class='Comment_Single_Line'>/* query is complete */ 
+</span> 
+        <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN501"><span class='Ref_to_Proto'>PQclear</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN495"><span class='Ref_To_Local'>last_res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN495"><span class='Ref_To_Local'>last_res</span></a> <span class='Operator'>= </span><a href="connection.c.html#LN499"><span class='Ref_To_Local'>res</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="connection.c.html#LN495"><span class='Ref_To_Local'>last_res</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgfdw_get_result &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Report an error we got from the remote server. 
+ * 
+ * elevel: error level to use (typically ERROR, but might be less) 
+ * res: PGresult containing the error 
+ * conn: connection we did the query on 
+ * clear: if true, PQclear the result (otherwise caller will handle it) 
+ * sql: NULL, or text of remote command we tried to execute 
+ * 
+ * Note: callers that choose not to throw ERROR for a remote error are 
+ * responsible for making sure that the associated ConnCacheEntry gets 
+ * marked with have_error = true. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN547"></a><span class='Declare_Function'>pgfdw_report_error</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>elevel</span><span class='Delimiter'>, </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>res</span><span class='Delimiter'>, </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Delimiter'>, 
+</span><a name="LN548"></a>                   <span class='Keyword'>bool </span><span class='Declare_Parameter'>clear</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>sql</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* If requested, PGresult must be released before leaving this function. */ 
+</span>    <a href="../../src/include/utils/elog.h.html#LN283"><span class='Ref_to_Macro'>PG_TRY</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN553"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>diag_sqlstate</span> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN472"><span class='Ref_to_Proto'>PQresultErrorField</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN547"><span class='Ref_to_Parameter'>res</span></a><span class='Delimiter'>, </span><a href="../../src/include/postgres_ext.h.html#LN56"><span class='Ref_to_Const'>PG_DIAG_SQLSTATE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN554"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>message_primary</span> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN472"><span class='Ref_to_Proto'>PQresultErrorField</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN547"><span class='Ref_to_Parameter'>res</span></a><span class='Delimiter'>, </span><a href="../../src/include/postgres_ext.h.html#LN57"><span class='Ref_to_Const'>PG_DIAG_MESSAGE_PRIMARY</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN555"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>message_detail</span> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN472"><span class='Ref_to_Proto'>PQresultErrorField</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN547"><span class='Ref_to_Parameter'>res</span></a><span class='Delimiter'>, </span><a href="../../src/include/postgres_ext.h.html#LN58"><span class='Ref_to_Const'>PG_DIAG_MESSAGE_DETAIL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN556"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>message_hint</span> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN472"><span class='Ref_to_Proto'>PQresultErrorField</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN547"><span class='Ref_to_Parameter'>res</span></a><span class='Delimiter'>, </span><a href="../../src/include/postgres_ext.h.html#LN59"><span class='Ref_to_Const'>PG_DIAG_MESSAGE_HINT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN557"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>message_context</span> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN472"><span class='Ref_to_Proto'>PQresultErrorField</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN547"><span class='Ref_to_Parameter'>res</span></a><span class='Delimiter'>, </span><a href="../../src/include/postgres_ext.h.html#LN63"><span class='Ref_to_Const'>PG_DIAG_CONTEXT</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN558"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>sqlstate</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN553"><span class='Ref_To_Local'>diag_sqlstate</span></a><span class='Parentheses'>) 
+</span>            <a href="connection.c.html#LN558"><span class='Ref_To_Local'>sqlstate</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/elog.h.html#LN61"><span class='Ref_to_Macro'>MAKE_SQLSTATE</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN553"><span class='Ref_To_Local'>diag_sqlstate</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>], 
+</span>                                     <a href="connection.c.html#LN553"><span class='Ref_To_Local'>diag_sqlstate</span></a><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>], 
+</span>                                     <a href="connection.c.html#LN553"><span class='Ref_To_Local'>diag_sqlstate</span></a><span class='Delimiter'>[</span><span class='Number'>2</span><span class='Delimiter'>], 
+</span>                                     <a href="connection.c.html#LN553"><span class='Ref_To_Local'>diag_sqlstate</span></a><span class='Delimiter'>[</span><span class='Number'>3</span><span class='Delimiter'>], 
+</span>                                     <a href="connection.c.html#LN553"><span class='Ref_To_Local'>diag_sqlstate</span></a><span class='Delimiter'>[</span><span class='Number'>4</span><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="connection.c.html#LN558"><span class='Ref_To_Local'>sqlstate</span></a> <span class='Operator'>= </span>ERRCODE_CONNECTION_FAILURE<span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If we don't get a message from the PGresult, try the PGconn.  This 
+         * is needed because for connection-level failures, PQexec may just 
+         * return NULL, not a PGresult at all. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN554"><span class='Ref_To_Local'>message_primary</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <a href="connection.c.html#LN554"><span class='Ref_To_Local'>message_primary</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/palloc.h.html#LN129"><span class='Ref_to_Proto'>pchomp</span></a><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN323"><span class='Ref_to_Proto'>PQerrorMessage</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN547"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN547"><span class='Ref_to_Parameter'>elevel</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN558"><span class='Ref_To_Local'>sqlstate</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="connection.c.html#LN554"><span class='Ref_To_Local'>message_primary</span></a> <span class='Operator'>? </span><a href="../../src/backend/utils/error/elog.c.html#LN825"><span class='Ref_to_Func'>errmsg_internal</span></a><span class='Parentheses'>(</span><span class='String'>"%s"</span><span class='Delimiter'>, </span><a href="connection.c.html#LN554"><span class='Ref_To_Local'>message_primary</span></a><span class='Parentheses'>) </span><span class='Operator'>: 
+</span>                 <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not obtain message string for remote error"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>               <a href="connection.c.html#LN555"><span class='Ref_To_Local'>message_detail</span></a> <span class='Operator'>? </span><a href="../../src/backend/utils/error/elog.c.html#LN898"><span class='Ref_to_Func'>errdetail_internal</span></a><span class='Parentheses'>(</span><span class='String'>"%s"</span><span class='Delimiter'>, </span><a href="connection.c.html#LN555"><span class='Ref_To_Local'>message_detail</span></a><span class='Parentheses'>) </span><span class='Operator'>: </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                 <a href="connection.c.html#LN556"><span class='Ref_To_Local'>message_hint</span></a> <span class='Operator'>? </span><a href="../../src/backend/utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"%s"</span><span class='Delimiter'>, </span><a href="connection.c.html#LN556"><span class='Ref_To_Local'>message_hint</span></a><span class='Parentheses'>) </span><span class='Operator'>: </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                 <a href="connection.c.html#LN557"><span class='Ref_To_Local'>message_context</span></a> <span class='Operator'>? </span>errcontext<span class='Parentheses'>(</span><span class='String'>"%s"</span><span class='Delimiter'>, </span><a href="connection.c.html#LN557"><span class='Ref_To_Local'>message_context</span></a><span class='Parentheses'>) </span><span class='Operator'>: </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                 <a href="connection.c.html#LN548"><span class='Ref_to_Parameter'>sql</span></a> <span class='Operator'>? </span>errcontext<span class='Parentheses'>(</span><span class='String'>"Remote SQL command: %s"</span><span class='Delimiter'>, </span><a href="connection.c.html#LN548"><span class='Ref_to_Parameter'>sql</span></a><span class='Parentheses'>) </span><span class='Operator'>: </span><span class='Number'>0</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../src/include/utils/elog.h.html#LN292"><span class='Ref_to_Macro'>PG_CATCH</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN548"><span class='Ref_to_Parameter'>clear</span></a><span class='Parentheses'>) 
+</span>            <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN501"><span class='Ref_to_Proto'>PQclear</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN547"><span class='Ref_to_Parameter'>res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../src/include/utils/elog.h.html#LN310"><span class='Ref_to_Macro'>PG_RE_THROW</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="../../src/include/utils/elog.h.html#LN299"><span class='Ref_to_Macro'>PG_END_TRY</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN548"><span class='Ref_to_Parameter'>clear</span></a><span class='Parentheses'>) 
+</span>        <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN501"><span class='Ref_to_Proto'>PQclear</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN547"><span class='Ref_to_Parameter'>res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgfdw_report_error &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * pgfdw_xact_callback --- cleanup at main-transaction end. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN601"></a><span class='Declare_Function'>pgfdw_xact_callback</span><span class='Parentheses'>(</span><a href="../../src/include/access/xact.h.html#LN98"><span class='Ref_to_Typedef'>XactEvent</span></a> <span class='Declare_Parameter'>event</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN603"></a>    <a href="../../src/include/utils/hsearch.h.html#LN111"><span class='Ref_to_Typedef'>HASH_SEQ_STATUS</span></a> <span class='Declare_Local'>scan</span><span class='Delimiter'>; 
+</span><a name="LN604"></a>    <a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a> <span class='Operator'>*</span><span class='Declare_Local'>entry</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Quick exit if no connections were touched in this transaction. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="connection.c.html#LN67"><span class='Ref_to_Global_Var'>xact_got_connection</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Scan all connection cache entries to find open remote transactions, and 
+     * close them. 
+     */ 
+</span>    <a href="../../src/include/utils/hsearch.h.html#LN134"><span class='Ref_to_Proto'>hash_seq_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="connection.c.html#LN603"><span class='Ref_To_Local'>scan</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN60"><span class='Ref_to_Global_Var'>ConnectionHash</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../src/include/utils/hsearch.h.html#LN135"><span class='Ref_to_Proto'>hash_seq_search</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="connection.c.html#LN603"><span class='Ref_To_Local'>scan</span></a><span class='Parentheses'>)))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN617"></a>        <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>res</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Ignore cache entry if no open connection right now */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* If it has an open remote transaction, try to close it */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN626"></a>            <span class='Keyword'>bool</span>        <span class='Declare_Local'>abort_cleanup_failure</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, </span><span class='String'>"closing remote transaction on connection %p"</span><span class='Delimiter'>, 
+</span>                 <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN601"><span class='Ref_to_Parameter'>event</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>case</span> <a href="../../src/include/access/xact.h.html#LN106"><span class='Ref_to_EnumConst'>XACT_EVENT_PARALLEL_PRE_COMMIT</span></a><span class='Operator'>: 
+</span>                <span class='Control'>case</span> <a href="../../src/include/access/xact.h.html#LN105"><span class='Ref_to_EnumConst'>XACT_EVENT_PRE_COMMIT</span></a><span class='Operator'>: 
+</span> 
+                    <span class='Comment_Multi_Line'>/* 
+                     * If abort cleanup previously failed for this connection, 
+                     * we can't issue any more commands against it. 
+                     */ 
+</span>                    <a href="connection.c.html#LN80"><span class='Ref_to_Proto'>pgfdw_reject_incomplete_xact_state_change</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                    <span class='Comment_Multi_Line'>/* Commit all remote transactions during pre-commit */ 
+</span>                    <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                    <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>, </span><span class='String'>"COMMIT TRANSACTION"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+                    <span class='Comment_Multi_Line'>/* 
+                     * If there were any errors in subtransactions, and we 
+                     * made prepared statements, do a DEALLOCATE ALL to make 
+                     * sure we get rid of all prepared statements. This is 
+                     * annoying and not terribly bulletproof, but it's 
+                     * probably not worth trying harder. 
+                     * 
+                     * DEALLOCATE ALL only exists in 8.3 and later, so this 
+                     * constrains how old a server postgres_fdw can 
+                     * communicate with.  We intentionally ignore errors in 
+                     * the DEALLOCATE, so that we can hobble along to some 
+                     * extent with older servers (leaking prepared statements 
+                     * as we go; but we don't really support update operations 
+                     * pre-8.3 anyway). 
+                     */ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN52"><span class='Ref_to_Member'>have_prep_stmt</span></a> <span class='Operator'>&& </span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN53"><span class='Ref_to_Member'>have_error</span></a><span class='Parentheses'>) 
+</span>                    <span class='Delimiter'>{ 
+</span>                        <a href="connection.c.html#LN617"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN380"><span class='Ref_to_Proto'>PQexec</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>, </span><span class='String'>"DEALLOCATE ALL"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                        <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN501"><span class='Ref_to_Proto'>PQclear</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN617"><span class='Ref_To_Local'>res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Delimiter'>} 
+</span>                    <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN52"><span class='Ref_to_Member'>have_prep_stmt</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                    <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN53"><span class='Ref_to_Member'>have_error</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>case</span> <a href="../../src/include/access/xact.h.html#LN107"><span class='Ref_to_EnumConst'>XACT_EVENT_PRE_PREPARE</span></a><span class='Operator'>: 
+</span> 
+                    <span class='Comment_Multi_Line'>/* 
+                     * We disallow remote transactions that modified anything, 
+                     * since it's not very reasonable to hold them open until 
+                     * the prepared transaction is committed.  For the moment, 
+                     * throw error unconditionally; later we might allow 
+                     * read-only cases.  Note that the error will cause us to 
+                     * come right back here with event == XACT_EVENT_ABORT, so 
+                     * we'll clean up the connection state at that point. 
+                     */ 
+</span>                    <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                            <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_FEATURE_NOT_SUPPORTED<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                             <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"cannot prepare a transaction that modified remote tables"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>case</span> <a href="../../src/include/access/xact.h.html#LN101"><span class='Ref_to_EnumConst'>XACT_EVENT_PARALLEL_COMMIT</span></a><span class='Operator'>: 
+</span>                <span class='Control'>case</span> <a href="../../src/include/access/xact.h.html#LN100"><span class='Ref_to_EnumConst'>XACT_EVENT_COMMIT</span></a><span class='Operator'>: 
+</span>                <span class='Control'>case</span> <a href="../../src/include/access/xact.h.html#LN104"><span class='Ref_to_EnumConst'>XACT_EVENT_PREPARE</span></a><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* Pre-commit should have closed the open transaction */ 
+</span>                    <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"missed cleaning up connection during pre-commit"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>case</span> <a href="../../src/include/access/xact.h.html#LN103"><span class='Ref_to_EnumConst'>XACT_EVENT_PARALLEL_ABORT</span></a><span class='Operator'>: 
+</span>                <span class='Control'>case</span> <a href="../../src/include/access/xact.h.html#LN102"><span class='Ref_to_EnumConst'>XACT_EVENT_ABORT</span></a><span class='Operator'>: 
+</span> 
+                    <span class='Comment_Multi_Line'>/* 
+                     * Don't try to clean up the connection if we're already 
+                     * in error recursion trouble. 
+                     */ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN402"><span class='Ref_to_Proto'>in_error_recursion_trouble</span></a><span class='Parentheses'>())</span> 
+                        <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+                    <span class='Comment_Multi_Line'>/* 
+                     * If connection is already unsalvageable, don't touch it 
+                     * further. 
+                     */ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a><span class='Parentheses'>) 
+</span>                        <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+                    <span class='Comment_Multi_Line'>/* 
+                     * Mark this connection as in the process of changing 
+                     * transaction state. 
+                     */ 
+</span>                    <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+                    <span class='Comment_Multi_Line'>/* Assume we might have lost track of prepared statements */ 
+</span>                    <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN53"><span class='Ref_to_Member'>have_error</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+                    <span class='Comment_Multi_Line'>/* 
+                     * If a command has been submitted to the remote server by 
+                     * using an asynchronous execution function, the command 
+                     * might not have yet completed.  Check to see if a 
+                     * command is still being processed by the remote server, 
+                     * and if so, request cancellation of the command. 
+                     */ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN318"><span class='Ref_to_Proto'>PQtransactionStatus</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN103"><span class='Ref_to_EnumConst'>PQTRANS_ACTIVE</span></a> <span class='Operator'>&& 
+</span>                        <span class='Operator'>!</span><a href="connection.c.html#LN81"><span class='Ref_to_Proto'>pgfdw_cancel_query</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>))</span> 
+                    <span class='Delimiter'>{ 
+</span>                        <span class='Comment_Multi_Line'>/* Unable to cancel running query. */ 
+</span>                        <a href="connection.c.html#LN626"><span class='Ref_To_Local'>abort_cleanup_failure</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                    <span class='Delimiter'>} 
+</span>                    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="connection.c.html#LN82"><span class='Ref_to_Proto'>pgfdw_exec_cleanup_query</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>, 
+</span>                                                       <span class='String'>"ABORT TRANSACTION"</span><span class='Delimiter'>, 
+</span>                                                       <span class='Boolean'>false</span><span class='Parentheses'>))</span> 
+                    <span class='Delimiter'>{ 
+</span>                        <span class='Comment_Multi_Line'>/* Unable to abort remote transaction. */ 
+</span>                        <a href="connection.c.html#LN626"><span class='Ref_To_Local'>abort_cleanup_failure</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                    <span class='Delimiter'>} 
+</span>                    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN52"><span class='Ref_to_Member'>have_prep_stmt</span></a> <span class='Operator'>&& </span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN53"><span class='Ref_to_Member'>have_error</span></a> <span class='Operator'>&& 
+</span>                             <span class='Operator'>!</span><a href="connection.c.html#LN82"><span class='Ref_to_Proto'>pgfdw_exec_cleanup_query</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>, 
+</span>                                                       <span class='String'>"DEALLOCATE ALL"</span><span class='Delimiter'>, 
+</span>                                                       <span class='Boolean'>true</span><span class='Parentheses'>))</span> 
+                    <span class='Delimiter'>{ 
+</span>                        <span class='Comment_Multi_Line'>/* Trouble clearing prepared statements. */ 
+</span>                        <a href="connection.c.html#LN626"><span class='Ref_To_Local'>abort_cleanup_failure</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>                    <span class='Delimiter'>} 
+</span>                    <span class='Control'>else</span> 
+                    <span class='Delimiter'>{ 
+</span>                        <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN52"><span class='Ref_to_Member'>have_prep_stmt</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                        <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN53"><span class='Ref_to_Member'>have_error</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                    <span class='Delimiter'>} 
+</span> 
+                    <span class='Comment_Multi_Line'>/* Disarm changing_xact_state if it all worked. */ 
+</span>                    <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><a href="connection.c.html#LN626"><span class='Ref_To_Local'>abort_cleanup_failure</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch event &raquo; </span> 
+        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if entry-&GT;xact_depth&GT;0 &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* Reset state to show we're out of a transaction */ 
+</span>        <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If the connection isn't in a good idle state, discard it to 
+         * recover. Next GetConnection will open a new connection. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN317"><span class='Ref_to_Proto'>PQstatus</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN48"><span class='Ref_to_EnumConst'>CONNECTION_OK</span></a> <span class='Operator'>|| 
+</span>            <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN318"><span class='Ref_to_Proto'>PQtransactionStatus</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN102"><span class='Ref_to_EnumConst'>PQTRANS_IDLE</span></a> <span class='Operator'>|| 
+</span>            <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, </span><span class='String'>"discarding connection %p"</span><span class='Delimiter'>, </span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN272"><span class='Ref_to_Proto'>PQfinish</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>            <a href="connection.c.html#LN604"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while (entry=(ConnCacheEntr... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Regardless of the event type, we can now mark ourselves as out of the 
+     * transaction.  (Note: if we are here during PRE_COMMIT or PRE_PREPARE, 
+     * this saves a useless scan of the hashtable during COMMIT or PREPARE.) 
+     */ 
+</span>    <a href="connection.c.html#LN67"><span class='Ref_to_Global_Var'>xact_got_connection</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Also reset cursor numbering for next transaction */ 
+</span>    <a href="connection.c.html#LN63"><span class='Ref_to_Global_Var'>cursor_number</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgfdw_xact_callback &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * pgfdw_subxact_callback --- cleanup at subtransaction end. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN790"></a><span class='Declare_Function'>pgfdw_subxact_callback</span><span class='Parentheses'>(</span><a href="../../src/include/access/xact.h.html#LN112"><span class='Ref_to_Typedef'>SubXactEvent</span></a> <span class='Declare_Parameter'>event</span><span class='Delimiter'>, </span><a href="../../src/include/c.h.html#LN400"><span class='Ref_to_Typedef'>SubTransactionId</span></a> <span class='Declare_Parameter'>mySubid</span><span class='Delimiter'>, 
+</span><a name="LN791"></a>                       <a href="../../src/include/c.h.html#LN400"><span class='Ref_to_Typedef'>SubTransactionId</span></a> <span class='Declare_Parameter'>parentSubid</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN793"></a>    <a href="../../src/include/utils/hsearch.h.html#LN111"><span class='Ref_to_Typedef'>HASH_SEQ_STATUS</span></a> <span class='Declare_Local'>scan</span><span class='Delimiter'>; 
+</span><a name="LN794"></a>    <a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a> <span class='Operator'>*</span><span class='Declare_Local'>entry</span><span class='Delimiter'>; 
+</span><a name="LN795"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>curlevel</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Nothing to do at subxact start, nor after commit. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><span class='Parentheses'>(</span><a href="connection.c.html#LN790"><span class='Ref_to_Parameter'>event</span></a> <span class='Operator'>== </span><a href="../../src/include/access/xact.h.html#LN117"><span class='Ref_to_EnumConst'>SUBXACT_EVENT_PRE_COMMIT_SUB</span></a> <span class='Operator'>|| 
+</span>          <a href="connection.c.html#LN790"><span class='Ref_to_Parameter'>event</span></a> <span class='Operator'>== </span><a href="../../src/include/access/xact.h.html#LN116"><span class='Ref_to_EnumConst'>SUBXACT_EVENT_ABORT_SUB</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Quick exit if no connections were touched in this transaction. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="connection.c.html#LN67"><span class='Ref_to_Global_Var'>xact_got_connection</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Scan all connection cache entries to find open remote subtransactions 
+     * of the current level, and close them. 
+     */ 
+</span>    <a href="connection.c.html#LN795"><span class='Ref_To_Local'>curlevel</span></a> <span class='Operator'>= </span><a href="../../src/include/access/xact.h.html#LN344"><span class='Ref_to_Proto'>GetCurrentTransactionNestLevel</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../src/include/utils/hsearch.h.html#LN134"><span class='Ref_to_Proto'>hash_seq_init</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="connection.c.html#LN793"><span class='Ref_To_Local'>scan</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN60"><span class='Ref_to_Global_Var'>ConnectionHash</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../src/include/utils/hsearch.h.html#LN135"><span class='Ref_to_Proto'>hash_seq_search</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="connection.c.html#LN793"><span class='Ref_To_Local'>scan</span></a><span class='Parentheses'>)))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN814"></a>        <span class='Keyword'>char</span>        <span class='Declare_Local'>sql</span><span class='Delimiter'>[</span><span class='Number'>100</span><span class='Delimiter'>]; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * We only care about connections with open remote subtransactions of 
+         * the current level. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL </span><span class='Operator'>|| </span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>&LT; </span><a href="connection.c.html#LN795"><span class='Ref_To_Local'>curlevel</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a> <span class='Operator'>&GT; </span><a href="connection.c.html#LN795"><span class='Ref_To_Local'>curlevel</span></a><span class='Parentheses'>) 
+</span>            <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"missed cleaning up remote subtransaction at level %d"</span><span class='Delimiter'>, 
+</span>                 <a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN790"><span class='Ref_to_Parameter'>event</span></a> <span class='Operator'>== </span><a href="../../src/include/access/xact.h.html#LN117"><span class='Ref_to_EnumConst'>SUBXACT_EVENT_PRE_COMMIT_SUB</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * If abort cleanup previously failed for this connection, we 
+             * can't issue any more commands against it. 
+             */ 
+</span>            <a href="connection.c.html#LN80"><span class='Ref_to_Proto'>pgfdw_reject_incomplete_xact_state_change</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Commit all remote subtransactions during pre-commit */ 
+</span>            <a href="../../src/pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN814"><span class='Ref_To_Local'>sql</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="connection.c.html#LN814"><span class='Ref_To_Local'>sql</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"RELEASE SAVEPOINT s%d"</span><span class='Delimiter'>, </span><a href="connection.c.html#LN795"><span class='Ref_To_Local'>curlevel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="connection.c.html#LN73"><span class='Ref_to_Proto'>do_sql_command</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN814"><span class='Ref_To_Local'>sql</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN402"><span class='Ref_to_Proto'>in_error_recursion_trouble</span></a><span class='Parentheses'>())</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * Don't try to clean up the connection if we're already in error 
+             * recursion trouble. 
+             */ 
+</span>            <a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN851"></a>            <span class='Keyword'>bool</span>        <span class='Declare_Local'>abort_cleanup_failure</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Remember that abort cleanup is in progress. */ 
+</span>            <a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Assume we might have lost track of prepared statements */ 
+</span>            <a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN53"><span class='Ref_to_Member'>have_error</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * If a command has been submitted to the remote server by using 
+             * an asynchronous execution function, the command might not have 
+             * yet completed.  Check to see if a command is still being 
+             * processed by the remote server, and if so, request cancellation 
+             * of the command. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN318"><span class='Ref_to_Proto'>PQtransactionStatus</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN103"><span class='Ref_to_EnumConst'>PQTRANS_ACTIVE</span></a> <span class='Operator'>&& 
+</span>                <span class='Operator'>!</span><a href="connection.c.html#LN81"><span class='Ref_to_Proto'>pgfdw_cancel_query</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Parentheses'>))</span> 
+                <a href="connection.c.html#LN851"><span class='Ref_To_Local'>abort_cleanup_failure</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* Rollback all remote subtransactions during abort */ 
+</span>                <a href="../../src/pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN814"><span class='Ref_To_Local'>sql</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="connection.c.html#LN814"><span class='Ref_To_Local'>sql</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                         <span class='String'>"ROLLBACK TO SAVEPOINT s%d; RELEASE SAVEPOINT s%d"</span><span class='Delimiter'>, 
+</span>                         <a href="connection.c.html#LN795"><span class='Ref_To_Local'>curlevel</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN795"><span class='Ref_To_Local'>curlevel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="connection.c.html#LN82"><span class='Ref_to_Proto'>pgfdw_exec_cleanup_query</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN49"><span class='Ref_to_Member'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN814"><span class='Ref_To_Local'>sql</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>))</span> 
+                    <a href="connection.c.html#LN851"><span class='Ref_To_Local'>abort_cleanup_failure</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* Disarm changing_xact_state if it all worked. */ 
+</span>            <a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a> <span class='Operator'>= </span><a href="connection.c.html#LN851"><span class='Ref_To_Local'>abort_cleanup_failure</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !entry-&GT;changing_xact... &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* OK, we're outta that level of subtransaction */ 
+</span>        <a href="connection.c.html#LN794"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN50"><span class='Ref_to_Member'>xact_depth</span></a><span class='Operator'>--</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while (entry=(ConnCacheEntr... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end pgfdw_subxact_callback &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Raise an error if the given connection cache entry is marked as being 
+ * in the middle of an xact state change.  This should be called at which no 
+ * such change is expected to be in progress; if one is found to be in 
+ * progress, it means that we aborted in the middle of a previous state change 
+ * and now don't know what the remote transaction state actually is. 
+ * Such connections can't safely be further used.  Re-establishing the 
+ * connection would change the snapshot and roll back any writes already 
+ * performed, so that's not an option, either. Thus, we must abort. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN899"></a><span class='Declare_Function'>pgfdw_reject_incomplete_xact_state_change</span><span class='Parentheses'>(</span><a href="connection.c.html#LN46"><span class='Ref_to_Struct'>ConnCacheEntry</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>entry</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN901"></a>    <a href="../../src/include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>tup</span><span class='Delimiter'>; 
+</span><a name="LN902"></a>    <a href="../../src/include/catalog/pg_user_mapping.h.html#LN44"><span class='Ref_to_Typedef'>Form_pg_user_mapping</span></a> <span class='Declare_Local'>umform</span><span class='Delimiter'>; 
+</span><a name="LN903"></a>    <a href="../../src/include/foreign/foreign.h.html#LN44"><span class='Ref_to_Struct'>ForeignServer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>server</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="connection.c.html#LN899"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN54"><span class='Ref_to_Member'>changing_xact_state</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <a href="connection.c.html#LN901"><span class='Ref_To_Local'>tup</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/syscache.h.html#LN155"><span class='Ref_to_Macro'>SearchSysCache1</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/syscache.h.html#LN108"><span class='Ref_to_EnumConst'>USERMAPPINGOID</span></a><span class='Delimiter'>, 
+</span>                          <a href="../../src/include/postgres.h.html#LN512"><span class='Ref_to_Macro'>ObjectIdGetDatum</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN899"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN48"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../src/include/access/htup.h.html#LN76"><span class='Ref_to_Macro'>HeapTupleIsValid</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN901"><span class='Ref_To_Local'>tup</span></a><span class='Parentheses'>))</span> 
+        <a href="../../src/backend/bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"cache lookup failed for user mapping %u"</span><span class='Delimiter'>, </span><a href="connection.c.html#LN899"><span class='Ref_to_Parameter'>entry</span></a><span class='Operator'>-&GT;</span><a href="connection.c.html#LN48"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="connection.c.html#LN902"><span class='Ref_To_Local'>umform</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../src/include/catalog/pg_user_mapping.h.html#LN44"><span class='Ref_to_Typedef'>Form_pg_user_mapping</span></a><span class='Parentheses'>) </span><a href="../../src/include/access/htup_details.h.html#LN655"><span class='Ref_to_Macro'>GETSTRUCT</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN901"><span class='Ref_To_Local'>tup</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="connection.c.html#LN903"><span class='Ref_To_Local'>server</span></a> <span class='Operator'>= </span><a href="../../src/include/foreign/foreign.h.html#LN71"><span class='Ref_to_Proto'>GetForeignServer</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN902"><span class='Ref_To_Local'>umform</span></a><span class='Operator'>-&GT;</span>umserver<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../src/include/utils/syscache.h.html#LN119"><span class='Ref_to_Proto'>ReleaseSysCache</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN901"><span class='Ref_To_Local'>tup</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_CONNECTION_EXCEPTION<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>             <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"connection to server \"%s\" was lost"</span><span class='Delimiter'>, 
+</span>                    <a href="connection.c.html#LN903"><span class='Ref_To_Local'>server</span></a><span class='Operator'>-&GT;</span><a href="../../src/include/foreign/foreign.h.html#LN49"><span class='Ref_to_Member'>servername</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgfdw_reject_incomplete_xact_state_change &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Cancel the currently-in-progress query (whose query text we do not have) 
+ * and ignore the result.  Returns true if we successfully cancel the query 
+ * and discard any pending result, and false if not. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN928"></a><span class='Declare_Function'>pgfdw_cancel_query</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN930"></a>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN152"><span class='Ref_to_Typedef'>PGcancel</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>cancel</span><span class='Delimiter'>; 
+</span><a name="LN931"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>errbuf</span><span class='Delimiter'>[</span><span class='Number'>256</span><span class='Delimiter'>]; 
+</span><a name="LN932"></a>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>result</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN933"></a>    <a href="../../src/interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>endtime</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If it takes too long to cancel the query and discard the result, assume 
+     * the connection is dead. 
+     */ 
+</span>    <a href="connection.c.html#LN933"><span class='Ref_To_Local'>endtime</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/timestamp.h.html#LN55"><span class='Ref_to_Macro'>TimestampTzPlusMilliseconds</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><span class='Number'>30000</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Issue cancel request.  Unfortunately, there's no good way to limit the 
+     * amount of time that we might block inside PQgetCancel(). 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="connection.c.html#LN930"><span class='Ref_To_Local'>cancel</span></a> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN298"><span class='Ref_to_Proto'>PQgetCancel</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN928"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>)))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN304"><span class='Ref_to_Proto'>PQcancel</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN930"><span class='Ref_To_Local'>cancel</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN931"><span class='Ref_To_Local'>errbuf</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="connection.c.html#LN931"><span class='Ref_To_Local'>errbuf</span></a><span class='Parentheses'>)))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../src/include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN130"><span class='Ref_to_Proto'>errcode</span></a><span class='Parentheses'>(</span>ERRCODE_CONNECTION_FAILURE<span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../../src/backend/utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not send cancel request: %s"</span><span class='Delimiter'>, 
+</span>                            <a href="connection.c.html#LN931"><span class='Ref_To_Local'>errbuf</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN301"><span class='Ref_to_Proto'>PQfreeCancel</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN930"><span class='Ref_To_Local'>cancel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN301"><span class='Ref_to_Proto'>PQfreeCancel</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN930"><span class='Ref_To_Local'>cancel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get and discard the result of the query. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN84"><span class='Ref_to_Proto'>pgfdw_get_cleanup_result</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN928"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN933"><span class='Ref_To_Local'>endtime</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="connection.c.html#LN932"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN501"><span class='Ref_to_Proto'>PQclear</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN932"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgfdw_cancel_query &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Submit a query during (sub)abort cleanup and wait up to 30 seconds for the 
+ * result.  If the query is executed without error, the return value is true. 
+ * If the query is executed successfully but returns an error, the return 
+ * value is true if and only if ignore_errors is set.  If the query can't be 
+ * sent or times out, the return value is false. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN975"></a><span class='Declare_Function'>pgfdw_exec_cleanup_query</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Delimiter'>, </span><span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Parameter'>query</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>ignore_errors</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN977"></a>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>result</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN978"></a>    <a href="../../src/interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>endtime</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If it takes too long to execute a cleanup query, assume the connection 
+     * is dead.  It's fairly likely that this is why we aborted in the first 
+     * place (e.g. statement timeout, user cancel), so the timeout shouldn't 
+     * be too long. 
+     */ 
+</span>    <a href="connection.c.html#LN978"><span class='Ref_To_Local'>endtime</span></a> <span class='Operator'>= </span><a href="../../src/include/utils/timestamp.h.html#LN55"><span class='Ref_to_Macro'>TimestampTzPlusMilliseconds</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><span class='Number'>30000</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Submit a query.  Since we don't use non-blocking mode, this also can 
+     * block.  But its risk is relatively small, so we ignore that for now. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN401"><span class='Ref_to_Proto'>PQsendQuery</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN975"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN975"><span class='Ref_to_Parameter'>query</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="postgres_fdw.h.html#LN123"><span class='Ref_to_Proto'>pgfdw_report_error</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><a href="connection.c.html#LN975"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="connection.c.html#LN975"><span class='Ref_to_Parameter'>query</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Get the result of the query. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN84"><span class='Ref_to_Proto'>pgfdw_get_cleanup_result</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN975"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN978"><span class='Ref_To_Local'>endtime</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="connection.c.html#LN977"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Issue a warning if not successful. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN466"><span class='Ref_to_Proto'>PQresultStatus</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN977"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN84"><span class='Ref_to_EnumConst'>PGRES_COMMAND_OK</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="postgres_fdw.h.html#LN123"><span class='Ref_to_Proto'>pgfdw_report_error</span></a><span class='Parentheses'>(</span><a href="../../src/include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN977"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN975"><span class='Ref_to_Parameter'>conn</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Delimiter'>, </span><a href="connection.c.html#LN975"><span class='Ref_to_Parameter'>query</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <a href="connection.c.html#LN975"><span class='Ref_to_Parameter'>ignore_errors</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgfdw_exec_cleanup_query &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Get, during abort cleanup, the result of a query that is in progress.  This 
+ * might be a query that is being interrupted by transaction abort, or it might 
+ * be a query that was initiated as part of transaction abort to get the remote 
+ * side back to the appropriate state. 
+ * 
+ * It's not a huge problem if we throw an ERROR here, but if we get into error 
+ * recursion trouble, we'll end up slamming the connection shut, which will 
+ * necessitate failing the entire toplevel transaction even if subtransactions 
+ * were used.  Try to use WARNING where we can. 
+ * 
+ * endtime is the time at which we should give up and assume the remote 
+ * side is dead.  Returns true if the timeout expired, otherwise false. 
+ * Sets *result except in case of a timeout. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN1028"></a><span class='Declare_Function'>pgfdw_get_cleanup_result</span><span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN139"><span class='Ref_to_Typedef'>PGconn</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>conn</span><span class='Delimiter'>, </span><a href="../../src/interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Parameter'>endtime</span><span class='Delimiter'>, </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a> <span class='Operator'>**</span><span class='Declare_Parameter'>result</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN1030"></a>    <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>last_res</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN1034"></a>        <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN146"><span class='Ref_to_Typedef'>PGresult</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>res</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN424"><span class='Ref_to_Proto'>PQisBusy</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN1028"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN1038"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>wc</span><span class='Delimiter'>; 
+</span><a name="LN1039"></a>            <a href="../../src/interfaces/ecpg/include/pgtypes_timestamp.h.html#LN9"><span class='Ref_to_Typedef'>TimestampTz</span></a> <span class='Declare_Local'>now</span> <span class='Operator'>= </span><a href="../../src/include/utils/timestamp.h.html#LN69"><span class='Ref_to_Proto'>GetCurrentTimestamp</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN1040"></a>            <span class='Keyword'>long</span>        <span class='Declare_Local'>secs</span><span class='Delimiter'>; 
+</span><a name="LN1041"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>microsecs</span><span class='Delimiter'>; 
+</span><a name="LN1042"></a>            <span class='Keyword'>long</span>        <span class='Declare_Local'>cur_timeout</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* If timeout has expired, give up, else get sleep time. */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN1039"><span class='Ref_To_Local'>now</span></a> <span class='Operator'>&GT;= </span><a href="connection.c.html#LN1028"><span class='Ref_to_Parameter'>endtime</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="../../src/include/utils/timestamp.h.html#LN72"><span class='Ref_to_Proto'>TimestampDifference</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN1039"><span class='Ref_To_Local'>now</span></a><span class='Delimiter'>, </span><a href="connection.c.html#LN1028"><span class='Ref_to_Parameter'>endtime</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="connection.c.html#LN1040"><span class='Ref_To_Local'>secs</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="connection.c.html#LN1041"><span class='Ref_To_Local'>microsecs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* To protect against clock skew, limit sleep to one minute. */ 
+</span>            <a href="connection.c.html#LN1042"><span class='Ref_To_Local'>cur_timeout</span></a> <span class='Operator'>= </span><a href="../../src/interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><span class='Number'>60000</span><span class='Delimiter'>, </span><a href="connection.c.html#LN1040"><span class='Ref_To_Local'>secs</span></a> <span class='Operator'>* </span><a href="../../src/include/datatype/timestamp.h.html#LN93"><span class='Ref_to_Const'>USECS_PER_SEC</span></a> <span class='Operator'>+ </span><a href="connection.c.html#LN1041"><span class='Ref_To_Local'>microsecs</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Sleep until there's something to do */ 
+</span>            <a href="connection.c.html#LN1038"><span class='Ref_To_Local'>wc</span></a> <span class='Operator'>= </span><a href="../../src/include/storage/latch.h.html#LN165"><span class='Ref_to_Proto'>WaitLatchOrSocket</span></a><span class='Parentheses'>(</span><a href="../../src/backend/utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                              <a href="../../src/include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../src/include/storage/latch.h.html#LN124"><span class='Ref_to_Const'>WL_SOCKET_READABLE</span></a> <span class='Operator'>| </span><a href="../../src/include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a><span class='Delimiter'>, 
+</span>                                   <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN324"><span class='Ref_to_Proto'>PQsocket</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN1028"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                   <a href="connection.c.html#LN1042"><span class='Ref_To_Local'>cur_timeout</span></a><span class='Delimiter'>, </span><a href="../../src/include/pgstat.h.html#LN741"><span class='Ref_to_Const'>PG_WAIT_EXTENSION</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../src/include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../../src/backend/utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../src/include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Data available in socket */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN1038"><span class='Ref_To_Local'>wc</span></a> <span class='Operator'>& </span><a href="../../src/include/storage/latch.h.html#LN124"><span class='Ref_to_Const'>WL_SOCKET_READABLE</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN425"><span class='Ref_to_Proto'>PQconsumeInput</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN1028"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>))</span> 
+                <span class='Delimiter'>{ 
+</span>                    <span class='Operator'>*</span><a href="connection.c.html#LN1028"><span class='Ref_to_Parameter'>result</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while PQisBusy(conn) &raquo; </span> 
+ 
+        <a href="connection.c.html#LN1034"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>= </span><a href="../../src/interfaces/libpq/libpq-fe.h.html#LN421"><span class='Ref_to_Proto'>PQgetResult</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN1028"><span class='Ref_to_Parameter'>conn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="connection.c.html#LN1034"><span class='Ref_To_Local'>res</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>;</span>              <span class='Comment_Single_Line'>/* query is complete */ 
+</span> 
+        <a href="../../src/interfaces/libpq/libpq-fe.h.html#LN501"><span class='Ref_to_Proto'>PQclear</span></a><span class='Parentheses'>(</span><a href="connection.c.html#LN1030"><span class='Ref_To_Local'>last_res</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="connection.c.html#LN1030"><span class='Ref_To_Local'>last_res</span></a> <span class='Operator'>= </span><a href="connection.c.html#LN1034"><span class='Ref_To_Local'>res</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Operator'>*</span><a href="connection.c.html#LN1028"><span class='Ref_to_Parameter'>result</span></a> <span class='Operator'>= </span><a href="connection.c.html#LN1030"><span class='Ref_To_Local'>last_res</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgfdw_get_cleanup_result &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

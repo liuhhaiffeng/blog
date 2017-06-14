@@ -1,0 +1,349 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\heap\syncscan.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\heap\syncscan.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:29 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * syncscan.c 
+ *    heap scan synchronization support 
+ * 
+ * When multiple backends run a sequential scan on the same table, we try 
+ * to keep them synchronized to reduce the overall I/O needed.  The goal is 
+ * to read each page into shared buffer cache only once, and let all backends 
+ * that take part in the shared scan process the page before it falls out of 
+ * the cache. 
+ * 
+ * Since the "leader" in a pack of backends doing a seqscan will have to wait 
+ * for I/O, while the "followers" don't, there is a strong self-synchronizing 
+ * effect once we can get the backends examining approximately the same part 
+ * of the table at the same time.  Hence all that is really needed is to get 
+ * a new backend beginning a seqscan to begin it close to where other backends 
+ * are reading.  We can scan the table circularly, from block X up to the 
+ * end and then from block 0 to X-1, to ensure we visit all rows while still 
+ * participating in the common scan. 
+ * 
+ * To accomplish that, we keep track of the scan position of each table, and 
+ * start new scans close to where the previous scan(s) are.  We don't try to 
+ * do any extra synchronization to keep the scans together afterwards; some 
+ * scans might progress much more slowly than others, for example if the 
+ * results need to be transferred to the client over a slow network, and we 
+ * don't want such queries to slow down others. 
+ * 
+ * There can realistically only be a few large sequential scans on different 
+ * tables in progress at any time.  Therefore we just keep the scan positions 
+ * in a small LRU list which we scan every time we need to look up or update a 
+ * scan position.  The whole mechanism is only applied for tables exceeding 
+ * a threshold size (but that is not the concern of this module). 
+ * 
+ * INTERFACE ROUTINES 
+ *      ss_get_location     - return current scan location of a relation 
+ *      ss_report_location  - update current scan location 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/access/heap/syncscan.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/heapam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/lwlock.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/rel.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* GUC variables */ 
+</span><span class='Directive'>#ifdef</span> TRACE_SYNCSCAN 
+<a name="LN57"></a><span class='Keyword'>bool</span>        <span class='Declare_Var'>trace_syncscan</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Size of the LRU list. 
+ * 
+ * Note: the code assumes that SYNC_SCAN_NELEM &GT; 1. 
+ * 
+ * XXX: What's a good value? It should be large enough to hold the 
+ * maximum number of large tables scanned simultaneously.  But a larger value 
+ * means more traversing of the LRU list when starting a new scan. 
+ */ 
+</span><a name="LN70"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>SYNC_SCAN_NELEM</span> <span class='Number'>20</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Interval between reports of the location of the current scan, in pages. 
+ * 
+ * Note: This should be smaller than the ring size (see buffer/freelist.c) 
+ * we use for bulk reads.  Otherwise a scan joining other scans might start 
+ * from a page that's no longer in the buffer cache.  This is a bit fuzzy; 
+ * there's no guarantee that the new scan will read the page before it leaves 
+ * the buffer cache anyway, and on the other hand the page is most likely 
+ * still in the OS cache. 
+ */ 
+</span><a name="LN82"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>SYNC_SCAN_REPORT_INTERVAL</span> <span class='Parentheses'>(</span><span class='Number'>128</span> <span class='Operator'>* </span><span class='Number'>1024</span> <span class='Operator'>/ </span>BLCKSZ<span class='Parentheses'>) 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The scan locations structure is essentially a doubly-linked LRU with head 
+ * and tail pointer, but designed to hold a fixed maximum number of elements in 
+ * fixed-size shared memory. 
+ */ 
+</span><a name="LN90"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>ss_scan_location_t</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN92"></a>    <a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Member'>relfilenode</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* identity of a relation */ 
+</span><a name="LN93"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Member'>location</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* last-reported location in the relation */ 
+</span><a name="LN94"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>ss_scan_location_t</span><span class='Delimiter'>; 
+</span> 
+<a name="LN96"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>ss_lru_item_t</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN98"></a>    <span class='Control'>struct</span> <a href="syncscan.c.html#LN96"><span class='Ref_to_Struct'>ss_lru_item_t</span></a> <span class='Operator'>*</span><span class='Declare_Member'>prev</span><span class='Delimiter'>; 
+</span><a name="LN99"></a>    <span class='Control'>struct</span> <a href="syncscan.c.html#LN96"><span class='Ref_to_Struct'>ss_lru_item_t</span></a> <span class='Operator'>*</span><span class='Declare_Member'>next</span><span class='Delimiter'>; 
+</span><a name="LN100"></a>    <a href="syncscan.c.html#LN90"><span class='Ref_to_Struct'>ss_scan_location_t</span></a> <span class='Declare_Member'>location</span><span class='Delimiter'>; 
+</span><a name="LN101"></a>} <span class='Declare_Typedef'>ss_lru_item_t</span><span class='Delimiter'>; 
+</span> 
+<a name="LN103"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>ss_scan_locations_t</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN105"></a>    <a href="syncscan.c.html#LN96"><span class='Ref_to_Struct'>ss_lru_item_t</span></a> <span class='Operator'>*</span><span class='Declare_Member'>head</span><span class='Delimiter'>; 
+</span><a name="LN106"></a>    <a href="syncscan.c.html#LN96"><span class='Ref_to_Struct'>ss_lru_item_t</span></a> <span class='Operator'>*</span><span class='Declare_Member'>tail</span><span class='Delimiter'>; 
+</span><a name="LN107"></a>    <a href="syncscan.c.html#LN96"><span class='Ref_to_Struct'>ss_lru_item_t</span></a> <span class='Declare_Member'>items</span><span class='Delimiter'>[</span>FLEXIBLE_ARRAY_MEMBER<span class='Delimiter'>]; </span><span class='Comment_Single_Line'>/* SYNC_SCAN_NELEM items */ 
+</span><a name="LN108"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>ss_scan_locations_t</span><span class='Delimiter'>; 
+</span> 
+<a name="LN110"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SizeOfScanLocations</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>N</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="syncscan.c.html#LN103"><span class='Ref_to_Struct'>ss_scan_locations_t</span></a><span class='Delimiter'>, </span>items<span class='Parentheses'>) </span><span class='Operator'>+ </span><span class='Parentheses'>(</span><a href="syncscan.c.html#LN110"><span class='Ref_to_Parameter'>N</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="syncscan.c.html#LN96"><span class='Ref_to_Struct'>ss_lru_item_t</span></a><span class='Parentheses'>))</span> 
+ 
+<span class='Comment_Multi_Line'>/* Pointer to struct in shared memory */ 
+</span><a name="LN114"></a><span class='Keyword'>static </span><a href="syncscan.c.html#LN103"><span class='Ref_to_Struct'>ss_scan_locations_t</span></a> <span class='Operator'>*</span><span class='Declare_Var'>scan_locations</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* prototypes for internal functions */ 
+</span><a name="LN117"></a><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Prototype'>ss_search</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>relfilenode</span><span class='Delimiter'>, 
+</span><a name="LN118"></a>          <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>location</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>set</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * SyncScanShmemSize --- report amount of shared memory space needed 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN125"></a><span class='Declare_Function'>SyncScanShmemSize</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="syncscan.c.html#LN110"><span class='Ref_to_Macro'>SizeOfScanLocations</span></a><span class='Parentheses'>(</span><a href="syncscan.c.html#LN70"><span class='Ref_to_Const'>SYNC_SCAN_NELEM</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * SyncScanShmemInit --- initialize this module's shared memory 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN134"></a><span class='Declare_Function'>SyncScanShmemInit</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN136"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span><a name="LN137"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span><span class='Delimiter'>; 
+</span> 
+    <a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="syncscan.c.html#LN103"><span class='Ref_to_Struct'>ss_scan_locations_t</span></a> <span class='Operator'>*</span><span class='Parentheses'>) 
+</span>        <a href="../../../include/storage/shmem.h.html#LN43"><span class='Ref_to_Proto'>ShmemInitStruct</span></a><span class='Parentheses'>(</span><span class='String'>"Sync Scan Locations List"</span><span class='Delimiter'>, 
+</span>                        <a href="syncscan.c.html#LN110"><span class='Ref_to_Macro'>SizeOfScanLocations</span></a><span class='Parentheses'>(</span><a href="syncscan.c.html#LN70"><span class='Ref_to_Const'>SYNC_SCAN_NELEM</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                        <span class='Operator'>&</span><a href="syncscan.c.html#LN137"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../utils/init/globals.c.html#LN100"><span class='Ref_to_Global_Var'>IsUnderPostmaster</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Initialize shared memory area */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="syncscan.c.html#LN137"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN105"><span class='Ref_to_Member'>head</span></a> <span class='Operator'>= &</span><a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN107"><span class='Ref_to_Member'>items</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]; 
+</span>        <a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN106"><span class='Ref_to_Member'>tail</span></a> <span class='Operator'>= &</span><a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN107"><span class='Ref_to_Member'>items</span></a><span class='Delimiter'>[</span><a href="syncscan.c.html#LN70"><span class='Ref_to_Const'>SYNC_SCAN_NELEM</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN136"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="syncscan.c.html#LN136"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="syncscan.c.html#LN70"><span class='Ref_to_Const'>SYNC_SCAN_NELEM</span></a><span class='Delimiter'>; </span><a href="syncscan.c.html#LN136"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN154"></a>            <a href="syncscan.c.html#LN96"><span class='Ref_to_Struct'>ss_lru_item_t</span></a> <span class='Operator'>*</span><span class='Declare_Local'>item</span> <span class='Operator'>= &</span><a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN107"><span class='Ref_to_Member'>items</span></a><span class='Delimiter'>[</span><a href="syncscan.c.html#LN136"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Initialize all slots with invalid values. As scans are started, 
+             * these invalid entries will fall off the LRU list and get 
+             * replaced with real entries. 
+             */ 
+</span>            <a href="syncscan.c.html#LN154"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN100"><span class='Ref_to_Member'>location</span></a><span class='Operator'>.</span><a href="syncscan.c.html#LN92"><span class='Ref_to_Member'>relfilenode</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN58"><span class='Ref_to_Member'>spcNode</span></a> <span class='Operator'>= </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+</span>            <a href="syncscan.c.html#LN154"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN100"><span class='Ref_to_Member'>location</span></a><span class='Operator'>.</span><a href="syncscan.c.html#LN92"><span class='Ref_to_Member'>relfilenode</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN59"><span class='Ref_to_Member'>dbNode</span></a> <span class='Operator'>= </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+</span>            <a href="syncscan.c.html#LN154"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN100"><span class='Ref_to_Member'>location</span></a><span class='Operator'>.</span><a href="syncscan.c.html#LN92"><span class='Ref_to_Member'>relfilenode</span></a><span class='Operator'>.</span><a href="../../../include/storage/relfilenode.h.html#LN60"><span class='Ref_to_Member'>relNode</span></a> <span class='Operator'>= </span><a href="../../../include/postgres_ext.h.html#LN33"><span class='Ref_to_Const'>InvalidOid</span></a><span class='Delimiter'>; 
+</span>            <a href="syncscan.c.html#LN154"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN100"><span class='Ref_to_Member'>location</span></a><span class='Operator'>.</span><a href="syncscan.c.html#LN93"><span class='Ref_to_Member'>location</span></a> <span class='Operator'>= </span><a href="../../../include/storage/block.h.html#LN32"><span class='Ref_to_Const'>InvalidBlockNumber</span></a><span class='Delimiter'>; 
+</span> 
+            <a href="syncscan.c.html#LN154"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN98"><span class='Ref_to_Member'>prev</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="syncscan.c.html#LN136"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) </span><span class='Operator'>? 
+</span>                <span class='Parentheses'>(</span><span class='Operator'>&</span><a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN107"><span class='Ref_to_Member'>items</span></a><span class='Delimiter'>[</span><a href="syncscan.c.html#LN136"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>: </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>            <a href="syncscan.c.html#LN154"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN99"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="syncscan.c.html#LN136"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="syncscan.c.html#LN70"><span class='Ref_to_Const'>SYNC_SCAN_NELEM</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>? 
+</span>                <span class='Parentheses'>(</span><span class='Operator'>&</span><a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN107"><span class='Ref_to_Member'>items</span></a><span class='Delimiter'>[</span><a href="syncscan.c.html#LN136"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>: </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !IsUnderPostmaster &raquo; </span> 
+    <span class='Control'>else</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="syncscan.c.html#LN137"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end SyncScanShmemInit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ss_search --- search the scan_locations structure for an entry with the 
+ *      given relfilenode. 
+ * 
+ * If "set" is true, the location is updated to the given location.  If no 
+ * entry for the given relfilenode is found, it will be created at the head 
+ * of the list with the given location, even if "set" is false. 
+ * 
+ * In any case, the location after possible update is returned. 
+ * 
+ * Caller is responsible for having acquired suitable lock on the shared 
+ * data structure. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN190"></a><span class='Declare_Function'>ss_search</span><span class='Parentheses'>(</span><a href="../../../include/storage/relfilenode.h.html#LN56"><span class='Ref_to_Struct'>RelFileNode</span></a> <span class='Declare_Parameter'>relfilenode</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>location</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>set</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN192"></a>    <a href="syncscan.c.html#LN96"><span class='Ref_to_Struct'>ss_lru_item_t</span></a> <span class='Operator'>*</span><span class='Declare_Local'>item</span><span class='Delimiter'>; 
+</span> 
+    <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN105"><span class='Ref_to_Member'>head</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN197"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>match</span><span class='Delimiter'>; 
+</span> 
+        <a href="syncscan.c.html#LN197"><span class='Ref_To_Local'>match</span></a> <span class='Operator'>= </span><a href="../../../include/storage/relfilenode.h.html#LN87"><span class='Ref_to_Macro'>RelFileNodeEquals</span></a><span class='Parentheses'>(</span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN100"><span class='Ref_to_Member'>location</span></a><span class='Operator'>.</span><a href="syncscan.c.html#LN92"><span class='Ref_to_Member'>relfilenode</span></a><span class='Delimiter'>, </span><a href="syncscan.c.html#LN190"><span class='Ref_to_Parameter'>relfilenode</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN197"><span class='Ref_To_Local'>match</span></a> <span class='Operator'>|| </span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN99"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * If we reached the end of list and no match was found, take over 
+             * the last entry 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="syncscan.c.html#LN197"><span class='Ref_To_Local'>match</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN100"><span class='Ref_to_Member'>location</span></a><span class='Operator'>.</span><a href="syncscan.c.html#LN92"><span class='Ref_to_Member'>relfilenode</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN190"><span class='Ref_to_Parameter'>relfilenode</span></a><span class='Delimiter'>; 
+</span>                <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN100"><span class='Ref_to_Member'>location</span></a><span class='Operator'>.</span><a href="syncscan.c.html#LN93"><span class='Ref_to_Member'>location</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN190"><span class='Ref_to_Parameter'>location</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN190"><span class='Ref_to_Parameter'>set</span></a><span class='Parentheses'>) 
+</span>                <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN100"><span class='Ref_to_Member'>location</span></a><span class='Operator'>.</span><a href="syncscan.c.html#LN93"><span class='Ref_to_Member'>location</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN190"><span class='Ref_to_Parameter'>location</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Move the entry to the front of the LRU list */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a> <span class='Operator'>!= </span><a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN105"><span class='Ref_to_Member'>head</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* unlink */ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a> <span class='Operator'>== </span><a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN106"><span class='Ref_to_Member'>tail</span></a><span class='Parentheses'>) 
+</span>                    <a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN106"><span class='Ref_to_Member'>tail</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN98"><span class='Ref_to_Member'>prev</span></a><span class='Delimiter'>; 
+</span>                <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN98"><span class='Ref_to_Member'>prev</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN99"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN99"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN99"><span class='Ref_to_Member'>next</span></a><span class='Parentheses'>) 
+</span>                    <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN99"><span class='Ref_to_Member'>next</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN98"><span class='Ref_to_Member'>prev</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN98"><span class='Ref_to_Member'>prev</span></a><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* link */ 
+</span>                <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN98"><span class='Ref_to_Member'>prev</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>                <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN99"><span class='Ref_to_Member'>next</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN105"><span class='Ref_to_Member'>head</span></a><span class='Delimiter'>; 
+</span>                <a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN105"><span class='Ref_to_Member'>head</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN98"><span class='Ref_to_Member'>prev</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Delimiter'>; 
+</span>                <a href="syncscan.c.html#LN114"><span class='Ref_to_Global_Var'>scan_locations</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN105"><span class='Ref_to_Member'>head</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Control'>return</span> <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN100"><span class='Ref_to_Member'>location</span></a><span class='Operator'>.</span><a href="syncscan.c.html#LN93"><span class='Ref_to_Member'>location</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if match||item-&GT;next==NU... &raquo; </span> 
+ 
+        <a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN192"><span class='Ref_To_Local'>item</span></a><span class='Operator'>-&GT;</span><a href="syncscan.c.html#LN99"><span class='Ref_to_Member'>next</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* not reached */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end ss_search &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ss_get_location --- get the optimal starting location for scan 
+ * 
+ * Returns the last-reported location of a sequential scan on the 
+ * relation, or 0 if no valid location is found. 
+ * 
+ * We expect the caller has just done RelationGetNumberOfBlocks(), and 
+ * so that number is passed in rather than computing it again.  The result 
+ * is guaranteed less than relnblocks (assuming that's &GT; 0). 
+ */ 
+</span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> 
+<a name="LN252"></a><span class='Declare_Function'>ss_get_location</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>relnblocks</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN254"></a>    <a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Local'>startloc</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>SyncScanLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="syncscan.c.html#LN254"><span class='Ref_To_Local'>startloc</span></a> <span class='Operator'>= </span><a href="syncscan.c.html#LN117"><span class='Ref_to_Proto'>ss_search</span></a><span class='Parentheses'>(</span><a href="syncscan.c.html#LN252"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN84"><span class='Ref_to_Member'>rd_node</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncScanLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the location is not a valid block number for this scan, start at 0. 
+     * 
+     * This can happen if for instance a VACUUM truncated the table since the 
+     * location was saved. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN254"><span class='Ref_To_Local'>startloc</span></a> <span class='Operator'>&GT;= </span><a href="syncscan.c.html#LN252"><span class='Ref_to_Parameter'>relnblocks</span></a><span class='Parentheses'>) 
+</span>        <a href="syncscan.c.html#LN254"><span class='Ref_To_Local'>startloc</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> TRACE_SYNCSCAN 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN57"><span class='Ref_to_Global_Var'>trace_syncscan</span></a><span class='Parentheses'>) 
+</span>        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>             <span class='String'>"SYNC_SCAN: start \"%s\" (size %u) at %u"</span><span class='Delimiter'>, 
+</span>             <a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="syncscan.c.html#LN252"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="syncscan.c.html#LN252"><span class='Ref_to_Parameter'>relnblocks</span></a><span class='Delimiter'>, </span><a href="syncscan.c.html#LN254"><span class='Ref_To_Local'>startloc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Control'>return</span> <a href="syncscan.c.html#LN254"><span class='Ref_To_Local'>startloc</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ss_get_location &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * ss_report_location --- update the current scan location 
+ * 
+ * Writes an entry into the shared Sync Scan state of the form 
+ * (relfilenode, blocknumber), overwriting any existing entry for the 
+ * same relfilenode. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN287"></a><span class='Declare_Function'>ss_report_location</span><span class='Parentheses'>(</span><a href="../../../include/utils/relcache.h.html#LN20"><span class='Ref_to_Typedef'>Relation</span></a> <span class='Declare_Parameter'>rel</span><span class='Delimiter'>, </span><a href="../../../include/storage/block.h.html#LN30"><span class='Ref_to_Typedef'>BlockNumber</span></a> <span class='Declare_Parameter'>location</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><span class='Directive'>#ifdef</span> TRACE_SYNCSCAN 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN57"><span class='Ref_to_Global_Var'>trace_syncscan</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="syncscan.c.html#LN287"><span class='Ref_to_Parameter'>location</span></a> <span class='Operator'>% </span><span class='Number'>1024</span><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                 <span class='String'>"SYNC_SCAN: scanning \"%s\" at %u"</span><span class='Delimiter'>, 
+</span>                 <a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="syncscan.c.html#LN287"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="syncscan.c.html#LN287"><span class='Ref_to_Parameter'>location</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * To reduce lock contention, only report scan progress every N pages. For 
+     * the same reason, don't block if the lock isn't immediately available. 
+     * Missing a few updates isn't critical, it just means that a new scan 
+     * that wants to join the pack will start a little bit behind the head of 
+     * the scan.  Hopefully the pages are still in OS cache and the scan 
+     * catches up quickly. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="syncscan.c.html#LN287"><span class='Ref_to_Parameter'>location</span></a> <span class='Operator'>% </span><a href="syncscan.c.html#LN82"><span class='Ref_to_Const'>SYNC_SCAN_REPORT_INTERVAL</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/storage/lwlock.h.html#LN146"><span class='Ref_to_Proto'>LWLockConditionalAcquire</span></a><span class='Parentheses'>(</span>SyncScanLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="syncscan.c.html#LN117"><span class='Ref_to_Proto'>ss_search</span></a><span class='Parentheses'>(</span><a href="syncscan.c.html#LN287"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/utils/rel.h.html#LN84"><span class='Ref_to_Member'>rd_node</span></a><span class='Delimiter'>, </span><a href="syncscan.c.html#LN287"><span class='Ref_to_Parameter'>location</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>SyncScanLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span><span class='Directive'>#ifdef</span> TRACE_SYNCSCAN 
+        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="syncscan.c.html#LN57"><span class='Ref_to_Global_Var'>trace_syncscan</span></a><span class='Parentheses'>) 
+</span>            <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                 <span class='String'>"SYNC_SCAN: missed update for \"%s\" at %u"</span><span class='Delimiter'>, 
+</span>                 <a href="../../../include/utils/rel.h.html#LN436"><span class='Ref_to_Macro'>RelationGetRelationName</span></a><span class='Parentheses'>(</span><a href="syncscan.c.html#LN287"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="syncscan.c.html#LN287"><span class='Ref_to_Parameter'>location</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end ss_report_location &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

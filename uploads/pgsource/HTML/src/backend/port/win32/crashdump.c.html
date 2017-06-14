@@ -1,0 +1,210 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\port\win32\crashdump.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\port\win32\crashdump.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:45 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * win32_crashdump.c 
+ *         Automatic crash dump creation for PostgreSQL on Windows 
+ * 
+ * The crashdump feature traps unhandled win32 exceptions produced by the 
+ * backend, and tries to produce a Windows MiniDump crash 
+ * dump for later debugging and analysis. The machine performing the dump 
+ * doesn't need any special debugging tools; the user only needs to send 
+ * the dump to somebody who has the same version of PostgreSQL and has debugging 
+ * tools. 
+ * 
+ * crashdump module originally by Craig Ringer &LT;ringerc@ringerc.id.au&GT; 
+ * 
+ * LIMITATIONS 
+ * =========== 
+ * This *won't* work in hard OOM situations or stack overflows. 
+ * 
+ * For those, it'd be necessary to take a much more complicated approach where 
+ * the handler switches to a new stack (if it can) and forks a helper process 
+ * to debug it self. 
+ * 
+ * POSSIBLE FUTURE WORK 
+ * ==================== 
+ * For bonus points, the crash dump format permits embedding of user-supplied 
+ * data. If there's anything else that should always be supplied with a crash 
+ * dump (postgresql.conf? Last few lines of a log file?), it could potentially 
+ * be added, though at the cost of a greater chance of the crash dump failing. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/port/win32/crashdump.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<a name="LN40"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>WIN32_LEAN_AND_MEAN</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Some versions of the MS SDK contain "typedef enum { ... } ;" which the MS 
+ * compiler quite sanely complains about. Well done, Microsoft. 
+ * This pragma disables the warning just while we include the header. 
+ * The pragma is known to work with all (as at the time of writing) supported 
+ * versions of MSVC. 
+ */ 
+</span><span class='Directive'>#ifdef</span> _MSC_VER 
+<span class='Keyword'>#pragma </span><a href="../../../timezone/zic.c.html#LN492"><span class='Ref_to_Func'>warning</span></a><span class='Parentheses'>(</span><a href="../../regex/regcomp.c.html#LN155"><span class='Ref_to_Proto'>push</span></a><span class='Parentheses'>) 
+</span><span class='Keyword'>#pragma </span><a href="../../../timezone/zic.c.html#LN492"><span class='Ref_to_Func'>warning</span></a><span class='Parentheses'>(</span>disable <span class='Operator'>: </span><span class='Number'>4091</span><span class='Parentheses'>) 
+</span><span class='Directive'>#endif</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;dbghelp.h&GT;</span> 
+<span class='Directive'>#ifdef</span> _MSC_VER 
+<span class='Keyword'>#pragma </span><a href="../../../timezone/zic.c.html#LN492"><span class='Ref_to_Func'>warning</span></a><span class='Parentheses'>(</span>pop<span class='Parentheses'>) 
+</span><span class='Directive'>#endif</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Much of the following code is based on CodeProject and MSDN examples, 
+ * particularly 
+ * http://www.codeproject.com/KB/debug/postmortemdebug_standalone1.aspx 
+ * 
+ * Useful MSDN articles: 
+ * 
+ * http://msdn.microsoft.com/en-us/library/ff805116(v=VS.85).aspx 
+ * http://msdn.microsoft.com/en-us/library/ms679294(VS.85).aspx 
+ * 
+ * Other useful articles on working with minidumps: 
+ * http://www.debuginfo.com/articles/effminidumps.html 
+ */ 
+</span> 
+<a name="LN72"></a><span class='Control'>typedef</span> BOOL <span class='Parentheses'>(</span>WINAPI <span class='Operator'>* </span><span class='Declare_Typedef'>MINIDUMPWRITEDUMP</span><span class='Parentheses'>) (</span>HANDLE hProcess<span class='Delimiter'>, </span><span class='Keyword'>DWORD </span>dwPid<span class='Delimiter'>, </span>HANDLE hFile<span class='Delimiter'>, </span>MINIDUMP_TYPE DumpType<span class='Delimiter'>, 
+</span>                        CONST PMINIDUMP_EXCEPTION_INFORMATION ExceptionParam<span class='Delimiter'>, 
+</span>                     CONST PMINIDUMP_USER_STREAM_INFORMATION UserStreamParam<span class='Delimiter'>, 
+</span>                           CONST PMINIDUMP_CALLBACK_INFORMATION CallbackParam 
+<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * This function is the exception handler passed to SetUnhandledExceptionFilter. 
+ * It's invoked only if there's an unhandled exception. The handler will use 
+ * dbghelp.dll to generate a crash dump, then resume the normal unhandled 
+ * exception process, which will generally exit with an error message from 
+ * the runtime. 
+ * 
+ * This function is run under the unhandled exception handler, effectively 
+ * in a crash context, so it should be careful with memory and avoid using 
+ * any PostgreSQL functions. 
+ */ 
+</span><span class='Keyword'>static LONG </span>WINAPI 
+<a name="LN91"></a><span class='Declare_Function'>crashDumpHandler</span><span class='Parentheses'>(</span><span class='Control'>struct</span> _EXCEPTION_POINTERS <span class='Operator'>* </span><span class='Declare_Parameter'>pExceptionInfo</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * We only write crash dumps if the "crashdumps" directory within the 
+     * postgres data directory exists. 
+     */ 
+</span><a name="LN97"></a>    <span class='Keyword'>DWORD</span>       <span class='Declare_Local'>attribs</span> <span class='Operator'>= </span>GetFileAttributesA<span class='Parentheses'>(</span><span class='String'>"crashdumps"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="crashdump.c.html#LN97"><span class='Ref_To_Local'>attribs</span></a> <span class='Operator'>!= </span>INVALID_FILE_ATTRIBUTES <span class='Operator'>&& </span><span class='Parentheses'>(</span><a href="crashdump.c.html#LN97"><span class='Ref_To_Local'>attribs</span></a> <span class='Operator'>& </span>FILE_ATTRIBUTE_DIRECTORY<span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 'crashdumps' exists and is a directory. Try to write a dump' */ 
+</span><a name="LN102"></a>        HMODULE     <span class='Declare_Local'>hDll</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN103"></a>        <a href="crashdump.c.html#LN72"><span class='Ref_to_Typedef'>MINIDUMPWRITEDUMP</span></a> <span class='Declare_Local'>pDump</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN104"></a>        MINIDUMP_TYPE <span class='Declare_Local'>dumpType</span><span class='Delimiter'>; 
+</span><a name="LN105"></a>        <span class='Keyword'>char</span>        <span class='Declare_Local'>dumpPath</span><span class='Delimiter'>[</span>_MAX_PATH<span class='Delimiter'>]; 
+</span><a name="LN106"></a>        HANDLE      <span class='Declare_Local'>selfProcHandle</span> <span class='Operator'>= </span>GetCurrentProcess<span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><a name="LN107"></a>        <span class='Keyword'>DWORD</span>       <span class='Declare_Local'>selfPid</span> <span class='Operator'>= </span>GetProcessId<span class='Parentheses'>(</span><a href="crashdump.c.html#LN106"><span class='Ref_To_Local'>selfProcHandle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN108"></a>        HANDLE      <span class='Declare_Local'>dumpFile</span><span class='Delimiter'>; 
+</span><a name="LN109"></a>        <span class='Keyword'>DWORD</span>       <span class='Declare_Local'>systemTicks</span><span class='Delimiter'>; 
+</span><a name="LN110"></a>        <span class='Control'>struct</span> _MINIDUMP_EXCEPTION_INFORMATION <span class='Declare_Local'>ExInfo</span><span class='Delimiter'>; 
+</span> 
+        <a href="crashdump.c.html#LN110"><span class='Ref_To_Local'>ExInfo</span></a><span class='Operator'>.</span>ThreadId <span class='Operator'>= </span>GetCurrentThreadId<span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="crashdump.c.html#LN110"><span class='Ref_To_Local'>ExInfo</span></a><span class='Operator'>.</span>ExceptionPointers <span class='Operator'>= </span><a href="crashdump.c.html#LN91"><span class='Ref_to_Parameter'>pExceptionInfo</span></a><span class='Delimiter'>; 
+</span>        <a href="crashdump.c.html#LN110"><span class='Ref_To_Local'>ExInfo</span></a><span class='Operator'>.</span>ClientPointers <span class='Operator'>= </span><span class='Boolean'>FALSE</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Load the dbghelp.dll library and functions */ 
+</span>        <a href="crashdump.c.html#LN102"><span class='Ref_To_Local'>hDll</span></a> <span class='Operator'>= </span>LoadLibrary<span class='Parentheses'>(</span><span class='String'>"dbghelp.dll"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="crashdump.c.html#LN102"><span class='Ref_To_Local'>hDll</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../bin/pg_dump/parallel.c.html#LN179"><span class='Ref_to_Macro'>write_stderr</span></a><span class='Parentheses'>(</span><span class='String'>"could not load dbghelp.dll, cannot write crash dump\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> EXCEPTION_CONTINUE_SEARCH<span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="crashdump.c.html#LN103"><span class='Ref_To_Local'>pDump</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="crashdump.c.html#LN72"><span class='Ref_to_Typedef'>MINIDUMPWRITEDUMP</span></a><span class='Parentheses'>) </span>GetProcAddress<span class='Parentheses'>(</span><a href="crashdump.c.html#LN102"><span class='Ref_To_Local'>hDll</span></a><span class='Delimiter'>, </span><span class='String'>"MiniDumpWriteDump"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="crashdump.c.html#LN103"><span class='Ref_To_Local'>pDump</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../bin/pg_dump/parallel.c.html#LN179"><span class='Ref_to_Macro'>write_stderr</span></a><span class='Parentheses'>(</span><span class='String'>"could not load required functions in dbghelp.dll, cannot write crash dump\n"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> EXCEPTION_CONTINUE_SEARCH<span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Dump as much as we can, except shared memory, code segments, and 
+         * memory mapped files. Exactly what we can dump depends on the 
+         * version of dbghelp.dll, see: 
+         * http://msdn.microsoft.com/en-us/library/ms680519(v=VS.85).aspx 
+         */ 
+</span>        <a href="crashdump.c.html#LN104"><span class='Ref_To_Local'>dumpType</span></a> <span class='Operator'>= </span>MiniDumpNormal <span class='Operator'>| </span>MiniDumpWithHandleData <span class='Operator'>| 
+</span>            MiniDumpWithDataSegs<span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span>GetProcAddress<span class='Parentheses'>(</span><a href="crashdump.c.html#LN102"><span class='Ref_To_Local'>hDll</span></a><span class='Delimiter'>, </span><span class='String'>"EnumDirTree"</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* If this function exists, we have version 5.2 or newer */ 
+</span>            <a href="crashdump.c.html#LN104"><span class='Ref_To_Local'>dumpType</span></a> <span class='Operator'>|= </span>MiniDumpWithIndirectlyReferencedMemory <span class='Operator'>| 
+</span>                MiniDumpWithPrivateReadWriteMemory<span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="crashdump.c.html#LN109"><span class='Ref_To_Local'>systemTicks</span></a> <span class='Operator'>= </span>GetTickCount<span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>        <a href="../../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="crashdump.c.html#LN105"><span class='Ref_To_Local'>dumpPath</span></a><span class='Delimiter'>, </span>_MAX_PATH<span class='Delimiter'>, 
+</span>                 <span class='String'>"crashdumps\\postgres-pid%0i-%0i.mdmp"</span><span class='Delimiter'>, 
+</span>                 <span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="crashdump.c.html#LN107"><span class='Ref_To_Local'>selfPid</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="crashdump.c.html#LN109"><span class='Ref_To_Local'>systemTicks</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="crashdump.c.html#LN105"><span class='Ref_To_Local'>dumpPath</span></a><span class='Delimiter'>[</span>_MAX_PATH <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+        <a href="crashdump.c.html#LN108"><span class='Ref_To_Local'>dumpFile</span></a> <span class='Operator'>= </span>CreateFile<span class='Parentheses'>(</span><a href="crashdump.c.html#LN105"><span class='Ref_To_Local'>dumpPath</span></a><span class='Delimiter'>, </span>GENERIC_WRITE<span class='Delimiter'>, </span>FILE_SHARE_WRITE<span class='Delimiter'>, 
+</span>                              <span class='Null_Value'>NULL</span><span class='Delimiter'>, </span>CREATE_ALWAYS<span class='Delimiter'>, </span>FILE_ATTRIBUTE_NORMAL<span class='Delimiter'>, 
+</span>                              <span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="crashdump.c.html#LN108"><span class='Ref_To_Local'>dumpFile</span></a> <span class='Operator'>== </span>INVALID_HANDLE_VALUE<span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="../../../bin/pg_dump/parallel.c.html#LN179"><span class='Ref_to_Macro'>write_stderr</span></a><span class='Parentheses'>(</span><span class='String'>"could not open crash dump file \"%s\" for writing: error code %lu\n"</span><span class='Delimiter'>, 
+</span>                         <a href="crashdump.c.html#LN105"><span class='Ref_To_Local'>dumpPath</span></a><span class='Delimiter'>, </span>GetLastError<span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> EXCEPTION_CONTINUE_SEARCH<span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>((</span><span class='Operator'>*</span><a href="crashdump.c.html#LN103"><span class='Ref_To_Local'>pDump</span></a><span class='Parentheses'>) (</span><a href="crashdump.c.html#LN106"><span class='Ref_To_Local'>selfProcHandle</span></a><span class='Delimiter'>, </span><a href="crashdump.c.html#LN107"><span class='Ref_To_Local'>selfPid</span></a><span class='Delimiter'>, </span><a href="crashdump.c.html#LN108"><span class='Ref_To_Local'>dumpFile</span></a><span class='Delimiter'>, </span><a href="crashdump.c.html#LN104"><span class='Ref_To_Local'>dumpType</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="crashdump.c.html#LN110"><span class='Ref_To_Local'>ExInfo</span></a><span class='Delimiter'>, 
+</span>                      <span class='Null_Value'>NULL</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>))</span> 
+            <a href="../../../bin/pg_dump/parallel.c.html#LN179"><span class='Ref_to_Macro'>write_stderr</span></a><span class='Parentheses'>(</span><span class='String'>"wrote crash dump to file \"%s\"\n"</span><span class='Delimiter'>, </span><a href="crashdump.c.html#LN105"><span class='Ref_To_Local'>dumpPath</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <a href="../../../bin/pg_dump/parallel.c.html#LN179"><span class='Ref_to_Macro'>write_stderr</span></a><span class='Parentheses'>(</span><span class='String'>"could not write crash dump to file \"%s\": error code %lu\n"</span><span class='Delimiter'>, 
+</span>                         <a href="crashdump.c.html#LN105"><span class='Ref_To_Local'>dumpPath</span></a><span class='Delimiter'>, </span>GetLastError<span class='Parentheses'>())</span><span class='Delimiter'>; 
+</span> 
+        CloseHandle<span class='Parentheses'>(</span><a href="crashdump.c.html#LN108"><span class='Ref_To_Local'>dumpFile</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if attribs!=INVALID_FILE... &raquo; </span> 
+ 
+    <span class='Control'>return</span> EXCEPTION_CONTINUE_SEARCH<span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end crashDumpHandler &raquo; </span> 
+ 
+ 
+<span class='Keyword'>void 
+</span><a name="LN179"></a><span class='Declare_Function'>pgwin32_install_crashdump_handler</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    SetUnhandledExceptionFilter<span class='Parentheses'>(</span><a href="crashdump.c.html#LN90"><span class='Ref_to_Func'>crashDumpHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

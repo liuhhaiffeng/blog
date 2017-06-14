@@ -1,0 +1,826 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\transam\clog.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\transam\clog.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:30 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * clog.c 
+ *      PostgreSQL transaction-commit-log manager 
+ * 
+ * This module replaces the old "pg_log" access code, which treated pg_log 
+ * essentially like a relation, in that it went through the regular buffer 
+ * manager.  The problem with that was that there wasn't any good way to 
+ * recycle storage space for transactions so old that they'll never be 
+ * looked up again.  Now we use specialized access code so that the commit 
+ * log can be broken into relatively small, independent segments. 
+ * 
+ * XLOG interactions: this module generates an XLOG record whenever a new 
+ * CLOG page is initialized to zeroes.  Other writes of CLOG come from 
+ * recording of transaction commit or abort in xact.c, which generates its 
+ * own XLOG records for these events and will re-perform the status update 
+ * on redo; so we need make no additional XLOG entry here.  For synchronous 
+ * transaction commits, the XLOG is guaranteed flushed through the XLOG commit 
+ * record before we are called to log a commit, so the WAL rule "write xlog 
+ * before data" is satisfied automatically.  However, for async commits we 
+ * must track the latest LSN affecting each CLOG page, so that we can flush 
+ * XLOG that far and satisfy the WAL rule.  We don't have to worry about this 
+ * for aborts (whether sync or async), since the post-crash assumption would 
+ * be that such transactions failed anyway. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * src/backend/access/transam/clog.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/clog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/slru.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/transam.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xloginsert.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlogutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pg_trace.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Defines for CLOG page sizes.  A page is the same BLCKSZ as is used 
+ * everywhere else in Postgres. 
+ * 
+ * Note: because TransactionIds are 32 bits and wrap around at 0xFFFFFFFF, 
+ * CLOG page numbering also wraps around at 0xFFFFFFFF/CLOG_XACTS_PER_PAGE, 
+ * and CLOG segment numbering at 
+ * 0xFFFFFFFF/CLOG_XACTS_PER_PAGE/SLRU_PAGES_PER_SEGMENT.  We need take no 
+ * explicit notice of that fact in this module, except when comparing segment 
+ * and page numbers in TruncateCLOG (see CLOGPagePrecedes). 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* We need two bits per xact, so four xacts fit in a byte */ 
+</span><a name="LN56"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CLOG_BITS_PER_XACT</span>  <span class='Number'>2</span> 
+<a name="LN57"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CLOG_XACTS_PER_BYTE</span> <span class='Number'>4</span> 
+<a name="LN58"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CLOG_XACTS_PER_PAGE</span> <span class='Parentheses'>(</span>BLCKSZ <span class='Operator'>* </span><a href="clog.c.html#LN57"><span class='Ref_to_Const'>CLOG_XACTS_PER_BYTE</span></a><span class='Parentheses'>) 
+</span><a name="LN59"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CLOG_XACT_BITMASK</span>   <span class='Parentheses'>((</span><span class='Number'>1</span> <span class='Operator'>&LT;&LT; </span><a href="clog.c.html#LN56"><span class='Ref_to_Const'>CLOG_BITS_PER_XACT</span></a><span class='Parentheses'>) </span><span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>)</span> 
+ 
+<a name="LN61"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>TransactionIdToPage</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>xid</span><span class='Parentheses'>)</span>    <span class='Parentheses'>((</span><a href="clog.c.html#LN61"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>/ </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="clog.c.html#LN58"><span class='Ref_to_Const'>CLOG_XACTS_PER_PAGE</span></a><span class='Parentheses'>)</span> 
+<a name="LN62"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>TransactionIdToPgIndex</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>xid</span><span class='Parentheses'>) ((</span><a href="clog.c.html#LN62"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>% </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="clog.c.html#LN58"><span class='Ref_to_Const'>CLOG_XACTS_PER_PAGE</span></a><span class='Parentheses'>)</span> 
+<a name="LN63"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>TransactionIdToByte</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>xid</span><span class='Parentheses'>)</span>    <span class='Parentheses'>(</span><a href="clog.c.html#LN62"><span class='Ref_to_Macro'>TransactionIdToPgIndex</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN63"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>/ </span><a href="clog.c.html#LN57"><span class='Ref_to_Const'>CLOG_XACTS_PER_BYTE</span></a><span class='Parentheses'>)</span> 
+<a name="LN64"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>TransactionIdToBIndex</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>xid</span><span class='Parentheses'>)</span>  <span class='Parentheses'>((</span><a href="clog.c.html#LN64"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>% </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="clog.c.html#LN57"><span class='Ref_to_Const'>CLOG_XACTS_PER_BYTE</span></a><span class='Parentheses'>)</span> 
+ 
+<span class='Comment_Multi_Line'>/* We store the latest async LSN for each group of transactions */ 
+</span><a name="LN67"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CLOG_XACTS_PER_LSN_GROUP</span>    <span class='Number'>32</span>  <span class='Comment_Single_Line'>/* keep this a power of 2 */ 
+</span><a name="LN68"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CLOG_LSNS_PER_PAGE</span>  <span class='Parentheses'>(</span><a href="clog.c.html#LN58"><span class='Ref_to_Const'>CLOG_XACTS_PER_PAGE</span></a> <span class='Operator'>/ </span><a href="clog.c.html#LN67"><span class='Ref_to_Const'>CLOG_XACTS_PER_LSN_GROUP</span></a><span class='Parentheses'>) 
+</span> 
+<a name="LN70"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>GetLSNIndex</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>slotno</span><span class='Delimiter'>, </span><span class='Declare_Parameter'>xid</span><span class='Parentheses'>)</span>    <span class='Parentheses'>((</span><a href="clog.c.html#LN70"><span class='Ref_to_Parameter'>slotno</span></a><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="clog.c.html#LN68"><span class='Ref_to_Const'>CLOG_LSNS_PER_PAGE</span></a> <span class='Operator'>+ \ 
+</span>    <span class='Parentheses'>((</span><a href="clog.c.html#LN70"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>% </span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="clog.c.html#LN58"><span class='Ref_to_Const'>CLOG_XACTS_PER_PAGE</span></a><span class='Parentheses'>)</span> <span class='Operator'>/ </span><a href="clog.c.html#LN67"><span class='Ref_to_Const'>CLOG_XACTS_PER_LSN_GROUP</span></a><span class='Parentheses'>)</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Link to shared-memory data structures for CLOG control 
+ */ 
+</span><a name="LN77"></a><span class='Keyword'>static </span><a href="../../../include/access/slru.h.html#LN116"><span class='Ref_to_Struct'>SlruCtlData</span></a> <span class='Declare_Var'>ClogCtlData</span><span class='Delimiter'>; 
+</span> 
+<a name="LN79"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>ClogCtl</span> <span class='Parentheses'>(</span><span class='Operator'>&</span><a href="clog.c.html#LN77"><span class='Ref_to_Global_Var'>ClogCtlData</span></a><span class='Parentheses'>) 
+</span> 
+ 
+<a name="LN82"></a><span class='Keyword'>static int</span>  <span class='Declare_Prototype'>ZeroCLOGPage</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>writeXlog</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN83"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>CLOGPagePrecedes</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>page1</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>page2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN84"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>WriteZeroPageXlogRec</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN85"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>WriteTruncateXlogRec</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestXact</span><span class='Delimiter'>, 
+</span><a name="LN86"></a>                     <a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>oldestXidDb</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN87"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>TransactionIdSetPageStatus</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, 
+</span><a name="LN88"></a>                           <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, </span><a href="../../../include/access/clog.h.html#LN23"><span class='Ref_to_Typedef'>XidStatus</span></a> <span class='Declare_Parameter'>status</span><span class='Delimiter'>, 
+</span><a name="LN89"></a>                           <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>lsn</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN90"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>TransactionIdSetStatusBit</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><a href="../../../include/access/clog.h.html#LN23"><span class='Ref_to_Typedef'>XidStatus</span></a> <span class='Declare_Parameter'>status</span><span class='Delimiter'>, 
+</span><a name="LN91"></a>                          <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>lsn</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>slotno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN92"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>set_status_by_pages</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, 
+</span><a name="LN93"></a>                    <a href="../../../include/access/clog.h.html#LN23"><span class='Ref_to_Typedef'>XidStatus</span></a> <span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>lsn</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * TransactionIdSetTreeStatus 
+ * 
+ * Record the final state of transaction entries in the commit log for 
+ * a transaction and its subtransaction tree. Take care to ensure this is 
+ * efficient, and as atomic as possible. 
+ * 
+ * xid is a single xid to set status for. This will typically be 
+ * the top level transactionid for a top level commit or abort. It can 
+ * also be a subtransaction when we record transaction aborts. 
+ * 
+ * subxids is an array of xids of length nsubxids, representing subtransactions 
+ * in the tree of xid. In various cases nsubxids may be zero. 
+ * 
+ * lsn must be the WAL location of the commit record when recording an async 
+ * commit.  For a synchronous commit it can be InvalidXLogRecPtr, since the 
+ * caller guarantees the commit record is already flushed in that case.  It 
+ * should be InvalidXLogRecPtr for abort cases, too. 
+ * 
+ * In the commit case, atomicity is limited by whether all the subxids are in 
+ * the same CLOG page as xid.  If they all are, then the lock will be grabbed 
+ * only once, and the status will be set to committed directly.  Otherwise 
+ * we must 
+ *   1. set sub-committed all subxids that are not on the same page as the 
+ *      main xid 
+ *   2. atomically set committed the main xid and the subxids on the same page 
+ *   3. go over the first bunch again and set them committed 
+ * Note that as far as concurrent checkers are concerned, main transaction 
+ * commit as a whole is still atomic. 
+ * 
+ * Example: 
+ *      TransactionId t commits and has subxids t1, t2, t3, t4 
+ *      t is on page p1, t1 is also on p1, t2 and t3 are on p2, t4 is on p3 
+ *      1. update pages2-3: 
+ *                  page2: set t2,t3 as sub-committed 
+ *                  page3: set t4 as sub-committed 
+ *      2. update page1: 
+ *                  set t1 as sub-committed, 
+ *                  then set t as committed, 
+                    then set t1 as committed 
+ *      3. update pages2-3: 
+ *                  page2: set t2,t3 as committed 
+ *                  page3: set t4 as committed 
+ * 
+ * NB: this is a low-level routine and is NOT the preferred entry point 
+ * for most uses; functions in transam.c are the intended callers. 
+ * 
+ * XXX Think about issuing FADVISE_WILLNEED on pages that we will need, 
+ * but aren't yet in cache, as well as hinting pages not to fall out of 
+ * cache yet. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN148"></a><span class='Declare_Function'>TransactionIdSetTreeStatus</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, 
+</span><a name="LN149"></a>                    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, </span><a href="../../../include/access/clog.h.html#LN23"><span class='Ref_to_Typedef'>XidStatus</span></a> <span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN151"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN148"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* get page of parent */ 
+</span><a name="LN152"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN26"><span class='Ref_to_Const'>TRANSACTION_STATUS_COMMITTED</span></a> <span class='Operator'>|| 
+</span>           <a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN27"><span class='Ref_to_Const'>TRANSACTION_STATUS_ABORTED</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * See how many subxids, if any, are on the same page as the parent, if 
+     * any. 
+     */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN152"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="clog.c.html#LN152"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="clog.c.html#LN148"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Delimiter'>; </span><a href="clog.c.html#LN152"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="clog.c.html#LN152"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="clog.c.html#LN151"><span class='Ref_To_Local'>pageno</span></a><span class='Parentheses'>)</span> 
+            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Do all items fit on a single page? 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN152"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>== </span><a href="clog.c.html#LN148"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Set the parent and all subtransactions in a single call 
+         */ 
+</span>        <a href="clog.c.html#LN87"><span class='Ref_to_Proto'>TransactionIdSetPageStatus</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN148"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN148"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>status</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>, 
+</span>                                   <a href="clog.c.html#LN151"><span class='Ref_To_Local'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN180"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>nsubxids_on_first_page</span> <span class='Operator'>= </span><a href="clog.c.html#LN152"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If this is a commit then we care about doing this correctly (i.e. 
+         * using the subcommitted intermediate status).  By here, we know 
+         * we're updating more than one page of clog, so we must mark entries 
+         * that are *not* on the first page so that they show as subcommitted 
+         * before we then return to update the status to fully committed. 
+         * 
+         * To avoid touching the first page twice, skip marking subcommitted 
+         * for the subxids on that first page. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN26"><span class='Ref_to_Const'>TRANSACTION_STATUS_COMMITTED</span></a><span class='Parentheses'>) 
+</span>            <a href="clog.c.html#LN92"><span class='Ref_to_Proto'>set_status_by_pages</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN148"><span class='Ref_to_Parameter'>nsubxids</span></a> <span class='Operator'>- </span><a href="clog.c.html#LN180"><span class='Ref_To_Local'>nsubxids_on_first_page</span></a><span class='Delimiter'>, 
+</span>                                <a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>subxids</span></a> <span class='Operator'>+ </span><a href="clog.c.html#LN180"><span class='Ref_To_Local'>nsubxids_on_first_page</span></a><span class='Delimiter'>, 
+</span>                                <a href="../../../include/access/clog.h.html#LN28"><span class='Ref_to_Const'>TRANSACTION_STATUS_SUB_COMMITTED</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Now set the parent and subtransactions on same page as the parent, 
+         * if any 
+         */ 
+</span>        <a href="clog.c.html#LN151"><span class='Ref_To_Local'>pageno</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN148"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="clog.c.html#LN87"><span class='Ref_to_Proto'>TransactionIdSetPageStatus</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN148"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN180"><span class='Ref_To_Local'>nsubxids_on_first_page</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>status</span></a><span class='Delimiter'>, 
+</span>                                   <a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN151"><span class='Ref_To_Local'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Now work through the rest of the subxids one clog page at a time, 
+         * starting from the second page onwards, like we did above. 
+         */ 
+</span>        <a href="clog.c.html#LN92"><span class='Ref_to_Proto'>set_status_by_pages</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN148"><span class='Ref_to_Parameter'>nsubxids</span></a> <span class='Operator'>- </span><a href="clog.c.html#LN180"><span class='Ref_To_Local'>nsubxids_on_first_page</span></a><span class='Delimiter'>, 
+</span>                            <a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>subxids</span></a> <span class='Operator'>+ </span><a href="clog.c.html#LN180"><span class='Ref_To_Local'>nsubxids_on_first_page</span></a><span class='Delimiter'>, 
+</span>                            <a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>status</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN149"><span class='Ref_to_Parameter'>lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end TransactionIdSetTreeStatus &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Helper for TransactionIdSetTreeStatus: set the status for a bunch of 
+ * transactions, chunking in the separate CLOG pages involved. We never 
+ * pass the whole transaction tree to this function, only subtransactions 
+ * that are on different pages to the top level transaction id. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN222"></a><span class='Declare_Function'>set_status_by_pages</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, 
+</span><a name="LN223"></a>                    <a href="../../../include/access/clog.h.html#LN23"><span class='Ref_to_Typedef'>XidStatus</span></a> <span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN225"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN222"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN226"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>offset</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN227"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN227"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="clog.c.html#LN222"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN231"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>num_on_page</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN222"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="clog.c.html#LN227"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="clog.c.html#LN225"><span class='Ref_To_Local'>pageno</span></a> <span class='Operator'>&& </span><a href="clog.c.html#LN227"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="clog.c.html#LN222"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="clog.c.html#LN231"><span class='Ref_To_Local'>num_on_page</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <a href="clog.c.html#LN227"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="clog.c.html#LN87"><span class='Ref_to_Proto'>TransactionIdSetPageStatus</span></a><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN30"><span class='Ref_to_Const'>InvalidTransactionId</span></a><span class='Delimiter'>, 
+</span>                                   <a href="clog.c.html#LN231"><span class='Ref_To_Local'>num_on_page</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN222"><span class='Ref_to_Parameter'>subxids</span></a> <span class='Operator'>+ </span><a href="clog.c.html#LN226"><span class='Ref_To_Local'>offset</span></a><span class='Delimiter'>, 
+</span>                                   <a href="clog.c.html#LN223"><span class='Ref_to_Parameter'>status</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN223"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN225"><span class='Ref_To_Local'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="clog.c.html#LN226"><span class='Ref_To_Local'>offset</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN227"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>        <a href="clog.c.html#LN225"><span class='Ref_To_Local'>pageno</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN222"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="clog.c.html#LN226"><span class='Ref_To_Local'>offset</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end set_status_by_pages &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Record the final state of transaction entries in the commit log for 
+ * all entries on a single page.  Atomic only on this page. 
+ * 
+ * Otherwise API is same as TransactionIdSetTreeStatus() 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN254"></a><span class='Declare_Function'>TransactionIdSetPageStatus</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nsubxids</span><span class='Delimiter'>, 
+</span><a name="LN255"></a>                           <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>subxids</span><span class='Delimiter'>, </span><a href="../../../include/access/clog.h.html#LN23"><span class='Ref_to_Typedef'>XidStatus</span></a> <span class='Declare_Parameter'>status</span><span class='Delimiter'>, 
+</span><a name="LN256"></a>                           <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>lsn</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN258"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span><a name="LN259"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN26"><span class='Ref_to_Const'>TRANSACTION_STATUS_COMMITTED</span></a> <span class='Operator'>|| 
+</span>           <a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN27"><span class='Ref_to_Const'>TRANSACTION_STATUS_ABORTED</span></a> <span class='Operator'>|| 
+</span>           <span class='Parentheses'>(</span><a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN28"><span class='Ref_to_Const'>TRANSACTION_STATUS_SUB_COMMITTED</span></a> <span class='Operator'>&& !</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN254"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we're doing an async commit (ie, lsn is valid), then we must wait 
+     * for any active write on the page slot to complete.  Otherwise our 
+     * update could reach disk in that write, which will not do since we 
+     * mustn't let it reach disk until we've done the appropriate WAL flush. 
+     * But when lsn is invalid, it's OK to scribble on a page while it is 
+     * write-busy, since we don't care if the update reaches disk sooner than 
+     * we think. 
+     */ 
+</span>    <a href="clog.c.html#LN258"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="../../../include/access/slru.h.html#LN147"><span class='Ref_to_Proto'>SimpleLruReadPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN256"><span class='Ref_to_Parameter'>pageno</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN256"><span class='Ref_to_Parameter'>lsn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="clog.c.html#LN254"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Set the main transaction id, if any. 
+     * 
+     * If we update more than one xid on this page while it is being written 
+     * out, we might find that some of the bits go to disk and others don't. 
+     * If we are updating commits on the page with the top-level xid that 
+     * could break atomicity, so we subcommit the subxids first before we mark 
+     * the top-level commit. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN40"><span class='Ref_to_Macro'>TransactionIdIsValid</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN254"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Subtransactions first, if needed ... */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN26"><span class='Ref_to_Const'>TRANSACTION_STATUS_COMMITTED</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="clog.c.html#LN254"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Delimiter'>; </span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_number<span class='Delimiter'>[</span><a href="clog.c.html#LN258"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>                <a href="clog.c.html#LN90"><span class='Ref_to_Proto'>TransactionIdSetStatusBit</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                                          <a href="../../../include/access/clog.h.html#LN28"><span class='Ref_to_Const'>TRANSACTION_STATUS_SUB_COMMITTED</span></a><span class='Delimiter'>, 
+</span>                                          <a href="clog.c.html#LN256"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN258"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* ... then the main transaction */ 
+</span>        <a href="clog.c.html#LN90"><span class='Ref_to_Proto'>TransactionIdSetStatusBit</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN254"><span class='Ref_to_Parameter'>xid</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>status</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN256"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN258"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Set the subtransactions */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="clog.c.html#LN254"><span class='Ref_to_Parameter'>nsubxids</span></a><span class='Delimiter'>; </span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_number<span class='Delimiter'>[</span><a href="clog.c.html#LN258"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>== </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="clog.c.html#LN90"><span class='Ref_to_Proto'>TransactionIdSetStatusBit</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>subxids</span></a><span class='Delimiter'>[</span><a href="clog.c.html#LN259"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], </span><a href="clog.c.html#LN255"><span class='Ref_to_Parameter'>status</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN256"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN258"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_dirty<span class='Delimiter'>[</span><a href="clog.c.html#LN258"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TransactionIdSetPageStatus &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Sets the commit status of a single transaction. 
+ * 
+ * Must be called with CLogControlLock held 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN323"></a><span class='Declare_Function'>TransactionIdSetStatusBit</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><a href="../../../include/access/clog.h.html#LN23"><span class='Ref_to_Typedef'>XidStatus</span></a> <span class='Declare_Parameter'>status</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Declare_Parameter'>lsn</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>slotno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN325"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>byteno</span> <span class='Operator'>= </span><a href="clog.c.html#LN63"><span class='Ref_to_Macro'>TransactionIdToByte</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN326"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>bshift</span> <span class='Operator'>= </span><a href="clog.c.html#LN64"><span class='Ref_to_Macro'>TransactionIdToBIndex</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="clog.c.html#LN56"><span class='Ref_to_Const'>CLOG_BITS_PER_XACT</span></a><span class='Delimiter'>; 
+</span><a name="LN327"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>byteptr</span><span class='Delimiter'>; 
+</span><a name="LN328"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>byteval</span><span class='Delimiter'>; 
+</span><a name="LN329"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>curval</span><span class='Delimiter'>; 
+</span> 
+    <a href="clog.c.html#LN327"><span class='Ref_To_Local'>byteptr</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_buffer<span class='Delimiter'>[</span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>+ </span><a href="clog.c.html#LN325"><span class='Ref_To_Local'>byteno</span></a><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN329"><span class='Ref_To_Local'>curval</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="clog.c.html#LN327"><span class='Ref_To_Local'>byteptr</span></a> <span class='Operator'>&GT;&GT; </span><a href="clog.c.html#LN326"><span class='Ref_To_Local'>bshift</span></a><span class='Parentheses'>) </span><span class='Operator'>& </span><a href="clog.c.html#LN59"><span class='Ref_to_Const'>CLOG_XACT_BITMASK</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * When replaying transactions during recovery we still need to perform 
+     * the two phases of subcommit and then commit. However, some transactions 
+     * are already correctly marked, so we just treat those as a no-op which 
+     * allows us to keep the following Assert as restrictive as possible. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="xlog.c.html#LN191"><span class='Ref_to_Global_Var'>InRecovery</span></a> <span class='Operator'>&& </span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN28"><span class='Ref_to_Const'>TRANSACTION_STATUS_SUB_COMMITTED</span></a> <span class='Operator'>&& 
+</span>        <a href="clog.c.html#LN329"><span class='Ref_To_Local'>curval</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN26"><span class='Ref_to_Const'>TRANSACTION_STATUS_COMMITTED</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Current state change should be from 0 or subcommitted to target state 
+     * or we should already be there when replaying changes during recovery. 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="clog.c.html#LN329"><span class='Ref_To_Local'>curval</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| 
+</span>           <span class='Parentheses'>(</span><a href="clog.c.html#LN329"><span class='Ref_To_Local'>curval</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN28"><span class='Ref_to_Const'>TRANSACTION_STATUS_SUB_COMMITTED</span></a> <span class='Operator'>&& 
+</span>            <a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>!= </span><a href="../../../include/access/clog.h.html#LN25"><span class='Ref_to_Const'>TRANSACTION_STATUS_IN_PROGRESS</span></a><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>           <a href="clog.c.html#LN329"><span class='Ref_To_Local'>curval</span></a> <span class='Operator'>== </span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>status</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* note this assumes exclusive access to the clog page */ 
+</span>    <a href="clog.c.html#LN328"><span class='Ref_To_Local'>byteval</span></a> <span class='Operator'>= *</span><a href="clog.c.html#LN327"><span class='Ref_To_Local'>byteptr</span></a><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN328"><span class='Ref_To_Local'>byteval</span></a> <span class='Operator'>&= ~</span><span class='Parentheses'>(((</span><span class='Number'>1</span> <span class='Operator'>&LT;&LT; </span><a href="clog.c.html#LN56"><span class='Ref_to_Const'>CLOG_BITS_PER_XACT</span></a><span class='Parentheses'>) </span><span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>)</span> <span class='Operator'>&LT;&LT; </span><a href="clog.c.html#LN326"><span class='Ref_To_Local'>bshift</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN328"><span class='Ref_To_Local'>byteval</span></a> <span class='Operator'>|= </span><span class='Parentheses'>(</span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>status</span></a> <span class='Operator'>&LT;&LT; </span><a href="clog.c.html#LN326"><span class='Ref_To_Local'>bshift</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="clog.c.html#LN327"><span class='Ref_To_Local'>byteptr</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN328"><span class='Ref_To_Local'>byteval</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Update the group LSN if the transaction completion LSN is higher. 
+     * 
+     * Note: lsn will be invalid when supplied during InRecovery processing, 
+     * so we don't need to do anything special to avoid LSN updates during 
+     * recovery. After recovery completes the next clog change will set the 
+     * LSN correctly. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xlogdefs.h.html#LN28"><span class='Ref_to_Macro'>XLogRecPtrIsInvalid</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>lsn</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN369"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>lsnindex</span> <span class='Operator'>= </span><a href="clog.c.html#LN70"><span class='Ref_to_Macro'>GetLSNIndex</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>slotno</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>group_lsn<span class='Delimiter'>[</span><a href="clog.c.html#LN369"><span class='Ref_To_Local'>lsnindex</span></a><span class='Delimiter'>] </span><span class='Operator'>&LT; </span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>lsn</span></a><span class='Parentheses'>) 
+</span>            <a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>group_lsn<span class='Delimiter'>[</span><a href="clog.c.html#LN369"><span class='Ref_To_Local'>lsnindex</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="clog.c.html#LN323"><span class='Ref_to_Parameter'>lsn</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end TransactionIdSetStatusBit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Interrogate the state of a transaction in the commit log. 
+ * 
+ * Aside from the actual commit status, this function returns (into *lsn) 
+ * an LSN that is late enough to be able to guarantee that if we flush up to 
+ * that LSN then we will have flushed the transaction's commit record to disk. 
+ * The result is not necessarily the exact LSN of the transaction's commit 
+ * record!  For example, for long-past transactions (those whose clog pages 
+ * already migrated to disk), we'll return InvalidXLogRecPtr.  Also, because 
+ * we group transactions on the same clog page to conserve storage, we might 
+ * return the LSN of a later transaction that falls into the same group. 
+ * 
+ * NB: this is a low-level routine and is NOT the preferred entry point 
+ * for most uses; TransactionLogFetch() in transam.c is the intended caller. 
+ */ 
+</span><a href="../../../include/access/clog.h.html#LN23"><span class='Ref_to_Typedef'>XidStatus</span></a> 
+<a name="LN392"></a><span class='Declare_Function'>TransactionIdGetStatus</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>xid</span><span class='Delimiter'>, </span><a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>lsn</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN394"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN392"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN395"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>byteno</span> <span class='Operator'>= </span><a href="clog.c.html#LN63"><span class='Ref_to_Macro'>TransactionIdToByte</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN392"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN396"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>bshift</span> <span class='Operator'>= </span><a href="clog.c.html#LN64"><span class='Ref_to_Macro'>TransactionIdToBIndex</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN392"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="clog.c.html#LN56"><span class='Ref_to_Const'>CLOG_BITS_PER_XACT</span></a><span class='Delimiter'>; 
+</span><a name="LN397"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span><a name="LN398"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>lsnindex</span><span class='Delimiter'>; 
+</span><a name="LN399"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>byteptr</span><span class='Delimiter'>; 
+</span><a name="LN400"></a>    <a href="../../../include/access/clog.h.html#LN23"><span class='Ref_to_Typedef'>XidStatus</span></a>   <span class='Declare_Local'>status</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* lock is acquired by SimpleLruReadPage_ReadOnly */ 
+</span> 
+    <a href="clog.c.html#LN397"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="../../../include/access/slru.h.html#LN149"><span class='Ref_to_Proto'>SimpleLruReadPage_ReadOnly</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN394"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN392"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN399"><span class='Ref_To_Local'>byteptr</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_buffer<span class='Delimiter'>[</span><a href="clog.c.html#LN397"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>+ </span><a href="clog.c.html#LN395"><span class='Ref_To_Local'>byteno</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="clog.c.html#LN400"><span class='Ref_To_Local'>status</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="clog.c.html#LN399"><span class='Ref_To_Local'>byteptr</span></a> <span class='Operator'>&GT;&GT; </span><a href="clog.c.html#LN396"><span class='Ref_To_Local'>bshift</span></a><span class='Parentheses'>) </span><span class='Operator'>& </span><a href="clog.c.html#LN59"><span class='Ref_to_Const'>CLOG_XACT_BITMASK</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="clog.c.html#LN398"><span class='Ref_To_Local'>lsnindex</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN70"><span class='Ref_to_Macro'>GetLSNIndex</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN397"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN392"><span class='Ref_to_Parameter'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="clog.c.html#LN392"><span class='Ref_to_Parameter'>lsn</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>group_lsn<span class='Delimiter'>[</span><a href="clog.c.html#LN398"><span class='Ref_To_Local'>lsnindex</span></a><span class='Delimiter'>]; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="clog.c.html#LN400"><span class='Ref_To_Local'>status</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TransactionIdGetStatus &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Number of shared CLOG buffers. 
+ * 
+ * On larger multi-processor systems, it is possible to have many CLOG page 
+ * requests in flight at one time which could lead to disk access for CLOG 
+ * page if the required page is not found in memory.  Testing revealed that we 
+ * can get the best performance by having 128 CLOG buffers, more than that it 
+ * doesn't improve performance. 
+ * 
+ * Unconditionally keeping the number of CLOG buffers to 128 did not seem like 
+ * a good idea, because it would increase the minimum amount of shared memory 
+ * required to start, which could be a problem for people running very small 
+ * configurations.  The following formula seems to represent a reasonable 
+ * compromise: people with very low values for shared_buffers will get fewer 
+ * CLOG buffers as well, and everyone else will get 128. 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN434"></a><span class='Declare_Function'>CLOGShmemBuffers</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><span class='Number'>128</span><span class='Delimiter'>, </span><a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN10"><span class='Ref_to_Macro'>Max</span></a><span class='Parentheses'>(</span><span class='Number'>4</span><span class='Delimiter'>, </span><a href="../../utils/init/globals.c.html#LN122"><span class='Ref_to_Global_Var'>NBuffers</span></a> <span class='Operator'>/ </span><span class='Number'>512</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialization of shared memory for CLOG 
+ */ 
+</span><a href="../../../include/c.h.html#LN355"><span class='Ref_to_Typedef'>Size</span></a> 
+<a name="LN443"></a><span class='Declare_Function'>CLOGShmemSize</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="slru.c.html#LN143"><span class='Ref_to_Func'>SimpleLruShmemSize</span></a><span class='Parentheses'>(</span><a href="../../../include/access/clog.h.html#LN41"><span class='Ref_to_Proto'>CLOGShmemBuffers</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><a href="clog.c.html#LN68"><span class='Ref_to_Const'>CLOG_LSNS_PER_PAGE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>void 
+</span><a name="LN449"></a><span class='Declare_Function'>CLOGShmemInit</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>PagePrecedes <span class='Operator'>= </span><a href="clog.c.html#LN83"><span class='Ref_to_Proto'>CLOGPagePrecedes</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/slru.h.html#LN144"><span class='Ref_to_Proto'>SimpleLruInit</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><span class='String'>"clog"</span><span class='Delimiter'>, </span><a href="../../../include/access/clog.h.html#LN41"><span class='Ref_to_Proto'>CLOGShmemBuffers</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, </span><a href="clog.c.html#LN68"><span class='Ref_to_Const'>CLOG_LSNS_PER_PAGE</span></a><span class='Delimiter'>, 
+</span>                  CLogControlLock<span class='Delimiter'>, </span><span class='String'>"pg_xact"</span><span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN197"><span class='Ref_to_EnumConst'>LWTRANCHE_CLOG_BUFFERS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * This func must be called ONCE on system install.  It creates 
+ * the initial CLOG segment.  (The CLOG directory is assumed to 
+ * have been created by initdb, and CLOGShmemInit must have been 
+ * called already.) 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN463"></a><span class='Declare_Function'>BootStrapCLOG</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN465"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Create and zero the first page of the commit log */ 
+</span>    <a href="clog.c.html#LN465"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN82"><span class='Ref_to_Proto'>ZeroCLOGPage</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Make sure it's written out */ 
+</span>    <a href="../../../include/access/slru.h.html#LN151"><span class='Ref_to_Proto'>SimpleLruWritePage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN465"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_dirty<span class='Delimiter'>[</span><a href="clog.c.html#LN465"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize (or reinitialize) a page of CLOG to zeroes. 
+ * If writeXlog is TRUE, also emit an XLOG record saying we did this. 
+ * 
+ * The page is not actually written, just set up in shared memory. 
+ * The slot number of the new page is returned. 
+ * 
+ * Control lock must be held at entry, and will be held at exit. 
+ */ 
+</span><span class='Keyword'>static int 
+</span><a name="LN489"></a><span class='Declare_Function'>ZeroCLOGPage</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>writeXlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN491"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span> 
+    <a href="clog.c.html#LN491"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="../../../include/access/slru.h.html#LN146"><span class='Ref_to_Proto'>SimpleLruZeroPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN489"><span class='Ref_to_Parameter'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN489"><span class='Ref_to_Parameter'>writeXlog</span></a><span class='Parentheses'>) 
+</span>        <a href="clog.c.html#LN84"><span class='Ref_to_Proto'>WriteZeroPageXlogRec</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN489"><span class='Ref_to_Parameter'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="clog.c.html#LN491"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * This must be called ONCE during postmaster or standalone-backend startup, 
+ * after StartupXLOG has initialized ShmemVariableCache-&GT;nextXid. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN506"></a><span class='Declare_Function'>StartupCLOG</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN508"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid</span> <span class='Operator'>= </span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN116"><span class='Ref_to_Member'>nextXid</span></a><span class='Delimiter'>; 
+</span><a name="LN509"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN508"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Initialize our idea of the latest page number. 
+     */ 
+</span>    <a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>latest_page_number <span class='Operator'>= </span><a href="clog.c.html#LN509"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * This must be called ONCE at the end of startup/recovery. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN525"></a><span class='Declare_Function'>TrimCLOG</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN527"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid</span> <span class='Operator'>= </span><a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN116"><span class='Ref_to_Member'>nextXid</span></a><span class='Delimiter'>; 
+</span><a name="LN528"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN527"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Re-Initialize our idea of the latest page number. 
+     */ 
+</span>    <a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>latest_page_number <span class='Operator'>= </span><a href="clog.c.html#LN528"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Zero out the remainder of the current clog page.  Under normal 
+     * circumstances it should be zeroes already, but it seems at least 
+     * theoretically possible that XLOG replay will have settled on a nextXID 
+     * value that is less than the last XID actually used and marked by the 
+     * previous database lifecycle (since subtransaction commit writes clog 
+     * but makes no WAL entry).  Let's just be safe. (We need not worry about 
+     * pages beyond the current one, since those will be zeroed when first 
+     * used.  For the same reason, there is no need to do anything when 
+     * nextXid is exactly at a page boundary; and it's likely that the 
+     * "current" page doesn't exist yet in that case.) 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN62"><span class='Ref_to_Macro'>TransactionIdToPgIndex</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN527"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN551"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>byteno</span> <span class='Operator'>= </span><a href="clog.c.html#LN63"><span class='Ref_to_Macro'>TransactionIdToByte</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN527"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN552"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>bshift</span> <span class='Operator'>= </span><a href="clog.c.html#LN64"><span class='Ref_to_Macro'>TransactionIdToBIndex</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN527"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="clog.c.html#LN56"><span class='Ref_to_Const'>CLOG_BITS_PER_XACT</span></a><span class='Delimiter'>; 
+</span><a name="LN553"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span><a name="LN554"></a>        <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>byteptr</span><span class='Delimiter'>; 
+</span> 
+        <a href="clog.c.html#LN553"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="../../../include/access/slru.h.html#LN147"><span class='Ref_to_Proto'>SimpleLruReadPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN528"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Delimiter'>, </span><a href="clog.c.html#LN527"><span class='Ref_To_Local'>xid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="clog.c.html#LN554"><span class='Ref_To_Local'>byteptr</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_buffer<span class='Delimiter'>[</span><a href="clog.c.html#LN553"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>+ </span><a href="clog.c.html#LN551"><span class='Ref_To_Local'>byteno</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Zero so-far-unused positions in the current byte */ 
+</span>        <span class='Operator'>*</span><a href="clog.c.html#LN554"><span class='Ref_To_Local'>byteptr</span></a> <span class='Operator'>&= </span><span class='Parentheses'>(</span><span class='Number'>1</span> <span class='Operator'>&LT;&LT; </span><a href="clog.c.html#LN552"><span class='Ref_To_Local'>bshift</span></a><span class='Parentheses'>) </span><span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>        <span class='Comment_Multi_Line'>/* Zero the rest of the page */ 
+</span>        <a href="../../../include/c.h.html#LN856"><span class='Ref_to_Macro'>MemSet</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN554"><span class='Ref_To_Local'>byteptr</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span>BLCKSZ <span class='Operator'>- </span><a href="clog.c.html#LN551"><span class='Ref_To_Local'>byteno</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_dirty<span class='Delimiter'>[</span><a href="clog.c.html#LN553"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TrimCLOG &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * This must be called ONCE during postmaster or standalone-backend shutdown 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN574"></a><span class='Declare_Function'>ShutdownCLOG</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Flush dirty CLOG pages to disk */ 
+</span>    TRACE_POSTGRESQL_CLOG_CHECKPOINT_START<span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/slru.h.html#LN152"><span class='Ref_to_Proto'>SimpleLruFlush</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * fsync pg_xact to ensure that any files flushed previously are durably 
+     * on disk. 
+     */ 
+</span>    <a href="../../../include/common/file_utils.h.html#LN17"><span class='Ref_to_Proto'>fsync_fname</span></a><span class='Parentheses'>(</span><span class='String'>"pg_xact"</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    TRACE_POSTGRESQL_CLOG_CHECKPOINT_DONE<span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Perform a checkpoint --- either during shutdown, or on-the-fly 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN593"></a><span class='Declare_Function'>CheckPointCLOG</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Flush dirty CLOG pages to disk */ 
+</span>    TRACE_POSTGRESQL_CLOG_CHECKPOINT_START<span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/slru.h.html#LN152"><span class='Ref_to_Proto'>SimpleLruFlush</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * fsync pg_xact to ensure that any files flushed previously are durably 
+     * on disk. 
+     */ 
+</span>    <a href="../../../include/common/file_utils.h.html#LN17"><span class='Ref_to_Proto'>fsync_fname</span></a><span class='Parentheses'>(</span><span class='String'>"pg_xact"</span><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    TRACE_POSTGRESQL_CLOG_CHECKPOINT_DONE<span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Make sure that CLOG has room for a newly-allocated XID. 
+ * 
+ * NB: this is called while holding XidGenLock.  We want it to be very fast 
+ * most of the time; even when it's not so fast, no actual I/O need happen 
+ * unless we're forced to write out a dirty clog or xlog page to make room 
+ * in shared memory. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN618"></a><span class='Declare_Function'>ExtendCLOG</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>newestXact</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN620"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * No work except at first XID of a page.  But beware: just after 
+     * wraparound, the first XID of page zero is FirstNormalTransactionId. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN62"><span class='Ref_to_Macro'>TransactionIdToPgIndex</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN618"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>&& 
+</span>        <span class='Operator'>!</span><a href="../../../include/access/transam.h.html#LN42"><span class='Ref_to_Macro'>TransactionIdEquals</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN618"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Delimiter'>, </span><a href="../../../include/access/transam.h.html#LN33"><span class='Ref_to_Const'>FirstNormalTransactionId</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <a href="clog.c.html#LN620"><span class='Ref_To_Local'>pageno</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN618"><span class='Ref_to_Parameter'>newestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Zero the page and make an XLOG entry about it */ 
+</span>    <a href="clog.c.html#LN82"><span class='Ref_to_Proto'>ZeroCLOGPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN620"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExtendCLOG &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Remove all CLOG segments before the one holding the passed transaction ID 
+ * 
+ * Before removing any CLOG data, we must flush XLOG to disk, to ensure 
+ * that any recently-emitted HEAP_FREEZE records have reached disk; otherwise 
+ * a crash and restart might leave us with some unfrozen tuples referencing 
+ * removed CLOG data.  We choose to emit a special TRUNCATE XLOG record too. 
+ * Replaying the deletion from XLOG is not critical, since the files could 
+ * just as well be removed later, but doing so prevents a long-running hot 
+ * standby server from acquiring an unreasonably bloated CLOG directory. 
+ * 
+ * Since CLOG segments hold a large number of transactions, the opportunity to 
+ * actually remove a segment is fairly rare, and so it seems best not to do 
+ * the XLOG flush unless we have confirmed that there is a removable segment. 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN657"></a><span class='Declare_Function'>TruncateCLOG</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestXact</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>oldestxid_datoid</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN659"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>cutoffPage</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The cutoff point is the start of the segment containing oldestXact. We 
+     * pass the *page* containing oldestXact to SimpleLruTruncate. 
+     */ 
+</span>    <a href="clog.c.html#LN659"><span class='Ref_To_Local'>cutoffPage</span></a> <span class='Operator'>= </span><a href="subtrans.c.html#LN53"><span class='Ref_to_Macro'>TransactionIdToPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN657"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Check to see if there's any files that could be removed */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/slru.h.html#LN158"><span class='Ref_to_Proto'>SlruScanDirectory</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><a href="../../../include/access/slru.h.html#LN162"><span class='Ref_to_Proto'>SlruScanDirCbReportPresence</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="clog.c.html#LN659"><span class='Ref_To_Local'>cutoffPage</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span><span class='Delimiter'>;</span>                 <span class='Comment_Single_Line'>/* nothing to remove */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Advance oldestClogXid before truncating clog, so concurrent xact status 
+     * lookups can ensure they don't attempt to access truncated-away clog. 
+     * 
+     * It's only necessary to do this if we will actually truncate away clog 
+     * pages. 
+     */ 
+</span>    <a href="../../../include/access/transam.h.html#LN181"><span class='Ref_to_Proto'>AdvanceOldestClogXid</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN657"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* vac_truncate_clog already advanced oldestXid */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/transam.h.html#LN169"><span class='Ref_to_Proto'>TransactionIdPrecedesOrEquals</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN657"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Delimiter'>, 
+</span>                                         <a href="varsup.c.html#LN33"><span class='Ref_to_Global_Var'>ShmemVariableCache</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/transam.h.html#LN118"><span class='Ref_to_Member'>oldestXid</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Write XLOG record and flush XLOG to disk. We record the oldest xid 
+     * we're keeping information about here so we can ensure that it's always 
+     * ahead of clog truncation in case we crash, and so a standby finds out 
+     * the new valid xid before the next checkpoint. 
+     */ 
+</span>    <a href="clog.c.html#LN85"><span class='Ref_to_Proto'>WriteTruncateXlogRec</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN659"><span class='Ref_To_Local'>cutoffPage</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN657"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN657"><span class='Ref_to_Parameter'>oldestxid_datoid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now we can remove the old CLOG segment(s) */ 
+</span>    <a href="../../../include/access/slru.h.html#LN153"><span class='Ref_to_Proto'>SimpleLruTruncate</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN659"><span class='Ref_To_Local'>cutoffPage</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TruncateCLOG &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Decide which of two CLOG page numbers is "older" for truncation purposes. 
+ * 
+ * We need to use comparison of TransactionIds here in order to do the right 
+ * thing with wraparound XID arithmetic.  However, if we are asked about 
+ * page number zero, we don't want to hand InvalidTransactionId to 
+ * TransactionIdPrecedes: it'll get weird about permanent xact IDs.  So, 
+ * offset both xids by FirstNormalTransactionId to avoid that. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN707"></a><span class='Declare_Function'>CLOGPagePrecedes</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>page1</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>page2</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN709"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid1</span><span class='Delimiter'>; 
+</span><a name="LN710"></a>    <a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Local'>xid2</span><span class='Delimiter'>; 
+</span> 
+    <a href="clog.c.html#LN709"><span class='Ref_To_Local'>xid1</span></a> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="clog.c.html#LN707"><span class='Ref_to_Parameter'>page1</span></a><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="clog.c.html#LN58"><span class='Ref_to_Const'>CLOG_XACTS_PER_PAGE</span></a><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN709"><span class='Ref_To_Local'>xid1</span></a> <span class='Operator'>+= </span><a href="../../../include/access/transam.h.html#LN33"><span class='Ref_to_Const'>FirstNormalTransactionId</span></a><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN710"><span class='Ref_To_Local'>xid2</span></a> <span class='Operator'>= </span><span class='Parentheses'>((</span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a><span class='Parentheses'>) </span><a href="clog.c.html#LN707"><span class='Ref_to_Parameter'>page2</span></a><span class='Parentheses'>)</span> <span class='Operator'>* </span><a href="clog.c.html#LN58"><span class='Ref_to_Const'>CLOG_XACTS_PER_PAGE</span></a><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN710"><span class='Ref_To_Local'>xid2</span></a> <span class='Operator'>+= </span><a href="../../../include/access/transam.h.html#LN33"><span class='Ref_to_Const'>FirstNormalTransactionId</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../../include/access/transam.h.html#LN168"><span class='Ref_to_Proto'>TransactionIdPrecedes</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN709"><span class='Ref_To_Local'>xid1</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN710"><span class='Ref_To_Local'>xid2</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Write a ZEROPAGE xlog record 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN725"></a><span class='Declare_Function'>WriteZeroPageXlogRec</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) (</span><span class='Operator'>&</span><a href="clog.c.html#LN725"><span class='Ref_to_Parameter'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_CLOG_ID<span class='Delimiter'>, </span><a href="../../../include/access/clog.h.html#LN53"><span class='Ref_to_Const'>CLOG_ZEROPAGE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Write a TRUNCATE xlog record 
+ * 
+ * We must flush the xlog record to disk before returning --- see notes 
+ * in TruncateCLOG(). 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN739"></a><span class='Declare_Function'>WriteTruncateXlogRec</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>pageno</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN396"><span class='Ref_to_Typedef'>TransactionId</span></a> <span class='Declare_Parameter'>oldestXact</span><span class='Delimiter'>, </span><a href="../../../include/postgres_ext.h.html#LN30"><span class='Ref_to_Typedef'>Oid</span></a> <span class='Declare_Parameter'>oldestXactDb</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN741"></a>    <a href="../../../include/access/xlogdefs.h.html#LN20"><span class='Ref_to_Typedef'>XLogRecPtr</span></a>  <span class='Declare_Local'>recptr</span><span class='Delimiter'>; 
+</span><a name="LN742"></a>    <a href="../../../include/access/clog.h.html#LN30"><span class='Ref_to_Struct'>xl_clog_truncate</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span> 
+    <a href="clog.c.html#LN742"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/clog.h.html#LN32"><span class='Ref_to_Member'>pageno</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN739"><span class='Ref_to_Parameter'>pageno</span></a><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN742"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/clog.h.html#LN33"><span class='Ref_to_Member'>oldestXact</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN739"><span class='Ref_to_Parameter'>oldestXact</span></a><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN742"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/clog.h.html#LN34"><span class='Ref_to_Member'>oldestXactDb</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN739"><span class='Ref_to_Parameter'>oldestXactDb</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/access/xloginsert.h.html#LN41"><span class='Ref_to_Proto'>XLogBeginInsert</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xloginsert.h.html#LN45"><span class='Ref_to_Proto'>XLogRegisterData</span></a><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) (</span><span class='Operator'>&</span><a href="clog.c.html#LN742"><span class='Ref_To_Local'>xlrec</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/clog.h.html#LN30"><span class='Ref_to_Struct'>xl_clog_truncate</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="clog.c.html#LN741"><span class='Ref_To_Local'>recptr</span></a> <span class='Operator'>= </span><a href="../../../include/access/xloginsert.h.html#LN43"><span class='Ref_to_Proto'>XLogInsert</span></a><span class='Parentheses'>(</span>RM_CLOG_ID<span class='Delimiter'>, </span><a href="../../../include/access/clog.h.html#LN54"><span class='Ref_to_Const'>CLOG_TRUNCATE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/xlog.h.html#LN225"><span class='Ref_to_Proto'>XLogFlush</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN741"><span class='Ref_To_Local'>recptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * CLOG resource manager's routines 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN758"></a><span class='Declare_Function'>clog_redo</span><span class='Parentheses'>(</span><a href="../../../include/access/xlogreader.h.html#LN68"><span class='Ref_to_Struct'>XLogReaderState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>record</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN760"></a>    <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Local'>info</span> <span class='Operator'>= </span><a href="../../../include/access/xlogreader.h.html#LN215"><span class='Ref_to_Macro'>XLogRecGetInfo</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN758"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>) </span><span class='Operator'>& ~</span><a href="../../../include/access/xlogrecord.h.html#LN61"><span class='Ref_to_Const'>XLR_INFO_MASK</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Backup blocks are not used in clog records */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/xlogreader.h.html#LN221"><span class='Ref_to_Macro'>XLogRecHasAnyBlockRefs</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN758"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN760"><span class='Ref_To_Local'>info</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN53"><span class='Ref_to_Const'>CLOG_ZEROPAGE</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN767"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>pageno</span><span class='Delimiter'>; 
+</span><a name="LN768"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>slotno</span><span class='Delimiter'>; 
+</span> 
+        memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="clog.c.html#LN767"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlogreader.h.html#LN219"><span class='Ref_to_Macro'>XLogRecGetData</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN758"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN145"><span class='Ref_to_Proto'>LWLockAcquire</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Delimiter'>, </span><a href="../../../include/storage/lwlock.h.html#LN133"><span class='Ref_to_EnumConst'>LW_EXCLUSIVE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="clog.c.html#LN768"><span class='Ref_To_Local'>slotno</span></a> <span class='Operator'>= </span><a href="clog.c.html#LN82"><span class='Ref_to_Proto'>ZeroCLOGPage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN767"><span class='Ref_To_Local'>pageno</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/access/slru.h.html#LN151"><span class='Ref_to_Proto'>SimpleLruWritePage</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN768"><span class='Ref_To_Local'>slotno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>page_dirty<span class='Delimiter'>[</span><a href="clog.c.html#LN768"><span class='Ref_To_Local'>slotno</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/storage/lwlock.h.html#LN148"><span class='Ref_to_Proto'>LWLockRelease</span></a><span class='Parentheses'>(</span>CLogControlLock<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="clog.c.html#LN760"><span class='Ref_To_Local'>info</span></a> <span class='Operator'>== </span><a href="../../../include/access/clog.h.html#LN54"><span class='Ref_to_Const'>CLOG_TRUNCATE</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN782"></a>        <a href="../../../include/access/clog.h.html#LN30"><span class='Ref_to_Struct'>xl_clog_truncate</span></a> <span class='Declare_Local'>xlrec</span><span class='Delimiter'>; 
+</span> 
+        memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="clog.c.html#LN782"><span class='Ref_To_Local'>xlrec</span></a><span class='Delimiter'>, </span><a href="../../../include/access/xlogreader.h.html#LN219"><span class='Ref_to_Macro'>XLogRecGetData</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN758"><span class='Ref_to_Parameter'>record</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/clog.h.html#LN30"><span class='Ref_to_Struct'>xl_clog_truncate</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * During XLOG replay, latest_page_number isn't set up yet; insert a 
+         * suitable value to bypass the sanity test in SimpleLruTruncate. 
+         */ 
+</span>        <a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Operator'>-&GT;</span>shared<span class='Operator'>-&GT;</span>latest_page_number <span class='Operator'>= </span><a href="clog.c.html#LN782"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/clog.h.html#LN32"><span class='Ref_to_Member'>pageno</span></a><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/transam.h.html#LN181"><span class='Ref_to_Proto'>AdvanceOldestClogXid</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN782"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/clog.h.html#LN33"><span class='Ref_to_Member'>oldestXact</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../../include/access/slru.h.html#LN153"><span class='Ref_to_Proto'>SimpleLruTruncate</span></a><span class='Parentheses'>(</span><a href="clog.c.html#LN79"><span class='Ref_to_Const'>ClogCtl</span></a><span class='Delimiter'>, </span><a href="clog.c.html#LN782"><span class='Ref_To_Local'>xlrec</span></a><span class='Operator'>.</span><a href="../../../include/access/clog.h.html#LN32"><span class='Ref_to_Member'>pageno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/utils/elog.h.html#LN52"><span class='Ref_to_Const'>PANIC</span></a><span class='Delimiter'>, </span><span class='String'>"clog_redo: unknown op code %u"</span><span class='Delimiter'>, </span><a href="clog.c.html#LN760"><span class='Ref_To_Local'>info</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end clog_redo &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

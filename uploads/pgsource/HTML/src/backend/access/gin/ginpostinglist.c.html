@@ -1,0 +1,446 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\access\gin\ginpostinglist.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\access\gin\ginpostinglist.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:28 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * ginpostinglist.c 
+ *    routines for dealing with posting lists. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * IDENTIFICATION 
+ *          src/backend/access/gin/ginpostinglist.c 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/gin_private.h"</span> 
+ 
+<span class='Directive'>#ifdef</span> USE_ASSERT_CHECKING 
+<a name="LN19"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>CHECK_ENCODING_ROUNDTRIP</span> 
+<span class='Directive'>#endif</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * For encoding purposes, item pointers are represented as 64-bit unsigned 
+ * integers. The lowest 11 bits represent the offset number, and the next 
+ * lowest 32 bits are the block number. That leaves 17 bits unused, i.e. 
+ * only 43 low bits are used. 
+ * 
+ * These 43-bit integers are encoded using varbyte encoding. In each byte, 
+ * the 7 low bits contain data, while the highest bit is a continuation bit. 
+ * When the continuation bit is set, the next byte is part of the same 
+ * integer, otherwise this is the last byte of this integer.  43 bits fit 
+ * conveniently in at most 6 bytes when varbyte encoded (the 6th byte does 
+ * not need a continuation bit, because we know the max size to be 43 bits): 
+ * 
+ * 0XXXXXXX 
+ * 1XXXXXXX 0XXXXYYY 
+ * 1XXXXXXX 1XXXXYYY 0YYYYYYY 
+ * 1XXXXXXX 1XXXXYYY 1YYYYYYY 0YYYYYYY 
+ * 1XXXXXXX 1XXXXYYY 1YYYYYYY 1YYYYYYY 0YYYYYYY 
+ * 1XXXXXXX 1XXXXYYY 1YYYYYYY 1YYYYYYY 1YYYYYYY YYYYYYYY 
+ * 
+ * X = bits used for offset number 
+ * Y = bits used for block number 
+ * 
+ * The bytes are in stored in little-endian order. 
+ * 
+ * An important property of this encoding is that removing an item from list 
+ * never increases the size of the resulting compressed posting list. Proof: 
+ * 
+ * Removing number is actually replacement of two numbers with their sum. We 
+ * have to prove that varbyte encoding of a sum can't be longer than varbyte 
+ * encoding of its summands. Sum of two numbers is at most one bit wider than 
+ * the larger of the summands. Widening a number by one bit enlarges its length 
+ * in varbyte encoding by at most one byte. Therefore, varbyte encoding of sum 
+ * is at most one byte longer than varbyte encoding of larger summand. Lesser 
+ * summand is at least one byte, so the sum cannot take more space than the 
+ * summands, Q.E.D. 
+ * 
+ * This property greatly simplifies VACUUM, which can assume that posting 
+ * lists always fit on the same page after vacuuming. Note that even though 
+ * that holds for removing items from a posting list, you must also be 
+ * careful to not cause expansion e.g. when merging uncompressed items on the 
+ * page into the compressed lists, when vacuuming. 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * How many bits do you need to encode offset number? OffsetNumber is a 16-bit 
+ * integer, but you can't fit that many items on a page. 11 ought to be more 
+ * than enough. It's tempting to derive this from MaxHeapTuplesPerPage, and 
+ * use the minimum number of bits, but that would require changing the on-disk 
+ * format if MaxHeapTuplesPerPage changes. Better to leave some slack. 
+ */ 
+</span><a name="LN73"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MaxHeapTuplesPerPageBits</span>        <span class='Number'>11</span> 
+ 
+<span class='Keyword'>static inline </span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a> 
+<a name="LN76"></a><span class='Declare_Function'>itemptr_to_uint64</span><span class='Parentheses'>(</span><span class='Keyword'>const </span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>iptr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN78"></a>    <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>val</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN76"><span class='Ref_to_Parameter'>iptr</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/ginblock.h.html#LN136"><span class='Ref_to_Macro'>GinItemPointerGetOffsetNumber</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN76"><span class='Ref_to_Parameter'>iptr</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Parentheses'>(</span><span class='Number'>1</span> <span class='Operator'>&LT;&LT; </span><a href="ginpostinglist.c.html#LN73"><span class='Ref_to_Const'>MaxHeapTuplesPerPageBits</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="ginpostinglist.c.html#LN78"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>= </span><a href="../../../include/access/ginblock.h.html#LN133"><span class='Ref_to_Macro'>GinItemPointerGetBlockNumber</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN76"><span class='Ref_to_Parameter'>iptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="ginpostinglist.c.html#LN78"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>&LT;&LT;= </span><a href="ginpostinglist.c.html#LN73"><span class='Ref_to_Const'>MaxHeapTuplesPerPageBits</span></a><span class='Delimiter'>; 
+</span>    <a href="ginpostinglist.c.html#LN78"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>|= </span><a href="../../../include/access/ginblock.h.html#LN136"><span class='Ref_to_Macro'>GinItemPointerGetOffsetNumber</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN76"><span class='Ref_to_Parameter'>iptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="ginpostinglist.c.html#LN78"><span class='Ref_To_Local'>val</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Keyword'>static inline void 
+</span><a name="LN91"></a><span class='Declare_Function'>uint64_to_itemptr</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a> <span class='Declare_Parameter'>val</span><span class='Delimiter'>, </span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>iptr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../../include/access/ginblock.h.html#LN142"><span class='Ref_to_Macro'>GinItemPointerSetOffsetNumber</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN91"><span class='Ref_to_Parameter'>iptr</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN91"><span class='Ref_to_Parameter'>val</span></a> <span class='Operator'>& </span><span class='Parentheses'>((</span><span class='Number'>1</span> <span class='Operator'>&LT;&LT; </span><a href="ginpostinglist.c.html#LN73"><span class='Ref_to_Const'>MaxHeapTuplesPerPageBits</span></a><span class='Parentheses'>) </span><span class='Operator'>- </span><span class='Number'>1</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="ginpostinglist.c.html#LN91"><span class='Ref_to_Parameter'>val</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN91"><span class='Ref_to_Parameter'>val</span></a> <span class='Operator'>&GT;&GT; </span><a href="ginpostinglist.c.html#LN73"><span class='Ref_to_Const'>MaxHeapTuplesPerPageBits</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/ginblock.h.html#LN139"><span class='Ref_to_Macro'>GinItemPointerSetBlockNumber</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN91"><span class='Ref_to_Parameter'>iptr</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN91"><span class='Ref_to_Parameter'>val</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN58"><span class='Ref_to_Macro'>ItemPointerIsValid</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN91"><span class='Ref_to_Parameter'>iptr</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Varbyte-encode 'val' into *ptr. *ptr is incremented to next integer. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN104"></a><span class='Declare_Function'>encode_varbyte</span><span class='Parentheses'>(</span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a> <span class='Declare_Parameter'>val</span><span class='Delimiter'>, </span><span class='Keyword'>unsigned char </span><span class='Operator'>**</span><span class='Declare_Parameter'>ptr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN106"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>p</span> <span class='Operator'>= *</span><a href="ginpostinglist.c.html#LN104"><span class='Ref_to_Parameter'>ptr</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN104"><span class='Ref_to_Parameter'>val</span></a> <span class='Operator'>&GT; </span><span class='Number'>0x7F</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Operator'>*</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN106"><span class='Ref_To_Local'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>) </span><span class='Operator'>= </span><span class='Number'>0x80</span> <span class='Operator'>| </span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN104"><span class='Ref_to_Parameter'>val</span></a> <span class='Operator'>& </span><span class='Number'>0x7F</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="ginpostinglist.c.html#LN104"><span class='Ref_to_Parameter'>val</span></a> <span class='Operator'>&GT;&GT;= </span><span class='Number'>7</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Operator'>*</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN106"><span class='Ref_To_Local'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>) </span><span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>unsigned char</span><span class='Parentheses'>) </span><a href="ginpostinglist.c.html#LN104"><span class='Ref_to_Parameter'>val</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN104"><span class='Ref_to_Parameter'>ptr</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN106"><span class='Ref_To_Local'>p</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Decode varbyte-encoded integer at *ptr. *ptr is incremented to next integer. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a> 
+<a name="LN122"></a><span class='Declare_Function'>decode_varbyte</span><span class='Parentheses'>(</span><span class='Keyword'>unsigned char </span><span class='Operator'>**</span><span class='Declare_Parameter'>ptr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN124"></a>    <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>val</span><span class='Delimiter'>; 
+</span><a name="LN125"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>p</span> <span class='Operator'>= *</span><a href="ginpostinglist.c.html#LN122"><span class='Ref_to_Parameter'>ptr</span></a><span class='Delimiter'>; 
+</span><a name="LN126"></a>    <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>c</span><span class='Delimiter'>; 
+</span> 
+    <a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>= *</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN125"><span class='Ref_To_Local'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="ginpostinglist.c.html#LN124"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x7F</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x80</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>= *</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN125"><span class='Ref_To_Local'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="ginpostinglist.c.html#LN124"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>|= </span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x7F</span><span class='Parentheses'>) </span><span class='Operator'>&LT;&LT; </span><span class='Number'>7</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x80</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>= *</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN125"><span class='Ref_To_Local'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="ginpostinglist.c.html#LN124"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>|= </span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x7F</span><span class='Parentheses'>) </span><span class='Operator'>&LT;&LT; </span><span class='Number'>14</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x80</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>= *</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN125"><span class='Ref_To_Local'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="ginpostinglist.c.html#LN124"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>|= </span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x7F</span><span class='Parentheses'>) </span><span class='Operator'>&LT;&LT; </span><span class='Number'>21</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x80</span><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>= *</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN125"><span class='Ref_To_Local'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="ginpostinglist.c.html#LN124"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>|= </span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x7F</span><span class='Parentheses'>) </span><span class='Operator'>&LT;&LT; </span><span class='Number'>28</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x80</span><span class='Parentheses'>) 
+</span>                    <span class='Delimiter'>{ 
+</span>                        <a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>= *</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN125"><span class='Ref_To_Local'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                        <a href="ginpostinglist.c.html#LN124"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>|= </span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x7F</span><span class='Parentheses'>) </span><span class='Operator'>&LT;&LT; </span><span class='Number'>35</span><span class='Delimiter'>; 
+</span>                        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>& </span><span class='Number'>0x80</span><span class='Parentheses'>) 
+</span>                        <span class='Delimiter'>{ 
+</span>                            <span class='Comment_Multi_Line'>/* last byte, no continuation bit */ 
+</span>                            <a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>= *</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN125"><span class='Ref_To_Local'>p</span></a><span class='Operator'>++</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                            <a href="ginpostinglist.c.html#LN124"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>|= </span><a href="ginpostinglist.c.html#LN126"><span class='Ref_To_Local'>c</span></a> <span class='Operator'>&LT;&LT; </span><span class='Number'>42</span><span class='Delimiter'>; 
+</span>                        <span class='Delimiter'>} 
+</span>                    <span class='Delimiter'>} 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if c&0x80 &raquo; </span> 
+        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if c&0x80 &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if c&0x80 &raquo; </span> 
+ 
+    <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN122"><span class='Ref_to_Parameter'>ptr</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN125"><span class='Ref_To_Local'>p</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="ginpostinglist.c.html#LN124"><span class='Ref_To_Local'>val</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end decode_varbyte &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Encode a posting list. 
+ * 
+ * The encoded list is returned in a palloc'd struct, which will be at most 
+ * 'maxsize' bytes in size.  The number items in the returned segment is 
+ * returned in *nwritten. If it's not equal to nipd, not all the items fit 
+ * in 'maxsize', and only the first *nwritten were encoded. 
+ * 
+ * The allocated size of the returned struct is short-aligned, and the padding 
+ * byte at the end, if any, is zero. 
+ */ 
+</span><a href="../../../include/access/ginblock.h.html#LN325"><span class='Ref_to_Typedef'>GinPostingList</span></a> <span class='Operator'>* 
+</span><a name="LN179"></a><span class='Declare_Function'>ginCompressPostingList</span><span class='Parentheses'>(</span><span class='Keyword'>const </span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Parameter'>ipd</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nipd</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>maxsize</span><span class='Delimiter'>, 
+</span><a name="LN180"></a>                       <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>nwritten</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN182"></a>    <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>prev</span><span class='Delimiter'>; 
+</span><a name="LN183"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>totalpacked</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN184"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>maxbytes</span><span class='Delimiter'>; 
+</span><a name="LN185"></a>    <a href="../../../include/access/ginblock.h.html#LN325"><span class='Ref_to_Typedef'>GinPostingList</span></a> <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span><a name="LN186"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>ptr</span><span class='Delimiter'>; 
+</span><a name="LN187"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>endptr</span><span class='Delimiter'>; 
+</span> 
+    <a href="ginpostinglist.c.html#LN179"><span class='Ref_to_Parameter'>maxsize</span></a> <span class='Operator'>= </span><a href="../../../include/c.h.html#LN595"><span class='Ref_to_Macro'>SHORTALIGN_DOWN</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN179"><span class='Ref_to_Parameter'>maxsize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN179"><span class='Ref_to_Parameter'>maxsize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="ginpostinglist.c.html#LN184"><span class='Ref_To_Local'>maxbytes</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN179"><span class='Ref_to_Parameter'>maxsize</span></a> <span class='Operator'>- </span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="../../../include/access/ginblock.h.html#LN325"><span class='Ref_to_Typedef'>GinPostingList</span></a><span class='Delimiter'>, </span>bytes<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN184"><span class='Ref_To_Local'>maxbytes</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Store the first special item */ 
+</span>    <a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN327"><span class='Ref_to_Member'>first</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN179"><span class='Ref_to_Parameter'>ipd</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]; 
+</span> 
+    <a href="ginpostinglist.c.html#LN182"><span class='Ref_To_Local'>prev</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN75"><span class='Ref_to_Func'>itemptr_to_uint64</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN327"><span class='Ref_to_Member'>first</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="ginpostinglist.c.html#LN186"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN329"><span class='Ref_to_Member'>bytes</span></a><span class='Delimiter'>; 
+</span>    <a href="ginpostinglist.c.html#LN187"><span class='Ref_To_Local'>endptr</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN329"><span class='Ref_to_Member'>bytes</span></a> <span class='Operator'>+ </span><a href="ginpostinglist.c.html#LN184"><span class='Ref_To_Local'>maxbytes</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN183"><span class='Ref_To_Local'>totalpacked</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="ginpostinglist.c.html#LN183"><span class='Ref_To_Local'>totalpacked</span></a> <span class='Operator'>&LT; </span><a href="ginpostinglist.c.html#LN179"><span class='Ref_to_Parameter'>nipd</span></a><span class='Delimiter'>; </span><a href="ginpostinglist.c.html#LN183"><span class='Ref_To_Local'>totalpacked</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN205"></a>        <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>val</span> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN75"><span class='Ref_to_Func'>itemptr_to_uint64</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN179"><span class='Ref_to_Parameter'>ipd</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN183"><span class='Ref_To_Local'>totalpacked</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN206"></a>        <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>delta</span> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN205"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN182"><span class='Ref_To_Local'>prev</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN205"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>&GT; </span><a href="ginpostinglist.c.html#LN182"><span class='Ref_To_Local'>prev</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN187"><span class='Ref_To_Local'>endptr</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN186"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>&GT;= </span><span class='Number'>6</span><span class='Parentheses'>) 
+</span>            <a href="ginpostinglist.c.html#LN103"><span class='Ref_to_Func'>encode_varbyte</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN206"><span class='Ref_To_Local'>delta</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN186"><span class='Ref_To_Local'>ptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * There are less than 6 bytes left. Have to check if the next 
+             * item fits in that space before writing it out. 
+             */ 
+</span><a name="LN218"></a>            <span class='Keyword'>unsigned char </span><span class='Declare_Local'>buf</span><span class='Delimiter'>[</span><span class='Number'>6</span><span class='Delimiter'>]; 
+</span><a name="LN219"></a>            <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>p</span> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN218"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>; 
+</span> 
+            <a href="ginpostinglist.c.html#LN103"><span class='Ref_to_Func'>encode_varbyte</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN206"><span class='Ref_To_Local'>delta</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN219"><span class='Ref_To_Local'>p</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN219"><span class='Ref_To_Local'>p</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN218"><span class='Ref_To_Local'>buf</span></a> <span class='Operator'>&GT; </span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN187"><span class='Ref_To_Local'>endptr</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN186"><span class='Ref_To_Local'>ptr</span></a><span class='Parentheses'>))</span> 
+                <span class='Control'>break</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* output is full */ 
+</span> 
+            memcpy<span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN186"><span class='Ref_To_Local'>ptr</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN218"><span class='Ref_To_Local'>buf</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN219"><span class='Ref_To_Local'>p</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN218"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="ginpostinglist.c.html#LN186"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>+= </span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN219"><span class='Ref_To_Local'>p</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN218"><span class='Ref_To_Local'>buf</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="ginpostinglist.c.html#LN182"><span class='Ref_To_Local'>prev</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN205"><span class='Ref_To_Local'>val</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for totalpacked=1;totalpa... &raquo; </span> 
+    <a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN328"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN186"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN329"><span class='Ref_to_Member'>bytes</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we wrote an odd number of bytes, zero out the padding byte at the 
+     * end. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN328"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>!= </span><a href="../../../include/c.h.html#LN583"><span class='Ref_to_Macro'>SHORTALIGN</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN328"><span class='Ref_to_Member'>nbytes</span></a><span class='Parentheses'>))</span> 
+        <a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN329"><span class='Ref_to_Member'>bytes</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN328"><span class='Ref_to_Member'>nbytes</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN180"><span class='Ref_to_Parameter'>nwritten</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN180"><span class='Ref_to_Parameter'>nwritten</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN183"><span class='Ref_To_Local'>totalpacked</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/ginblock.h.html#LN332"><span class='Ref_to_Macro'>SizeOfGinPostingList</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT;= </span><a href="ginpostinglist.c.html#LN179"><span class='Ref_to_Parameter'>maxsize</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check that the encoded segment decodes back to the original items. 
+     */ 
+</span><span class='Directive'>#if</span> defined <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN19"><span class='Ref_to_Const'>CHECK_ENCODING_ROUNDTRIP</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN249"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>ndecoded</span><span class='Delimiter'>; 
+</span><a name="LN250"></a>        <a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Local'>tmp</span> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN267"><span class='Ref_to_Func'>ginPostingListDecode</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN249"><span class='Ref_To_Local'>ndecoded</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN251"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN249"><span class='Ref_To_Local'>ndecoded</span></a> <span class='Operator'>== </span><a href="ginpostinglist.c.html#LN183"><span class='Ref_To_Local'>totalpacked</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN251"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="ginpostinglist.c.html#LN251"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="ginpostinglist.c.html#LN249"><span class='Ref_To_Local'>ndecoded</span></a><span class='Delimiter'>; </span><a href="ginpostinglist.c.html#LN251"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>            <span class='Debug'>Assert</span><span class='Parentheses'>(</span>memcmp<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN250"><span class='Ref_To_Local'>tmp</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN251"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], </span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN179"><span class='Ref_to_Parameter'>ipd</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN251"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN250"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span><span class='Directive'>#endif</span> 
+ 
+    <span class='Control'>return</span> <a href="ginpostinglist.c.html#LN185"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ginCompressPostingList &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Decode a compressed posting list into an array of item pointers. 
+ * The number of items is returned in *ndecoded. 
+ */ 
+</span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> 
+<a name="LN268"></a><span class='Declare_Function'>ginPostingListDecode</span><span class='Parentheses'>(</span><a href="../../../include/access/ginblock.h.html#LN325"><span class='Ref_to_Typedef'>GinPostingList</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>plist</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>ndecoded</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Control'>return</span> <a href="ginpostinglist.c.html#LN280"><span class='Ref_to_Func'>ginPostingListDecodeAllSegments</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN268"><span class='Ref_to_Parameter'>plist</span></a><span class='Delimiter'>, 
+</span>                                           <a href="../../../include/access/ginblock.h.html#LN332"><span class='Ref_to_Macro'>SizeOfGinPostingList</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN268"><span class='Ref_to_Parameter'>plist</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                           <a href="ginpostinglist.c.html#LN268"><span class='Ref_to_Parameter'>ndecoded</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Decode multiple posting list segments into an array of item pointers. 
+ * The number of items is returned in *ndecoded_out. The segments are stored 
+ * one after each other, with total size 'len' bytes. 
+ */ 
+</span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> 
+<a name="LN281"></a><span class='Declare_Function'>ginPostingListDecodeAllSegments</span><span class='Parentheses'>(</span><a href="../../../include/access/ginblock.h.html#LN325"><span class='Ref_to_Typedef'>GinPostingList</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>segment</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>len</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>ndecoded_out</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN283"></a>    <a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span><a name="LN284"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nallocated</span><span class='Delimiter'>; 
+</span><a name="LN285"></a>    <a href="../../../include/c.h.html#LN297"><span class='Ref_to_Typedef'>uint64</span></a>      <span class='Declare_Local'>val</span><span class='Delimiter'>; 
+</span><a name="LN286"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>endseg</span> <span class='Operator'>= </span><span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Parentheses'>)</span> <span class='Operator'>+ </span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>len</span></a><span class='Delimiter'>; 
+</span><a name="LN287"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>ndecoded</span><span class='Delimiter'>; 
+</span><a name="LN288"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>ptr</span><span class='Delimiter'>; 
+</span><a name="LN289"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>endptr</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Guess an initial size of the array. 
+     */ 
+</span>    <a href="ginpostinglist.c.html#LN284"><span class='Ref_To_Local'>nallocated</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN328"><span class='Ref_to_Member'>nbytes</span></a> <span class='Operator'>* </span><span class='Number'>2</span> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <a href="ginpostinglist.c.html#LN283"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN284"><span class='Ref_To_Local'>nallocated</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>((</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a> <span class='Operator'>&LT; </span><a href="ginpostinglist.c.html#LN286"><span class='Ref_To_Local'>endseg</span></a><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* enlarge output array if needed */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a> <span class='Operator'>&GT;= </span><a href="ginpostinglist.c.html#LN284"><span class='Ref_To_Local'>nallocated</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="ginpostinglist.c.html#LN284"><span class='Ref_To_Local'>nallocated</span></a> <span class='Operator'>*= </span><span class='Number'>2</span><span class='Delimiter'>; 
+</span>            <a href="ginpostinglist.c.html#LN283"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN36"><span class='Ref_to_Proto'>repalloc</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN283"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN284"><span class='Ref_To_Local'>nallocated</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* copy the first item */ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN39"><span class='Ref_to_Macro'>OffsetNumberIsValid</span></a><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN93"><span class='Ref_to_Macro'>ItemPointerGetOffsetNumber</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN327"><span class='Ref_to_Member'>first</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="../../../include/access/gin_private.h.html#LN459"><span class='Ref_to_Func'>ginCompareItemPointers</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN327"><span class='Ref_to_Member'>first</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN283"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="ginpostinglist.c.html#LN283"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN327"><span class='Ref_to_Member'>first</span></a><span class='Delimiter'>; 
+</span>        <a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+        <a href="ginpostinglist.c.html#LN285"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN75"><span class='Ref_to_Func'>itemptr_to_uint64</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN327"><span class='Ref_to_Member'>first</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="ginpostinglist.c.html#LN288"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN329"><span class='Ref_to_Member'>bytes</span></a><span class='Delimiter'>; 
+</span>        <a href="ginpostinglist.c.html#LN289"><span class='Ref_To_Local'>endptr</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN329"><span class='Ref_to_Member'>bytes</span></a> <span class='Operator'>+ </span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/ginblock.h.html#LN328"><span class='Ref_to_Member'>nbytes</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN288"><span class='Ref_To_Local'>ptr</span></a> <span class='Operator'>&LT; </span><a href="ginpostinglist.c.html#LN289"><span class='Ref_To_Local'>endptr</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* enlarge output array if needed */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a> <span class='Operator'>&GT;= </span><a href="ginpostinglist.c.html#LN284"><span class='Ref_To_Local'>nallocated</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="ginpostinglist.c.html#LN284"><span class='Ref_To_Local'>nallocated</span></a> <span class='Operator'>*= </span><span class='Number'>2</span><span class='Delimiter'>; 
+</span>                <a href="ginpostinglist.c.html#LN283"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN36"><span class='Ref_to_Proto'>repalloc</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN283"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN284"><span class='Ref_To_Local'>nallocated</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <a href="ginpostinglist.c.html#LN285"><span class='Ref_To_Local'>val</span></a> <span class='Operator'>+= </span><a href="ginpostinglist.c.html#LN121"><span class='Ref_to_Func'>decode_varbyte</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN288"><span class='Ref_To_Local'>ptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="ginpostinglist.c.html#LN90"><span class='Ref_to_Func'>uint64_to_itemptr</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN285"><span class='Ref_To_Local'>val</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN283"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a> <span class='Operator'>= </span><a href="../../../include/access/ginblock.h.html#LN333"><span class='Ref_to_Macro'>GinNextPostingListSegment</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>segment</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while (char*)segment&LT;endseg &raquo; </span> 
+ 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>ndecoded_out</span></a><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN281"><span class='Ref_to_Parameter'>ndecoded_out</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN287"><span class='Ref_To_Local'>ndecoded</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="ginpostinglist.c.html#LN283"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ginPostingListDecodeAllSegments &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Add all item pointers from a bunch of posting lists to a TIDBitmap. 
+ */ 
+</span><span class='Keyword'>int 
+</span><a name="LN342"></a><span class='Declare_Function'>ginPostingListDecodeAllSegmentsToTbm</span><span class='Parentheses'>(</span><a href="../../../include/access/ginblock.h.html#LN325"><span class='Ref_to_Typedef'>GinPostingList</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ptr</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>len</span><span class='Delimiter'>, 
+</span><a name="LN343"></a>                                     <a href="../../nodes/tidbitmap.c.html#LN146"><span class='Ref_to_Struct'>TIDBitmap</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>tbm</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN345"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>ndecoded</span><span class='Delimiter'>; 
+</span><a name="LN346"></a>    <a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> <span class='Declare_Local'>items</span><span class='Delimiter'>; 
+</span> 
+    <a href="ginpostinglist.c.html#LN346"><span class='Ref_To_Local'>items</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN280"><span class='Ref_to_Func'>ginPostingListDecodeAllSegments</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN342"><span class='Ref_to_Parameter'>ptr</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN342"><span class='Ref_to_Parameter'>len</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN345"><span class='Ref_To_Local'>ndecoded</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/nodes/tidbitmap.h.html#LN54"><span class='Ref_to_Proto'>tbm_add_tuples</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN343"><span class='Ref_to_Parameter'>tbm</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN346"><span class='Ref_To_Local'>items</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN345"><span class='Ref_To_Local'>ndecoded</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN346"><span class='Ref_To_Local'>items</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="ginpostinglist.c.html#LN345"><span class='Ref_To_Local'>ndecoded</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Merge two ordered arrays of itempointers, eliminating any duplicates. 
+ * 
+ * Returns a palloc'd array, and *nmerged is set to the number of items in 
+ * the result, after eliminating duplicates. 
+ */ 
+</span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a> 
+<a name="LN362"></a><span class='Declare_Function'>ginMergeItemPointers</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>a</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Parameter'>na</span><span class='Delimiter'>, 
+</span><a name="LN363"></a>                     <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>b</span><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN267"><span class='Ref_to_Typedef'>uint32</span></a> <span class='Declare_Parameter'>nb</span><span class='Delimiter'>, 
+</span><a name="LN364"></a>                     <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>nmerged</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN366"></a>    <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>dst</span><span class='Delimiter'>; 
+</span> 
+    <a href="ginpostinglist.c.html#LN366"><span class='Ref_To_Local'>dst</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN47"><span class='Ref_to_Typedef'>ItemPointer</span></a><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>((</span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a> <span class='Operator'>+ </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If the argument arrays don't overlap, we can just append them to each 
+     * other. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a> <span class='Operator'>== </span><span class='Number'>0</span> <span class='Operator'>|| </span><a href="../../../include/access/gin_private.h.html#LN459"><span class='Ref_to_Func'>ginCompareItemPointers</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>a</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>], </span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>b</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        memcpy<span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN366"><span class='Ref_To_Local'>dst</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>a</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN366"><span class='Ref_To_Local'>dst</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a><span class='Delimiter'>], </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>b</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN364"><span class='Ref_to_Parameter'>nmerged</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a> <span class='Operator'>+ </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/gin_private.h.html#LN459"><span class='Ref_to_Func'>ginCompareItemPointers</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>b</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>], </span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>a</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        memcpy<span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN366"><span class='Ref_To_Local'>dst</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>b</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        memcpy<span class='Parentheses'>(</span><span class='Operator'>&</span><a href="ginpostinglist.c.html#LN366"><span class='Ref_To_Local'>dst</span></a><span class='Delimiter'>[</span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a><span class='Delimiter'>], </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>a</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a> <span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN364"><span class='Ref_to_Parameter'>nmerged</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a> <span class='Operator'>+ </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN388"></a>        <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>dptr</span> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN366"><span class='Ref_To_Local'>dst</span></a><span class='Delimiter'>; 
+</span><a name="LN389"></a>        <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>aptr</span> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>a</span></a><span class='Delimiter'>; 
+</span><a name="LN390"></a>        <a href="../../../include/storage/itemptr.h.html#LN35"><span class='Ref_to_Struct'>ItemPointerData</span></a> <span class='Operator'>*</span><span class='Declare_Local'>bptr</span> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>b</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN389"><span class='Ref_To_Local'>aptr</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>a</span></a> <span class='Operator'>&LT; </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a> <span class='Operator'>&& </span><a href="ginpostinglist.c.html#LN390"><span class='Ref_To_Local'>bptr</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>b</span></a> <span class='Operator'>&LT; </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN394"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>cmp</span> <span class='Operator'>= </span><a href="../../../include/access/gin_private.h.html#LN459"><span class='Ref_to_Func'>ginCompareItemPointers</span></a><span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN389"><span class='Ref_To_Local'>aptr</span></a><span class='Delimiter'>, </span><a href="ginpostinglist.c.html#LN390"><span class='Ref_To_Local'>bptr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN394"><span class='Ref_To_Local'>cmp</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN388"><span class='Ref_To_Local'>dptr</span></a><span class='Operator'>++ = *</span><a href="ginpostinglist.c.html#LN390"><span class='Ref_To_Local'>bptr</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN394"><span class='Ref_To_Local'>cmp</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* only keep one copy of the identical items */ 
+</span>                <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN388"><span class='Ref_To_Local'>dptr</span></a><span class='Operator'>++ = *</span><a href="ginpostinglist.c.html#LN390"><span class='Ref_To_Local'>bptr</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                <a href="ginpostinglist.c.html#LN389"><span class='Ref_To_Local'>aptr</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+                <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN388"><span class='Ref_To_Local'>dptr</span></a><span class='Operator'>++ = *</span><a href="ginpostinglist.c.html#LN389"><span class='Ref_To_Local'>aptr</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN389"><span class='Ref_To_Local'>aptr</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>a</span></a> <span class='Operator'>&LT; </span><a href="ginpostinglist.c.html#LN362"><span class='Ref_to_Parameter'>na</span></a><span class='Parentheses'>) 
+</span>            <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN388"><span class='Ref_To_Local'>dptr</span></a><span class='Operator'>++ = *</span><a href="ginpostinglist.c.html#LN389"><span class='Ref_To_Local'>aptr</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="ginpostinglist.c.html#LN390"><span class='Ref_To_Local'>bptr</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>b</span></a> <span class='Operator'>&LT; </span><a href="ginpostinglist.c.html#LN363"><span class='Ref_to_Parameter'>nb</span></a><span class='Parentheses'>) 
+</span>            <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN388"><span class='Ref_To_Local'>dptr</span></a><span class='Operator'>++ = *</span><a href="ginpostinglist.c.html#LN390"><span class='Ref_To_Local'>bptr</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span> 
+        <span class='Operator'>*</span><a href="ginpostinglist.c.html#LN364"><span class='Ref_to_Parameter'>nmerged</span></a> <span class='Operator'>= </span><a href="ginpostinglist.c.html#LN388"><span class='Ref_To_Local'>dptr</span></a> <span class='Operator'>- </span><a href="ginpostinglist.c.html#LN366"><span class='Ref_To_Local'>dst</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+ 
+    <span class='Control'>return</span> <a href="ginpostinglist.c.html#LN366"><span class='Ref_To_Local'>dst</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ginMergeItemPointers &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

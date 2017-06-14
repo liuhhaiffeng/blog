@@ -1,0 +1,708 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\executor\nodeGatherMerge.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\executor\nodeGatherMerge.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:39 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * nodeGatherMerge.c 
+ *      Scan a plan in multiple workers, and do order-preserving merge. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/executor/nodeGatherMerge.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span> 
+<span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/relscan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xact.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/execdebug.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/execParallel.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeGatherMerge.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/nodeSubplan.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"executor/tqueue.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"lib/binaryheap.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/memutils.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/rel.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Tuple array for each worker 
+ */ 
+</span><a name="LN31"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>GMReaderTupleBuffer</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN33"></a>    <a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>  <span class='Operator'>*</span><span class='Declare_Member'>tuple</span><span class='Delimiter'>; 
+</span><a name="LN34"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>readCounter</span><span class='Delimiter'>; 
+</span><a name="LN35"></a>    <span class='Keyword'>int</span>         <span class='Declare_Member'>nTuples</span><span class='Delimiter'>; 
+</span><a name="LN36"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Member'>done</span><span class='Delimiter'>; 
+</span><a name="LN37"></a>} <span class='Declare_Typedef'>GMReaderTupleBuffer</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * When we read tuples from workers, it's a good idea to read several at once 
+ * for efficiency when possible: this minimizes context-switching overhead. 
+ * But reading too many at a time wastes memory without improving performance. 
+ */ 
+</span><a name="LN44"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>MAX_TUPLE_STORE</span> <span class='Number'>10</span> 
+ 
+<a name="LN46"></a><span class='Keyword'>static </span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> <span class='Declare_Prototype'>heap_compare_slots</span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>a</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>b</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>arg</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN47"></a><span class='Keyword'>static </span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>gather_merge_getnext</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN48"></a><span class='Keyword'>static </span><a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> <span class='Declare_Prototype'>gm_readnext_tuple</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nreader</span><span class='Delimiter'>, 
+</span><a name="LN49"></a>                  <span class='Keyword'>bool </span><span class='Declare_Parameter'>nowait</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>done</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN50"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>gather_merge_init</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN51"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>ExecShutdownGatherMergeWorkers</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN52"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>gather_merge_readnext</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>reader</span><span class='Delimiter'>, 
+</span><a name="LN53"></a>                      <span class='Keyword'>bool </span><span class='Declare_Parameter'>nowait</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN54"></a><span class='Keyword'>static void </span><span class='Declare_Prototype'>form_tuple_array</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>reader</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecInitGather 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>* 
+</span><a name="LN61"></a><span class='Declare_Function'>ExecInitGatherMerge</span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN843"><span class='Ref_to_Struct'>GatherMerge</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>estate</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>eflags</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN63"></a>    <a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Local'>gm_state</span><span class='Delimiter'>; 
+</span><a name="LN64"></a>    <a href="../../include/nodes/plannodes.h.html#LN117"><span class='Ref_to_Struct'>Plan</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>outerNode</span><span class='Delimiter'>; 
+</span><a name="LN65"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>hasoid</span><span class='Delimiter'>; 
+</span><a name="LN66"></a>    <a href="../../include/access/tupdesc.h.html#LN70"><span class='Ref_to_Typedef'>TupleDesc</span></a>   <span class='Declare_Local'>tupDesc</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Gather merge node doesn't have innerPlan node. */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN172"><span class='Ref_to_Macro'>innerPlan</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * create state structure 
+     */ 
+</span>    <a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a> <span class='Operator'>= </span><a href="../../include/nodes/nodes.h.html#LN556"><span class='Ref_to_Macro'>makeNode</span></a><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN117"><span class='Ref_to_Struct'>Plan</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Delimiter'>; 
+</span>    <a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN814"><span class='Ref_to_Member'>state</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Miscellaneous initialization 
+     * 
+     * create expression context for node 
+     */ 
+</span>    <a href="execUtils.c.html#LN416"><span class='Ref_to_Func'>ExecAssignExprContext</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * initialize child expressions 
+     */ 
+</span>    <a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN826"><span class='Ref_to_Member'>qual</span></a> <span class='Operator'>= 
+</span>        <a href="execExpr.c.html#LN158"><span class='Ref_to_Func'>ExecInitQual</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN845"><span class='Ref_to_Member'>plan</span></a><span class='Operator'>.</span><a href="../../include/nodes/plannodes.h.html#LN144"><span class='Ref_to_Member'>qual</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * tuple table initialization 
+     */ 
+</span>    <a href="../../include/executor/executor.h.html#LN400"><span class='Ref_to_Proto'>ExecInitResultTupleSlot</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * now initialize outer plan 
+     */ 
+</span>    <a href="nodeGatherMerge.c.html#LN64"><span class='Ref_To_Local'>outerNode</span></a> <span class='Operator'>= </span><a href="../../include/nodes/plannodes.h.html#LN173"><span class='Ref_to_Macro'>outerPlan</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/nodes/execnodes.h.html#LN854"><span class='Ref_to_Macro'>outerPlanState</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="execProcnode.c.html#LN138"><span class='Ref_to_Func'>ExecInitNode</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN64"><span class='Ref_To_Local'>outerNode</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>estate</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>eflags</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Initialize result tuple type and projection info. 
+     */ 
+</span>    <a href="execUtils.c.html#LN438"><span class='Ref_to_Func'>ExecAssignResultTypeFromTL</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/executor/executor.h.html#LN474"><span class='Ref_to_Proto'>ExecAssignProjectionInfo</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1908"><span class='Ref_to_Member'>gm_initialized</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * initialize sort-key information 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN848"><span class='Ref_to_Member'>numCols</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN115"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1910"><span class='Ref_to_Member'>gm_nkeys</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN848"><span class='Ref_to_Member'>numCols</span></a><span class='Delimiter'>; 
+</span>        <a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1911"><span class='Ref_to_Member'>gm_sortkeys</span></a> <span class='Operator'>= 
+</span>            <a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/utils/sortsupport.h.html#LN59"><span class='Ref_to_Struct'>SortSupportData</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN848"><span class='Ref_to_Member'>numCols</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN115"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN115"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN848"><span class='Ref_to_Member'>numCols</span></a><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN115"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN123"></a>            <a href="../../include/utils/sortsupport.h.html#LN57"><span class='Ref_to_Typedef'>SortSupport</span></a> <span class='Declare_Local'>sortKey</span> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1911"><span class='Ref_to_Member'>gm_sortkeys</span></a> <span class='Operator'>+ </span><a href="nodeGatherMerge.c.html#LN115"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span> 
+            <a href="nodeGatherMerge.c.html#LN123"><span class='Ref_To_Local'>sortKey</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/sortsupport.h.html#LN65"><span class='Ref_to_Member'>ssup_cxt</span></a> <span class='Operator'>= </span><a href="../utils/mmgr/mcxt.c.html#LN36"><span class='Ref_to_Global_Var'>CurrentMemoryContext</span></a><span class='Delimiter'>; 
+</span>            <a href="nodeGatherMerge.c.html#LN123"><span class='Ref_To_Local'>sortKey</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/sortsupport.h.html#LN66"><span class='Ref_to_Member'>ssup_collation</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN851"><span class='Ref_to_Member'>collations</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN115"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span>            <a href="nodeGatherMerge.c.html#LN123"><span class='Ref_To_Local'>sortKey</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/sortsupport.h.html#LN74"><span class='Ref_to_Member'>ssup_nulls_first</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN852"><span class='Ref_to_Member'>nullsFirst</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN115"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span>            <a href="nodeGatherMerge.c.html#LN123"><span class='Ref_To_Local'>sortKey</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/sortsupport.h.html#LN80"><span class='Ref_to_Member'>ssup_attno</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN849"><span class='Ref_to_Member'>sortColIdx</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN115"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * We don't perform abbreviated key conversion here, for the same 
+             * reasons that it isn't used in MergeAppend 
+             */ 
+</span>            <a href="nodeGatherMerge.c.html#LN123"><span class='Ref_To_Local'>sortKey</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/sortsupport.h.html#LN155"><span class='Ref_to_Member'>abbreviate</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+            <a href="../utils/sort/sortsupport.c.html#LN131"><span class='Ref_to_Func'>PrepareSortSupportFromOrderingOp</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN61"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN850"><span class='Ref_to_Member'>sortOperators</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN115"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], </span><a href="nodeGatherMerge.c.html#LN123"><span class='Ref_To_Local'>sortKey</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if node-&GT;numCols &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * store the tuple descriptor into gather merge state, so we can use it 
+     * later while initializing the gather merge slots. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/executor/executor.h.html#LN187"><span class='Ref_to_Proto'>ExecContextForcesOids</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN65"><span class='Ref_To_Local'>hasoid</span></a><span class='Parentheses'>))</span> 
+        <a href="nodeGatherMerge.c.html#LN65"><span class='Ref_To_Local'>hasoid</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="nodeGatherMerge.c.html#LN66"><span class='Ref_To_Local'>tupDesc</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN405"><span class='Ref_to_Proto'>ExecTypeFromTL</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN64"><span class='Ref_To_Local'>outerNode</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN143"><span class='Ref_to_Member'>targetlist</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN65"><span class='Ref_To_Local'>hasoid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1905"><span class='Ref_to_Member'>tupDesc</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN66"><span class='Ref_To_Local'>tupDesc</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="nodeGatherMerge.c.html#LN63"><span class='Ref_To_Local'>gm_state</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecInitGatherMerge &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecGatherMerge(node) 
+ * 
+ *      Scans the relation via multiple workers and returns 
+ *      the next qualifying tuple. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN160"></a><span class='Declare_Function'>ExecGatherMerge</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN162"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>slot</span><span class='Delimiter'>; 
+</span><a name="LN163"></a>    <a href="../../include/nodes/execnodes.h.html#LN191"><span class='Ref_to_Struct'>ExprContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>econtext</span><span class='Delimiter'>; 
+</span><a name="LN164"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * As with Gather, we don't launch workers until this node is actually 
+     * executed. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1900"><span class='Ref_to_Member'>initialized</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN172"></a>        <a href="../../include/nodes/execnodes.h.html#LN402"><span class='Ref_to_Struct'>EState</span></a>     <span class='Operator'>*</span><span class='Declare_Local'>estate</span> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN814"><span class='Ref_to_Member'>state</span></a><span class='Delimiter'>; 
+</span><a name="LN173"></a>        <a href="../../include/nodes/plannodes.h.html#LN843"><span class='Ref_to_Struct'>GatherMerge</span></a> <span class='Operator'>*</span><span class='Declare_Local'>gm</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/plannodes.h.html#LN843"><span class='Ref_to_Struct'>GatherMerge</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN812"><span class='Ref_to_Member'>plan</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Sometimes we might have to run without parallelism; but if parallel 
+         * mode is active then we can try to fire up some workers. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN173"><span class='Ref_To_Local'>gm</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN846"><span class='Ref_to_Member'>num_workers</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="../../include/access/xact.h.html#LN405"><span class='Ref_to_Proto'>IsInParallelMode</span></a><span class='Parentheses'>())</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN181"></a>            <a href="../../include/access/parallel.h.html#LN31"><span class='Ref_to_Struct'>ParallelContext</span></a> <span class='Operator'>*</span><span class='Declare_Local'>pcxt</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Initialize data structures for workers. */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a><span class='Parentheses'>) 
+</span>                <a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a> <span class='Operator'>= </span><a href="../../include/executor/execParallel.h.html#LN34"><span class='Ref_to_Proto'>ExecInitParallelPlan</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN827"><span class='Ref_to_Member'>lefttree</span></a><span class='Delimiter'>, 
+</span>                                                 <a href="nodeGatherMerge.c.html#LN172"><span class='Ref_To_Local'>estate</span></a><span class='Delimiter'>, 
+</span>                                                 <a href="nodeGatherMerge.c.html#LN173"><span class='Ref_To_Local'>gm</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN846"><span class='Ref_to_Member'>num_workers</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Try to launch workers. */ 
+</span>            <a href="nodeGatherMerge.c.html#LN181"><span class='Ref_To_Local'>pcxt</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN26"><span class='Ref_to_Member'>pcxt</span></a><span class='Delimiter'>; 
+</span>            <a href="../../include/access/parallel.h.html#LN56"><span class='Ref_to_Proto'>LaunchParallelWorkers</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN181"><span class='Ref_To_Local'>pcxt</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1903"><span class='Ref_to_Member'>nworkers_launched</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN181"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN36"><span class='Ref_to_Member'>nworkers_launched</span></a><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Set up tuple queue readers to read the results. */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN181"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN36"><span class='Ref_to_Member'>nworkers_launched</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>                <a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a> <span class='Operator'>= </span><a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN181"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN36"><span class='Ref_to_Member'>nworkers_launched</span></a> <span class='Operator'>* 
+</span>                                      <span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="tqueue.c.html#LN167"><span class='Ref_to_Struct'>TupleQueueReader</span></a> <span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+                <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN173"><span class='Ref_To_Local'>gm</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/plannodes.h.html#LN848"><span class='Ref_to_Member'>numCols</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN164"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN164"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="nodeGatherMerge.c.html#LN181"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN36"><span class='Ref_to_Member'>nworkers_launched</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="nodeGatherMerge.c.html#LN164"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="../../include/storage/shm_mq.h.html#LN62"><span class='Ref_to_Proto'>shm_mq_set_handle</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN29"><span class='Ref_to_Member'>tqueue</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN164"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                                      <a href="nodeGatherMerge.c.html#LN181"><span class='Ref_To_Local'>pcxt</span></a><span class='Operator'>-&GT;</span><a href="../../include/access/parallel.h.html#LN44"><span class='Ref_to_Member'>worker</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN164"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../include/access/parallel.h.html#LN26"><span class='Ref_to_Member'>bgwhandle</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= 
+</span>                        <a href="../../include/executor/tqueue.h.html#LN26"><span class='Ref_to_Proto'>CreateTupleQueueReader</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a><span class='Operator'>-&GT;</span><a href="../../include/executor/execParallel.h.html#LN29"><span class='Ref_to_Member'>tqueue</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN164"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                                               <a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1905"><span class='Ref_to_Member'>tupDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Delimiter'>} 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* No workers?  Then never mind. */ 
+</span>                <a href="nodeGatherMerge.c.html#LN51"><span class='Ref_to_Proto'>ExecShutdownGatherMergeWorkers</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if gm-&GT;num_workers&GT;0&&Is... &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* always allow leader to participate */ 
+</span>        <a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1909"><span class='Ref_to_Member'>need_to_scan_locally</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1900"><span class='Ref_to_Member'>initialized</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !node-&GT;initialized &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Reset per-tuple memory context to free any expression evaluation 
+     * storage allocated in the previous tuple cycle. 
+     */ 
+</span>    <a href="nodeGatherMerge.c.html#LN163"><span class='Ref_To_Local'>econtext</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN842"><span class='Ref_to_Member'>ps_ExprContext</span></a><span class='Delimiter'>; 
+</span>    <a href="../../include/executor/executor.h.html#LN449"><span class='Ref_to_Macro'>ResetExprContext</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN163"><span class='Ref_To_Local'>econtext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Get next tuple, either from one of our workers, or by running the plan 
+     * ourselves. 
+     */ 
+</span>    <a href="nodeGatherMerge.c.html#LN162"><span class='Ref_To_Local'>slot</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN47"><span class='Ref_to_Proto'>gather_merge_getnext</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * form the result tuple using ExecProject(), and return it --- unless the 
+     * projection produces an empty set, in which case we must loop back 
+     * around for another tuple 
+     */ 
+</span>    <a href="nodeGatherMerge.c.html#LN163"><span class='Ref_To_Local'>econtext</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN198"><span class='Ref_to_Member'>ecxt_outertuple</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN162"><span class='Ref_To_Local'>slot</span></a><span class='Delimiter'>; 
+</span>    <span class='Control'>return</span> <a href="../../include/executor/executor.h.html#LN307"><span class='Ref_to_Func'>ExecProject</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN160"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN843"><span class='Ref_to_Member'>ps_ProjInfo</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecGatherMerge &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecEndGatherMerge 
+ * 
+ *      frees any storage allocated through C routines. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN255"></a><span class='Declare_Function'>ExecEndGatherMerge</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="../../include/executor/executor.h.html#LN231"><span class='Ref_to_Proto'>ExecEndNode</span></a><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN854"><span class='Ref_to_Macro'>outerPlanState</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN255"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>))</span><span class='Delimiter'>;</span>  <span class='Comment_Single_Line'>/* let children clean up first */ 
+</span>    <a href="../../include/executor/nodeGatherMerge.h.html#LN24"><span class='Ref_to_Proto'>ExecShutdownGatherMerge</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN255"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/executor/executor.h.html#LN476"><span class='Ref_to_Proto'>ExecFreeExprContext</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN255"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN255"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN841"><span class='Ref_to_Member'>ps_ResultTupleSlot</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecShutdownGatherMerge 
+ * 
+ *      Destroy the setup for parallel workers including parallel context. 
+ *      Collect all the stats after workers are stopped, else some work 
+ *      done by workers won't be accounted. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN272"></a><span class='Declare_Function'>ExecShutdownGatherMerge</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <a href="nodeGatherMerge.c.html#LN51"><span class='Ref_to_Proto'>ExecShutdownGatherMergeWorkers</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN272"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now destroy the parallel context. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN272"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/executor/execParallel.h.html#LN37"><span class='Ref_to_Proto'>ExecParallelCleanup</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN272"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="nodeGatherMerge.c.html#LN272"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecShutdownGatherMergeWorkers 
+ * 
+ *      Destroy the parallel workers.  Collect all the stats after 
+ *      workers are stopped, else some work done by workers won't be 
+ *      accounted. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN293"></a><span class='Declare_Function'>ExecShutdownGatherMergeWorkers</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* Shut down tuple queue readers before shutting down workers. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN293"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN298"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN298"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN298"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="nodeGatherMerge.c.html#LN293"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a><span class='Delimiter'>; </span><span class='Operator'>++</span><a href="nodeGatherMerge.c.html#LN298"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN293"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN298"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>                <a href="../../include/executor/tqueue.h.html#LN28"><span class='Ref_to_Proto'>DestroyTupleQueueReader</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN293"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN298"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN293"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="nodeGatherMerge.c.html#LN293"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Now shut down the workers. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN293"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/executor/execParallel.h.html#LN36"><span class='Ref_to_Proto'>ExecParallelFinish</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN293"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end ExecShutdownGatherMergeWorkers &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ---------------------------------------------------------------- 
+ *      ExecReScanGatherMerge 
+ * 
+ *      Re-initialize the workers and rescans a relation via them. 
+ * ---------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN320"></a><span class='Declare_Function'>ExecReScanGatherMerge</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Re-initialize the parallel workers to perform rescan of relation. We 
+     * want to gracefully shutdown all the workers so that they should be able 
+     * to propagate any error or other information to master backend before 
+     * dying.  Parallel context will be reused for rescan. 
+     */ 
+</span>    <a href="nodeGatherMerge.c.html#LN51"><span class='Ref_to_Proto'>ExecShutdownGatherMergeWorkers</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN320"><span class='Ref_to_Parameter'>node</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="nodeGatherMerge.c.html#LN320"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1900"><span class='Ref_to_Member'>initialized</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN320"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a><span class='Parentheses'>) 
+</span>        <a href="../../include/executor/execParallel.h.html#LN38"><span class='Ref_to_Proto'>ExecParallelReinitialize</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN320"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1901"><span class='Ref_to_Member'>pei</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="execAmi.c.html#LN73"><span class='Ref_to_Func'>ExecReScan</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN320"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN827"><span class='Ref_to_Member'>lefttree</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Initialize the Gather merge tuple read. 
+ * 
+ * Pull at least a single tuple from each worker + leader and set up the heap. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN344"></a><span class='Declare_Function'>gather_merge_init</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN346"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nreaders</span> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a><span class='Delimiter'>; 
+</span><a name="LN347"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>initialize</span> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span><a name="LN348"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Allocate gm_slots for the number of worker + one more slot for leader. 
+     * Last slot is always for leader. Leader always calls ExecProcNode() to 
+     * read the tuple which will return the TupleTableSlot. Later it will 
+     * directly get assigned to gm_slot. So just initialize leader gm_slot 
+     * with NULL. For other slots below code will call 
+     * ExecInitExtraTupleSlot() which will do the initialization of worker 
+     * slots. 
+     */ 
+</span>    <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a> <span class='Operator'>= 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>((</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize the tuple slot and tuple array for each worker */ 
+</span>    <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a> <span class='Operator'>= 
+</span>        <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN31"><span class='Ref_to_Struct'>GMReaderTupleBuffer</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN31"><span class='Ref_to_Struct'>GMReaderTupleBuffer</span></a><span class='Parentheses'>) </span><span class='Operator'>* 
+</span>                                        <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Allocate the tuple array with MAX_TUPLE_STORE size */ 
+</span>        <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="nodeGatherMerge.c.html#LN33"><span class='Ref_to_Member'>tuple</span></a> <span class='Operator'>= 
+</span>            <span class='Parentheses'>(</span><a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a><span class='Parentheses'>) </span><span class='Operator'>* </span><a href="nodeGatherMerge.c.html#LN44"><span class='Ref_to_Const'>MAX_TUPLE_STORE</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Initialize slot for worker */ 
+</span>        <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN402"><span class='Ref_to_Proto'>ExecInitExtraTupleSlot</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN814"><span class='Ref_to_Member'>state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/executor/tuptable.h.html#LN146"><span class='Ref_to_Proto'>ExecSetSlotDescriptor</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>], 
+</span>                              <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1905"><span class='Ref_to_Member'>tupDesc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Allocate the resources for the merge */ 
+</span>    <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1907"><span class='Ref_to_Member'>gm_heap</span></a> <span class='Operator'>= </span><a href="../lib/binaryheap.c.html#LN31"><span class='Ref_to_Func'>binaryheap_allocate</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>, 
+</span>                                            <a href="nodeGatherMerge.c.html#LN46"><span class='Ref_to_Proto'>heap_compare_slots</span></a><span class='Delimiter'>, 
+</span>                                            <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * First, try to read a tuple from each worker (including leader) in 
+     * nowait mode, so that we initialize read from each worker as well as 
+     * leader. After this, if all active workers are unable to produce a 
+     * tuple, then re-read and this time use wait mode. For workers that were 
+     * able to produce a tuple in the earlier loop and are still active, just 
+     * try to fill the tuple array if more tuples are avaiable. 
+     */ 
+</span><a name="LN392"></a><span class='Label'>reread</span><span class='Operator'>: 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="nodeGatherMerge.c.html#LN346"><span class='Ref_To_Local'>nreaders</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="nodeGatherMerge.c.html#LN36"><span class='Ref_to_Member'>done</span></a> <span class='Operator'>&& 
+</span>            <span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>             <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN52"><span class='Ref_to_Proto'>gather_merge_readnext</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN347"><span class='Ref_To_Local'>initialize</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="../../include/lib/binaryheap.h.html#LN44"><span class='Ref_to_Proto'>binaryheap_add_unordered</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1907"><span class='Ref_to_Member'>gm_heap</span></a><span class='Delimiter'>, 
+</span>                                         <a href="../../include/postgres.h.html#LN484"><span class='Ref_to_Macro'>Int32GetDatum</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+            <a href="nodeGatherMerge.c.html#LN54"><span class='Ref_to_Proto'>form_tuple_array</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <a href="nodeGatherMerge.c.html#LN347"><span class='Ref_To_Local'>initialize</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="nodeGatherMerge.c.html#LN346"><span class='Ref_To_Local'>nreaders</span></a><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="nodeGatherMerge.c.html#LN36"><span class='Ref_to_Member'>done</span></a> <span class='Operator'>&& 
+</span>            <span class='Parentheses'>(</span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>) </span><span class='Operator'>|| 
+</span>             <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN348"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>-&GT;</span><a href="../../include/executor/tuptable.h.html#LN115"><span class='Ref_to_Member'>tts_isempty</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>goto</span> <span class='Symbol_Characters'>&uarr;</span><a href="nodeGatherMerge.c.html#LN392"><span class='Ref_to_Label'>reread</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/lib/binaryheap.h.html#LN45"><span class='Ref_to_Proto'>binaryheap_build</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1907"><span class='Ref_to_Member'>gm_heap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="nodeGatherMerge.c.html#LN344"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1908"><span class='Ref_to_Member'>gm_initialized</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end gather_merge_init &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Clear out the tuple table slots for each gather merge input. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN424"></a><span class='Declare_Function'>gather_merge_clear_slots</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN426"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN426"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN426"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="nodeGatherMerge.c.html#LN424"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN426"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN424"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN426"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="nodeGatherMerge.c.html#LN33"><span class='Ref_to_Member'>tuple</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="nodeGatherMerge.c.html#LN424"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN426"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN154"><span class='Ref_to_Proto'>ExecClearTuple</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN424"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN426"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Free tuple array as we don't need it any more */ 
+</span>    <a href="../../include/common/fe_memutils.h.html#LN37"><span class='Ref_to_Proto'>pfree</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN424"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Comment_Multi_Line'>/* Free the binaryheap, which was created for sort */ 
+</span>    <a href="../../include/lib/binaryheap.h.html#LN43"><span class='Ref_to_Proto'>binaryheap_free</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN424"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1907"><span class='Ref_to_Member'>gm_heap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Read the next tuple for gather merge. 
+ * 
+ * Fetch the sorted tuple out of the heap. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>* 
+</span><a name="LN446"></a><span class='Declare_Function'>gather_merge_getnext</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN448"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1908"><span class='Ref_to_Member'>gm_initialized</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * First time through: pull the first tuple from each participant, and 
+         * set up the heap. 
+         */ 
+</span>        <a href="nodeGatherMerge.c.html#LN50"><span class='Ref_to_Proto'>gather_merge_init</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Otherwise, pull the next tuple from whichever participant we 
+         * returned from last time, and reinsert that participant's index into 
+         * the heap, because it might now compare differently against the 
+         * other elements of the heap. 
+         */ 
+</span>        <a href="nodeGatherMerge.c.html#LN448"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../include/postgres.h.html#LN477"><span class='Ref_to_Macro'>DatumGetInt32</span></a><span class='Parentheses'>(</span><a href="../../include/lib/binaryheap.h.html#LN47"><span class='Ref_to_Proto'>binaryheap_first</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1907"><span class='Ref_to_Member'>gm_heap</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN52"><span class='Ref_to_Proto'>gather_merge_readnext</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN448"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>))</span> 
+            <a href="../../include/lib/binaryheap.h.html#LN49"><span class='Ref_to_Proto'>binaryheap_replace_first</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1907"><span class='Ref_to_Member'>gm_heap</span></a><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN484"><span class='Ref_to_Macro'>Int32GetDatum</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN448"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="../../include/lib/binaryheap.h.html#LN48"><span class='Ref_to_Proto'>binaryheap_remove_first</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1907"><span class='Ref_to_Member'>gm_heap</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/lib/binaryheap.h.html#LN51"><span class='Ref_to_Macro'>binaryheap_empty</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1907"><span class='Ref_to_Member'>gm_heap</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* All the queues are exhausted, and so is the heap */ 
+</span>        <a href="nodeGatherMerge.c.html#LN423"><span class='Ref_to_Func'>gather_merge_clear_slots</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Return next tuple from whichever participant has the leading one */ 
+</span>        <a href="nodeGatherMerge.c.html#LN448"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../include/postgres.h.html#LN477"><span class='Ref_to_Macro'>DatumGetInt32</span></a><span class='Parentheses'>(</span><a href="../../include/lib/binaryheap.h.html#LN47"><span class='Ref_to_Proto'>binaryheap_first</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1907"><span class='Ref_to_Member'>gm_heap</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <a href="nodeGatherMerge.c.html#LN446"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN448"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end gather_merge_getnext &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Read the tuple for given reader in nowait mode, and form the tuple array. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN492"></a><span class='Declare_Function'>form_tuple_array</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>reader</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN494"></a>    <a href="nodeGatherMerge.c.html#LN31"><span class='Ref_to_Struct'>GMReaderTupleBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tuple_buffer</span> <span class='Operator'>= &</span><a href="nodeGatherMerge.c.html#LN492"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN492"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>]; 
+</span><a name="LN495"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Last slot is for leader and we don't build tuple array for leader */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN492"><span class='Ref_to_Parameter'>reader</span></a> <span class='Operator'>== </span><a href="nodeGatherMerge.c.html#LN492"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We here because we already read all the tuples from the tuple array, so 
+     * initialize the counter to zero. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN35"><span class='Ref_to_Member'>nTuples</span></a> <span class='Operator'>== </span><a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN34"><span class='Ref_to_Member'>readCounter</span></a><span class='Parentheses'>) 
+</span>        <a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN35"><span class='Ref_to_Member'>nTuples</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN34"><span class='Ref_to_Member'>readCounter</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Tuple array is already full? */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN35"><span class='Ref_to_Member'>nTuples</span></a> <span class='Operator'>== </span><a href="nodeGatherMerge.c.html#LN44"><span class='Ref_to_Const'>MAX_TUPLE_STORE</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN495"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN35"><span class='Ref_to_Member'>nTuples</span></a><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN495"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="nodeGatherMerge.c.html#LN44"><span class='Ref_to_Const'>MAX_TUPLE_STORE</span></a><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN33"><span class='Ref_to_Member'>tuple</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="../access/common/heaptuple.c.html#LN606"><span class='Ref_to_Func'>heap_copytuple</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN48"><span class='Ref_to_Proto'>gm_readnext_tuple</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN492"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Delimiter'>, 
+</span>                                                                  <a href="nodeGatherMerge.c.html#LN492"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>, 
+</span>                                                                  <span class='Boolean'>false</span><span class='Delimiter'>, 
+</span>                                                       <span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN36"><span class='Ref_to_Member'>done</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/access/htup.h.html#LN76"><span class='Ref_to_Macro'>HeapTupleIsValid</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN33"><span class='Ref_to_Member'>tuple</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN495"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Parentheses'>))</span> 
+            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <a href="nodeGatherMerge.c.html#LN494"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN35"><span class='Ref_to_Member'>nTuples</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+}</span><span class='Auto_Annotations'> &laquo; end form_tuple_array &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Store the next tuple for a given reader into the appropriate slot. 
+ * 
+ * Returns false if the reader is exhausted, and true otherwise. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN530"></a><span class='Declare_Function'>gather_merge_readnext</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>reader</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>nowait</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN532"></a>    <a href="nodeGatherMerge.c.html#LN31"><span class='Ref_to_Struct'>GMReaderTupleBuffer</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tuple_buffer</span><span class='Delimiter'>; 
+</span><a name="LN533"></a>    <a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>tup</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * If we're being asked to generate a tuple from the leader, then we just 
+     * call ExecProcNode as normal to produce one. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1902"><span class='Ref_to_Member'>nreaders</span></a> <span class='Operator'>== </span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1909"><span class='Ref_to_Member'>need_to_scan_locally</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN543"></a>            <a href="../../include/nodes/execnodes.h.html#LN808"><span class='Ref_to_Struct'>PlanState</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>outerPlan</span> <span class='Operator'>= </span><a href="../../include/nodes/execnodes.h.html#LN854"><span class='Ref_to_Macro'>outerPlanState</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN544"></a>            <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>outerTupleSlot</span><span class='Delimiter'>; 
+</span> 
+            <a href="nodeGatherMerge.c.html#LN544"><span class='Ref_To_Local'>outerTupleSlot</span></a> <span class='Operator'>= </span><a href="../../include/executor/executor.h.html#LN229"><span class='Ref_to_Proto'>ExecProcNode</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN543"><span class='Ref_To_Local'>outerPlan</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN544"><span class='Ref_To_Local'>outerTupleSlot</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN544"><span class='Ref_To_Local'>outerTupleSlot</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="nodeGatherMerge.c.html#LN36"><span class='Ref_to_Member'>done</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1909"><span class='Ref_to_Member'>need_to_scan_locally</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* Otherwise, check the state of the relevant tuple buffer. */ 
+</span>    <a href="nodeGatherMerge.c.html#LN532"><span class='Ref_To_Local'>tuple_buffer</span></a> <span class='Operator'>= &</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN532"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN35"><span class='Ref_to_Member'>nTuples</span></a> <span class='Operator'>&GT; </span><a href="nodeGatherMerge.c.html#LN532"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN34"><span class='Ref_to_Member'>readCounter</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Return any tuple previously read that is still buffered. */ 
+</span>        <a href="nodeGatherMerge.c.html#LN532"><span class='Ref_To_Local'>tuple_buffer</span></a> <span class='Operator'>= &</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1912"><span class='Ref_to_Member'>gm_tuple_buffers</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>]; 
+</span>        <a href="nodeGatherMerge.c.html#LN533"><span class='Ref_To_Local'>tup</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN532"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN33"><span class='Ref_to_Member'>tuple</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN532"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN34"><span class='Ref_to_Member'>readCounter</span></a><span class='Operator'>++</span><span class='Delimiter'>]; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN532"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN36"><span class='Ref_to_Member'>done</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Reader is known to be exhausted. */ 
+</span>        <a href="../../include/executor/tqueue.h.html#LN28"><span class='Ref_to_Proto'>DestroyTupleQueueReader</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>]</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Read and buffer next tuple. */ 
+</span>        <a href="nodeGatherMerge.c.html#LN533"><span class='Ref_To_Local'>tup</span></a> <span class='Operator'>= </span><a href="../access/common/heaptuple.c.html#LN606"><span class='Ref_to_Func'>heap_copytuple</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN48"><span class='Ref_to_Proto'>gm_readnext_tuple</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Delimiter'>, 
+</span>                                               <a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>, 
+</span>                                               <a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>nowait</span></a><span class='Delimiter'>, 
+</span>                                               <span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN532"><span class='Ref_To_Local'>tuple_buffer</span></a><span class='Operator'>-&GT;</span><a href="nodeGatherMerge.c.html#LN36"><span class='Ref_to_Member'>done</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Attempt to read more tuples in nowait mode and store them in the 
+         * tuple array. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/access/htup.h.html#LN76"><span class='Ref_to_Macro'>HeapTupleIsValid</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN533"><span class='Ref_To_Local'>tup</span></a><span class='Parentheses'>))</span> 
+            <a href="nodeGatherMerge.c.html#LN54"><span class='Ref_to_Proto'>form_tuple_array</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>else</span> 
+            <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../include/access/htup.h.html#LN76"><span class='Ref_to_Macro'>HeapTupleIsValid</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN533"><span class='Ref_To_Local'>tup</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Build the TupleTableSlot for the given tuple */ 
+</span>    <a href="../../include/executor/tuptable.h.html#LN147"><span class='Ref_to_Proto'>ExecStoreTuple</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN533"><span class='Ref_To_Local'>tup</span></a><span class='Delimiter'>,</span>         <span class='Comment_Single_Line'>/* tuple to store */ 
+</span>                   <a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN530"><span class='Ref_to_Parameter'>reader</span></a><span class='Delimiter'>],</span>  <span class='Comment_Multi_Line'>/* slot in which to store the 
+                                                 * tuple */ 
+</span>                   <a href="../../include/storage/buf.h.html#LN24"><span class='Ref_to_Const'>InvalidBuffer</span></a><span class='Delimiter'>,</span>       <span class='Comment_Single_Line'>/* buffer associated with this tuple */ 
+</span>                   <span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* pfree this pointer if not from heap */ 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end gather_merge_readnext &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Attempt to read a tuple from given reader. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a> 
+<a name="LN609"></a><span class='Declare_Function'>gm_readnext_tuple</span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>gm_state</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>nreader</span><span class='Delimiter'>, </span><span class='Keyword'>bool </span><span class='Declare_Parameter'>nowait</span><span class='Delimiter'>, 
+</span><a name="LN610"></a>                  <span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Declare_Parameter'>done</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN612"></a>    <a href="tqueue.c.html#LN167"><span class='Ref_to_Struct'>TupleQueueReader</span></a> <span class='Operator'>*</span><span class='Declare_Local'>reader</span><span class='Delimiter'>; 
+</span><a name="LN613"></a>    <a href="../../include/access/htup.h.html#LN69"><span class='Ref_to_Typedef'>HeapTuple</span></a>   <span class='Declare_Local'>tup</span> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span><a name="LN614"></a>    <a href="../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>oldContext</span><span class='Delimiter'>; 
+</span><a name="LN615"></a>    <a href="../../include/utils/palloc.h.html#LN35"><span class='Ref_to_Typedef'>MemoryContext</span></a> <span class='Declare_Local'>tupleContext</span><span class='Delimiter'>; 
+</span> 
+    <a href="nodeGatherMerge.c.html#LN615"><span class='Ref_To_Local'>tupleContext</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN609"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1899"><span class='Ref_to_Member'>ps</span></a><span class='Operator'>.</span><a href="../../include/nodes/execnodes.h.html#LN842"><span class='Ref_to_Member'>ps_ExprContext</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN202"><span class='Ref_to_Member'>ecxt_per_tuple_memory</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN610"><span class='Ref_to_Parameter'>done</span></a> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <span class='Operator'>*</span><a href="nodeGatherMerge.c.html#LN610"><span class='Ref_to_Parameter'>done</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Check for async events, particularly messages from workers. */ 
+</span>    <a href="../../include/miscadmin.h.html#LN99"><span class='Ref_to_Macro'>CHECK_FOR_INTERRUPTS</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Attempt to read a tuple. */ 
+</span>    <a href="nodeGatherMerge.c.html#LN612"><span class='Ref_To_Local'>reader</span></a> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN609"><span class='Ref_to_Parameter'>gm_state</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1904"><span class='Ref_to_Member'>reader</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN609"><span class='Ref_to_Parameter'>nreader</span></a><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Run TupleQueueReaders in per-tuple context */ 
+</span>    <a href="nodeGatherMerge.c.html#LN614"><span class='Ref_To_Local'>oldContext</span></a> <span class='Operator'>= </span><a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN615"><span class='Ref_To_Local'>tupleContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="nodeGatherMerge.c.html#LN613"><span class='Ref_To_Local'>tup</span></a> <span class='Operator'>= </span><a href="../../include/executor/tqueue.h.html#LN29"><span class='Ref_to_Proto'>TupleQueueReaderNext</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN612"><span class='Ref_To_Local'>reader</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN609"><span class='Ref_to_Parameter'>nowait</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN610"><span class='Ref_to_Parameter'>done</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/palloc.h.html#LN107"><span class='Ref_to_Func'>MemoryContextSwitchTo</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN614"><span class='Ref_To_Local'>oldContext</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="nodeGatherMerge.c.html#LN613"><span class='Ref_To_Local'>tup</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end gm_readnext_tuple &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * We have one slot for each item in the heap array.  We use SlotNumber 
+ * to store slot indexes.  This doesn't actually provide any formal 
+ * type-safety, but it makes the code more self-documenting. 
+ */ 
+</span><a name="LN641"></a><span class='Control'>typedef</span> <a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> <span class='Declare_Typedef'>SlotNumber</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Compare the tuples in the two given slots. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/c.h.html#LN255"><span class='Ref_to_Typedef'>int32</span></a> 
+<a name="LN647"></a><span class='Declare_Function'>heap_compare_slots</span><span class='Parentheses'>(</span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>a</span><span class='Delimiter'>, </span><a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> <span class='Declare_Parameter'>b</span><span class='Delimiter'>, </span><span class='Keyword'>void </span><span class='Operator'>*</span><span class='Declare_Parameter'>arg</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN649"></a>    <a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Declare_Local'>node</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/nodes/execnodes.h.html#LN1897"><span class='Ref_to_Struct'>GatherMergeState</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="nodeGatherMerge.c.html#LN647"><span class='Ref_to_Parameter'>arg</span></a><span class='Delimiter'>; 
+</span><a name="LN650"></a>    <a href="nodeMergeAppend.c.html#LN50"><span class='Ref_to_Typedef'>SlotNumber</span></a>  <span class='Declare_Local'>slot1</span> <span class='Operator'>= </span><a href="../../include/postgres.h.html#LN477"><span class='Ref_to_Macro'>DatumGetInt32</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN647"><span class='Ref_to_Parameter'>a</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN651"></a>    <a href="nodeMergeAppend.c.html#LN50"><span class='Ref_to_Typedef'>SlotNumber</span></a>  <span class='Declare_Local'>slot2</span> <span class='Operator'>= </span><a href="../../include/postgres.h.html#LN477"><span class='Ref_to_Macro'>DatumGetInt32</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN647"><span class='Ref_to_Parameter'>b</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+<a name="LN653"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>s1</span> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN649"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN650"><span class='Ref_To_Local'>slot1</span></a><span class='Delimiter'>]; 
+</span><a name="LN654"></a>    <a href="../../include/executor/tuptable.h.html#LN112"><span class='Ref_to_Struct'>TupleTableSlot</span></a> <span class='Operator'>*</span><span class='Declare_Local'>s2</span> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN649"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1906"><span class='Ref_to_Member'>gm_slots</span></a><span class='Delimiter'>[</span><a href="nodeGatherMerge.c.html#LN651"><span class='Ref_To_Local'>slot2</span></a><span class='Delimiter'>]; 
+</span><a name="LN655"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>nkey</span><span class='Delimiter'>; 
+</span> 
+    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN653"><span class='Ref_To_Local'>s1</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/executor/tuptable.h.html#LN137"><span class='Ref_to_Macro'>TupIsNull</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN654"><span class='Ref_To_Local'>s2</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN655"><span class='Ref_To_Local'>nkey</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN655"><span class='Ref_To_Local'>nkey</span></a> <span class='Operator'>&LT; </span><a href="nodeGatherMerge.c.html#LN649"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1910"><span class='Ref_to_Member'>gm_nkeys</span></a><span class='Delimiter'>; </span><a href="nodeGatherMerge.c.html#LN655"><span class='Ref_To_Local'>nkey</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN662"></a>        <a href="../../include/utils/sortsupport.h.html#LN57"><span class='Ref_to_Typedef'>SortSupport</span></a> <span class='Declare_Local'>sortKey</span> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN649"><span class='Ref_To_Local'>node</span></a><span class='Operator'>-&GT;</span><a href="../../include/nodes/execnodes.h.html#LN1911"><span class='Ref_to_Member'>gm_sortkeys</span></a> <span class='Operator'>+ </span><a href="nodeGatherMerge.c.html#LN655"><span class='Ref_To_Local'>nkey</span></a><span class='Delimiter'>; 
+</span><a name="LN663"></a>        <a href="../../include/access/attnum.h.html#LN20"><span class='Ref_to_Typedef'>AttrNumber</span></a>  <span class='Declare_Local'>attno</span> <span class='Operator'>= </span><a href="nodeGatherMerge.c.html#LN662"><span class='Ref_To_Local'>sortKey</span></a><span class='Operator'>-&GT;</span><a href="../../include/utils/sortsupport.h.html#LN80"><span class='Ref_to_Member'>ssup_attno</span></a><span class='Delimiter'>; 
+</span><a name="LN664"></a>        <a href="../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a>       <span class='Declare_Local'>datum1</span><span class='Delimiter'>, 
+</span><a name="LN665"></a>                    <span class='Declare_Local'>datum2</span><span class='Delimiter'>; 
+</span><a name="LN666"></a>        <span class='Keyword'>bool</span>        <span class='Declare_Local'>isNull1</span><span class='Delimiter'>, 
+</span><a name="LN667"></a>                    <span class='Declare_Local'>isNull2</span><span class='Delimiter'>; 
+</span><a name="LN668"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>compare</span><span class='Delimiter'>; 
+</span> 
+        <a href="nodeGatherMerge.c.html#LN664"><span class='Ref_To_Local'>datum1</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN167"><span class='Ref_to_Proto'>slot_getattr</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN653"><span class='Ref_To_Local'>s1</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN663"><span class='Ref_To_Local'>attno</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN666"><span class='Ref_To_Local'>isNull1</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="nodeGatherMerge.c.html#LN665"><span class='Ref_To_Local'>datum2</span></a> <span class='Operator'>= </span><a href="../../include/executor/tuptable.h.html#LN167"><span class='Ref_to_Proto'>slot_getattr</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN654"><span class='Ref_To_Local'>s2</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN663"><span class='Ref_To_Local'>attno</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="nodeGatherMerge.c.html#LN667"><span class='Ref_To_Local'>isNull2</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <a href="nodeGatherMerge.c.html#LN668"><span class='Ref_To_Local'>compare</span></a> <span class='Operator'>= </span><a href="../../include/utils/sortsupport.h.html#LN199"><span class='Ref_to_Func'>ApplySortComparator</span></a><span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN664"><span class='Ref_To_Local'>datum1</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN666"><span class='Ref_To_Local'>isNull1</span></a><span class='Delimiter'>, 
+</span>                                      <a href="nodeGatherMerge.c.html#LN665"><span class='Ref_To_Local'>datum2</span></a><span class='Delimiter'>, </span><a href="nodeGatherMerge.c.html#LN667"><span class='Ref_To_Local'>isNull2</span></a><span class='Delimiter'>, 
+</span>                                      <a href="nodeGatherMerge.c.html#LN662"><span class='Ref_To_Local'>sortKey</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="nodeGatherMerge.c.html#LN668"><span class='Ref_To_Local'>compare</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Control'>return</span> <span class='Operator'>-</span><a href="nodeGatherMerge.c.html#LN668"><span class='Ref_To_Local'>compare</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end heap_compare_slots &raquo; </span> 
+</pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

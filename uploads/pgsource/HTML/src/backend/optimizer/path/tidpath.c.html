@@ -1,0 +1,297 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\optimizer\path\tidpath.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\optimizer\path\tidpath.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:42 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * tidpath.c 
+ *    Routines to determine which TID conditions are usable for scanning 
+ *    a given relation, and create TidPaths accordingly. 
+ * 
+ * What we are looking for here is WHERE conditions of the form 
+ * "CTID = pseudoconstant", which can be implemented by just fetching 
+ * the tuple directly via heap_fetch().  We can also handle OR'd conditions 
+ * such as (CTID = const1) OR (CTID = const2), as well as ScalarArrayOpExpr 
+ * conditions of the form CTID = ANY(pseudoconstant_array).  In particular 
+ * this allows 
+ *      WHERE ctid IN (tid1, tid2, ...) 
+ * 
+ * We also support "WHERE CURRENT OF cursor" conditions (CurrentOfExpr), 
+ * which amount to "CTID = run-time-determined-TID".  These could in 
+ * theory be translated to a simple comparison of CTID to the result of 
+ * a function, but in practice it works better to keep the special node 
+ * representation all the way through to execution. 
+ * 
+ * There is currently no special support for joins involving CTID; in 
+ * particular nothing corresponding to best_inner_indexscan().  Since it's 
+ * not very useful to store TIDs of one table in another table, there 
+ * doesn't seem to be enough use-case to justify adding a lot of code 
+ * for that. 
+ * 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/optimizer/path/tidpath.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/sysattr.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_operator.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"catalog/pg_type.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"nodes/nodeFuncs.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"optimizer/clauses.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"optimizer/pathnode.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"optimizer/paths.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"optimizer/restrictinfo.h"</span> 
+ 
+ 
+<a name="LN48"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>IsTidEqualClause</span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN491"><span class='Ref_to_Struct'>OpExpr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>varno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN49"></a><span class='Keyword'>static bool </span><span class='Declare_Prototype'>IsTidEqualAnyClause</span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN534"><span class='Ref_to_Struct'>ScalarArrayOpExpr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>varno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN50"></a><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>TidQualFromExpr</span><span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>expr</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>varno</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN51"></a><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>*</span><span class='Declare_Prototype'>TidQualFromBaseRestrictinfo</span><span class='Parentheses'>(</span><a href="../../../include/nodes/relation.h.html#LN517"><span class='Ref_to_Struct'>RelOptInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>rel</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Check to see if an opclause is of the form 
+ *      CTID = pseudoconstant 
+ * or 
+ *      pseudoconstant = CTID 
+ * 
+ * We check that the CTID Var belongs to relation "varno".  That is probably 
+ * redundant considering this is only applied to restriction clauses, but 
+ * let's be safe. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN65"></a><span class='Declare_Function'>IsTidEqualClause</span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN491"><span class='Ref_to_Struct'>OpExpr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>varno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN67"></a>    <a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>arg1</span><span class='Delimiter'>, 
+</span><a name="LN68"></a>               <span class='Operator'>*</span><span class='Declare_Local'>arg2</span><span class='Delimiter'>, 
+</span><a name="LN69"></a>               <span class='Operator'>*</span><span class='Declare_Local'>other</span><span class='Delimiter'>; 
+</span><a name="LN70"></a>    <a href="../../../include/nodes/primnodes.h.html#LN162"><span class='Ref_to_Struct'>Var</span></a>        <span class='Operator'>*</span><span class='Declare_Local'>var</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Operator must be tideq */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN65"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN494"><span class='Ref_to_Member'>opno</span></a> <span class='Operator'>!= </span><a href="../../../include/catalog/pg_operator.h.html#LN161"><span class='Ref_to_Const'>TIDEqualOperator</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN65"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN500"><span class='Ref_to_Member'>args</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Number'>2</span><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <a href="tidpath.c.html#LN67"><span class='Ref_To_Local'>arg1</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN110"><span class='Ref_to_Macro'>linitial</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN65"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN500"><span class='Ref_to_Member'>args</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="tidpath.c.html#LN68"><span class='Ref_To_Local'>arg2</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN115"><span class='Ref_to_Macro'>lsecond</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN65"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN500"><span class='Ref_to_Member'>args</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Look for CTID as either argument */ 
+</span>    <a href="tidpath.c.html#LN69"><span class='Ref_To_Local'>other</span></a> <span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN67"><span class='Ref_To_Local'>arg1</span></a> <span class='Operator'>&& </span><a href="../../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN67"><span class='Ref_To_Local'>arg1</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/primnodes.h.html#LN162"><span class='Ref_to_Struct'>Var</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN162"><span class='Ref_to_Struct'>Var</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tidpath.c.html#LN67"><span class='Ref_To_Local'>arg1</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN167"><span class='Ref_to_Member'>varattno</span></a> <span class='Operator'>== </span><a href="../../../include/access/sysattr.h.html#LN20"><span class='Ref_to_Const'>SelfItemPointerAttributeNumber</span></a> <span class='Operator'>&& 
+</span>            <a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN169"><span class='Ref_to_Member'>vartype</span></a> <span class='Operator'>== </span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN28"><span class='Ref_to_Const'>TIDOID</span></a> <span class='Operator'>&& 
+</span>            <a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN165"><span class='Ref_to_Member'>varno</span></a> <span class='Operator'>== </span><a href="tidpath.c.html#LN65"><span class='Ref_to_Parameter'>varno</span></a> <span class='Operator'>&& 
+</span>            <a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN172"><span class='Ref_to_Member'>varlevelsup</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="tidpath.c.html#LN69"><span class='Ref_To_Local'>other</span></a> <span class='Operator'>= </span><a href="tidpath.c.html#LN68"><span class='Ref_To_Local'>arg2</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tidpath.c.html#LN69"><span class='Ref_To_Local'>other</span></a> <span class='Operator'>&& </span><a href="tidpath.c.html#LN68"><span class='Ref_To_Local'>arg2</span></a> <span class='Operator'>&& </span><a href="../../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN68"><span class='Ref_To_Local'>arg2</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/primnodes.h.html#LN162"><span class='Ref_to_Struct'>Var</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN162"><span class='Ref_to_Struct'>Var</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tidpath.c.html#LN68"><span class='Ref_To_Local'>arg2</span></a><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN167"><span class='Ref_to_Member'>varattno</span></a> <span class='Operator'>== </span><a href="../../../include/access/sysattr.h.html#LN20"><span class='Ref_to_Const'>SelfItemPointerAttributeNumber</span></a> <span class='Operator'>&& 
+</span>            <a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN169"><span class='Ref_to_Member'>vartype</span></a> <span class='Operator'>== </span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN28"><span class='Ref_to_Const'>TIDOID</span></a> <span class='Operator'>&& 
+</span>            <a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN165"><span class='Ref_to_Member'>varno</span></a> <span class='Operator'>== </span><a href="tidpath.c.html#LN65"><span class='Ref_to_Parameter'>varno</span></a> <span class='Operator'>&& 
+</span>            <a href="tidpath.c.html#LN70"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN172"><span class='Ref_to_Member'>varlevelsup</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="tidpath.c.html#LN69"><span class='Ref_To_Local'>other</span></a> <span class='Operator'>= </span><a href="tidpath.c.html#LN67"><span class='Ref_To_Local'>arg1</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tidpath.c.html#LN69"><span class='Ref_To_Local'>other</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/nodes/nodeFuncs.h.html#LN31"><span class='Ref_to_Proto'>exprType</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN69"><span class='Ref_To_Local'>other</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN28"><span class='Ref_to_Const'>TIDOID</span></a><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>;</span>           <span class='Comment_Single_Line'>/* probably can't happen */ 
+</span> 
+    <span class='Comment_Multi_Line'>/* The other argument must be a pseudoconstant */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/optimizer/clauses.h.html#LN72"><span class='Ref_to_Proto'>is_pseudo_constant_clause</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN69"><span class='Ref_To_Local'>other</span></a><span class='Parentheses'>))</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>;</span>                <span class='Comment_Single_Line'>/* success */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end IsTidEqualClause &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Check to see if a clause is of the form 
+ *      CTID = ANY (pseudoconstant_array) 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN117"></a><span class='Declare_Function'>IsTidEqualAnyClause</span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN534"><span class='Ref_to_Struct'>ScalarArrayOpExpr</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>node</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>varno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN119"></a>    <a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>arg1</span><span class='Delimiter'>, 
+</span><a name="LN120"></a>               <span class='Operator'>*</span><span class='Declare_Local'>arg2</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Operator must be tideq */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN117"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN537"><span class='Ref_to_Member'>opno</span></a> <span class='Operator'>!= </span><a href="../../../include/catalog/pg_operator.h.html#LN161"><span class='Ref_to_Const'>TIDEqualOperator</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="tidpath.c.html#LN117"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN539"><span class='Ref_to_Member'>useOr</span></a><span class='Parentheses'>) 
+</span>        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/nodes/pg_list.h.html#LN87"><span class='Ref_to_Func'>list_length</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN117"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN541"><span class='Ref_to_Member'>args</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="tidpath.c.html#LN119"><span class='Ref_To_Local'>arg1</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN110"><span class='Ref_to_Macro'>linitial</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN117"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN541"><span class='Ref_to_Member'>args</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="tidpath.c.html#LN120"><span class='Ref_To_Local'>arg2</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN115"><span class='Ref_to_Macro'>lsecond</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN117"><span class='Ref_to_Parameter'>node</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN541"><span class='Ref_to_Member'>args</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* CTID must be first argument */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN119"><span class='Ref_To_Local'>arg1</span></a> <span class='Operator'>&& </span><a href="../../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN119"><span class='Ref_To_Local'>arg1</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/primnodes.h.html#LN162"><span class='Ref_to_Struct'>Var</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN134"></a>        <a href="../../../include/nodes/primnodes.h.html#LN162"><span class='Ref_to_Struct'>Var</span></a>        <span class='Operator'>*</span><span class='Declare_Local'>var</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/primnodes.h.html#LN162"><span class='Ref_to_Struct'>Var</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tidpath.c.html#LN119"><span class='Ref_To_Local'>arg1</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN134"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN167"><span class='Ref_to_Member'>varattno</span></a> <span class='Operator'>== </span><a href="../../../include/access/sysattr.h.html#LN20"><span class='Ref_to_Const'>SelfItemPointerAttributeNumber</span></a> <span class='Operator'>&& 
+</span>            <a href="tidpath.c.html#LN134"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN169"><span class='Ref_to_Member'>vartype</span></a> <span class='Operator'>== </span><a href="../../../interfaces/ecpg/ecpglib/pg_type.h.html#LN28"><span class='Ref_to_Const'>TIDOID</span></a> <span class='Operator'>&& 
+</span>            <a href="tidpath.c.html#LN134"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN165"><span class='Ref_to_Member'>varno</span></a> <span class='Operator'>== </span><a href="tidpath.c.html#LN117"><span class='Ref_to_Parameter'>varno</span></a> <span class='Operator'>&& 
+</span>            <a href="tidpath.c.html#LN134"><span class='Ref_To_Local'>var</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/primnodes.h.html#LN172"><span class='Ref_to_Member'>varlevelsup</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* The other argument must be a pseudoconstant */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN72"><span class='Ref_to_Proto'>is_pseudo_constant_clause</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN120"><span class='Ref_To_Local'>arg2</span></a><span class='Parentheses'>))</span> 
+                <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* success */ 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end IsTidEqualAnyClause &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ *  Extract a set of CTID conditions from the given qual expression 
+ * 
+ *  Returns a List of CTID qual expressions (with implicit OR semantics 
+ *  across the list), or NIL if there are no usable conditions. 
+ * 
+ *  If the expression is an AND clause, we can use a CTID condition 
+ *  from any sub-clause.  If it is an OR clause, we must be able to 
+ *  extract a CTID condition from every sub-clause, or we can't use it. 
+ * 
+ *  In theory, in the AND case we could get CTID conditions from different 
+ *  sub-clauses, in which case we could try to pick the most efficient one. 
+ *  In practice, such usage seems very unlikely, so we don't bother; we 
+ *  just exit as soon as we find the first candidate. 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN166"></a><span class='Declare_Function'>TidQualFromExpr</span><span class='Parentheses'>(</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>expr</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>varno</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN168"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>rlst</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN169"></a>    <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>l</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN19"><span class='Ref_to_Macro'>is_opclause</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* base case: check for tideq opclause */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN48"><span class='Ref_to_Proto'>IsTidEqualClause</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/primnodes.h.html#LN491"><span class='Ref_to_Struct'>OpExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Delimiter'>, </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>varno</span></a><span class='Parentheses'>))</span> 
+            <a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN138"><span class='Ref_to_Macro'>list_make1</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a> <span class='Operator'>&& </span><a href="../../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/primnodes.h.html#LN534"><span class='Ref_to_Struct'>ScalarArrayOpExpr</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* another base case: check for tid = ANY clause */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN49"><span class='Ref_to_Proto'>IsTidEqualAnyClause</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/primnodes.h.html#LN534"><span class='Ref_to_Struct'>ScalarArrayOpExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Delimiter'>, </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>varno</span></a><span class='Parentheses'>))</span> 
+            <a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN138"><span class='Ref_to_Macro'>list_make1</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a> <span class='Operator'>&& </span><a href="../../../include/nodes/nodes.h.html#LN559"><span class='Ref_to_Macro'>IsA</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Delimiter'>, </span><a href="../../../include/nodes/primnodes.h.html#LN1272"><span class='Ref_to_Struct'>CurrentOfExpr</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* another base case: check for CURRENT OF on this rel */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(((</span><a href="../../../include/nodes/primnodes.h.html#LN1272"><span class='Ref_to_Struct'>CurrentOfExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>cvarno <span class='Operator'>== </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>varno</span></a><span class='Parentheses'>)</span> 
+            <a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN138"><span class='Ref_to_Macro'>list_make1</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN42"><span class='Ref_to_Proto'>and_clause</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN169"><span class='Ref_To_Local'>l</span></a><span class='Delimiter'>, </span><span class='Parentheses'>((</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>args<span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a> <span class='Operator'>= </span><a href="tidpath.c.html#LN50"><span class='Ref_to_Proto'>TidQualFromExpr</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN169"><span class='Ref_To_Local'>l</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>varno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a><span class='Parentheses'>) 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/optimizer/clauses.h.html#LN39"><span class='Ref_to_Proto'>or_clause</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN169"><span class='Ref_To_Local'>l</span></a><span class='Delimiter'>, </span><span class='Parentheses'>((</span><a href="../../../include/nodes/primnodes.h.html#LN557"><span class='Ref_to_Struct'>BoolExpr</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>expr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>args<span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN202"></a>            <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>frtn</span> <span class='Operator'>= </span><a href="tidpath.c.html#LN50"><span class='Ref_to_Proto'>TidQualFromExpr</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN169"><span class='Ref_To_Local'>l</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="tidpath.c.html#LN166"><span class='Ref_to_Parameter'>varno</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN202"><span class='Ref_To_Local'>frtn</span></a><span class='Parentheses'>) 
+</span>                <a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN219"><span class='Ref_to_Proto'>list_concat</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a><span class='Delimiter'>, </span><a href="tidpath.c.html#LN202"><span class='Ref_To_Local'>frtn</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a><span class='Parentheses'>) 
+</span>                    <a href="../../../include/nodes/pg_list.h.html#LN265"><span class='Ref_to_Proto'>list_free</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <a href="tidpath.c.html#LN168"><span class='Ref_To_Local'>rlst</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TidQualFromExpr &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ *  Extract a set of CTID conditions from the rel's baserestrictinfo list 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a> <span class='Operator'>* 
+</span><a name="LN222"></a><span class='Declare_Function'>TidQualFromBaseRestrictinfo</span><span class='Parentheses'>(</span><a href="../../../include/nodes/relation.h.html#LN517"><span class='Ref_to_Struct'>RelOptInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>rel</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN224"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>rlst</span> <span class='Operator'>= </span><a href="../../../include/nodes/pg_list.h.html#LN68"><span class='Ref_to_Const'>NIL</span></a><span class='Delimiter'>; 
+</span><a name="LN225"></a>    <a href="../../../include/nodes/pg_list.h.html#LN52"><span class='Ref_to_Struct'>ListCell</span></a>   <span class='Operator'>*</span><span class='Declare_Local'>l</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/nodes/pg_list.h.html#LN160"><span class='Ref_to_Macro'>foreach</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN225"><span class='Ref_To_Local'>l</span></a><span class='Delimiter'>, </span><a href="tidpath.c.html#LN222"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/relation.h.html#LN583"><span class='Ref_to_Member'>baserestrictinfo</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span><a name="LN229"></a>        <a href="../../../include/nodes/relation.h.html#LN1742"><span class='Ref_to_Struct'>RestrictInfo</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rinfo</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/nodes/relation.h.html#LN1742"><span class='Ref_to_Struct'>RestrictInfo</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/nodes/pg_list.h.html#LN105"><span class='Ref_to_Macro'>lfirst</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN225"><span class='Ref_To_Local'>l</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If clause must wait till after some lower-security-level 
+         * restriction clause, reject it. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/optimizer/restrictinfo.h.html#LN32"><span class='Ref_to_Proto'>restriction_is_securely_promotable</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN229"><span class='Ref_To_Local'>rinfo</span></a><span class='Delimiter'>, </span><a href="tidpath.c.html#LN222"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>))</span> 
+            <span class='Control'>continue</span><span class='Delimiter'>; 
+</span> 
+        <a href="tidpath.c.html#LN224"><span class='Ref_To_Local'>rlst</span></a> <span class='Operator'>= </span><a href="tidpath.c.html#LN50"><span class='Ref_to_Proto'>TidQualFromExpr</span></a><span class='Parentheses'>((</span><a href="../../../include/nodes/nodes.h.html#LN508"><span class='Ref_to_Struct'>Node</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="tidpath.c.html#LN229"><span class='Ref_To_Local'>rinfo</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/relation.h.html#LN1746"><span class='Ref_to_Member'>clause</span></a><span class='Delimiter'>, </span><a href="tidpath.c.html#LN222"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/relation.h.html#LN552"><span class='Ref_to_Member'>relid</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN224"><span class='Ref_To_Local'>rlst</span></a><span class='Parentheses'>) 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <a href="tidpath.c.html#LN224"><span class='Ref_To_Local'>rlst</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end TidQualFromBaseRestrictinfo &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * create_tidscan_paths 
+ *    Create paths corresponding to direct TID scans of the given rel. 
+ * 
+ *    Candidate paths are added to the rel's pathlist (using add_path). 
+ */ 
+</span><span class='Keyword'>void 
+</span><a name="LN252"></a><span class='Declare_Function'>create_tidscan_paths</span><span class='Parentheses'>(</span><a href="../../../include/nodes/relation.h.html#LN150"><span class='Ref_to_Struct'>PlannerInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>root</span><span class='Delimiter'>, </span><a href="../../../include/nodes/relation.h.html#LN517"><span class='Ref_to_Struct'>RelOptInfo</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>rel</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN254"></a>    <a href="../../../include/nodes/relation.h.html#LN27"><span class='Ref_to_Typedef'>Relids</span></a>      <span class='Declare_Local'>required_outer</span><span class='Delimiter'>; 
+</span><a name="LN255"></a>    <a href="../../../include/nodes/pg_list.h.html#LN44"><span class='Ref_to_Struct'>List</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>tidquals</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We don't support pushing join clauses into the quals of a tidscan, but 
+     * it could still have required parameterization due to LATERAL refs in 
+     * its tlist. 
+     */ 
+</span>    <a href="tidpath.c.html#LN254"><span class='Ref_To_Local'>required_outer</span></a> <span class='Operator'>= </span><a href="tidpath.c.html#LN252"><span class='Ref_to_Parameter'>rel</span></a><span class='Operator'>-&GT;</span><a href="../../../include/nodes/relation.h.html#LN549"><span class='Ref_to_Member'>lateral_relids</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="tidpath.c.html#LN255"><span class='Ref_To_Local'>tidquals</span></a> <span class='Operator'>= </span><a href="tidpath.c.html#LN51"><span class='Ref_to_Proto'>TidQualFromBaseRestrictinfo</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN252"><span class='Ref_to_Parameter'>rel</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="tidpath.c.html#LN255"><span class='Ref_To_Local'>tidquals</span></a><span class='Parentheses'>) 
+</span>        <a href="../../../include/optimizer/pathnode.h.html#LN27"><span class='Ref_to_Proto'>add_path</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN252"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/nodes/relation.h.html#LN946"><span class='Ref_to_Struct'>Path</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/optimizer/pathnode.h.html#LN63"><span class='Ref_to_Proto'>create_tidscan_path</span></a><span class='Parentheses'>(</span><a href="tidpath.c.html#LN252"><span class='Ref_to_Parameter'>root</span></a><span class='Delimiter'>, </span><a href="tidpath.c.html#LN252"><span class='Ref_to_Parameter'>rel</span></a><span class='Delimiter'>, </span><a href="tidpath.c.html#LN255"><span class='Ref_To_Local'>tidquals</span></a><span class='Delimiter'>, 
+</span>                                                   <a href="tidpath.c.html#LN254"><span class='Ref_To_Local'>required_outer</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

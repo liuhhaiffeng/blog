@@ -1,0 +1,759 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\postmaster\pgarch.c</title>
+<LINK REL=StyleSheet HREF="../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\postmaster\pgarch.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:45 2017
+</td></tr>
+<tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+<span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * pgarch.c 
+ * 
+ *  PostgreSQL WAL archiver 
+ * 
+ *  All functions relating to archiver are included here 
+ * 
+ *  - All functions executed by archiver process 
+ * 
+ *  - archiver is forked from postmaster, and the two 
+ *  processes then communicate using signals. All functions 
+ *  executed by postmaster are included in this file. 
+ * 
+ *  Initial author: Simon Riggs     simon@2ndquadrant.com 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/postmaster/pgarch.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;fcntl.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;signal.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;time.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/time.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/wait.h&GT;</span> 
+<span class='Keyword'>#include </span><span class='String'>&LT;unistd.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/xlog_internal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"libpq/pqsignal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"miscadmin.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"pgstat.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/fork_process.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/pgarch.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"postmaster/postmaster.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/dsm.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/fd.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/ipc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/latch.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/pg_shmem.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"storage/pmsignal.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/guc.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/ps_status.h"</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* ---------- 
+ * Timer definitions. 
+ * ---------- 
+ */ 
+</span><a name="LN56"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PGARCH_AUTOWAKE_INTERVAL</span> <span class='Number'>60</span>     <span class='Comment_Multi_Line'>/* How often to force a poll of the 
+                                         * archive status directory; in 
+                                         * seconds. */ 
+</span><a name="LN59"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>PGARCH_RESTART_INTERVAL</span> <span class='Number'>10</span>      <span class='Comment_Multi_Line'>/* How often to attempt to restart a 
+                                         * failed archiver; in seconds. */ 
+</span> 
+<a name="LN62"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>NUM_ARCHIVE_RETRIES</span> <span class='Number'>3</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* ---------- 
+ * Local data 
+ * ---------- 
+ */ 
+</span><a name="LN69"></a><span class='Keyword'>static </span>time_t <span class='Declare_Var'>last_pgarch_start_time</span><span class='Delimiter'>; 
+</span><a name="LN70"></a><span class='Keyword'>static </span>time_t <span class='Declare_Var'>last_sigterm_time</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Flags set by interrupt handlers for later service in the main loop. 
+ */ 
+</span><a name="LN75"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>got_SIGHUP</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN76"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>got_SIGTERM</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN77"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>wakened</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span><a name="LN78"></a><span class='Keyword'>static volatile </span>sig_atomic_t <span class='Declare_Var'>ready_to_stop</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+<span class='Comment_Multi_Line'>/* ---------- 
+ * Local function forward declarations 
+ * ---------- 
+ */ 
+</span><span class='Directive'>#ifdef</span> EXEC_BACKEND 
+<a name="LN85"></a><span class='Keyword'>static </span><a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a> <span class='Declare_Prototype'>pgarch_forkexec</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+<a name="LN88"></a><a href="../../include/c.h.html#LN1118"><span class='Ref_to_Const'>NON_EXEC_STATIC</span></a> <span class='Keyword'>void </span><span class='Declare_Function'>PgArchiverMain</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>argc</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>argv</span><span class='Delimiter'>[]</span><span class='Parentheses'>) </span><a href="../replication/logical/tablesync.c.html#LN118"><span class='Ref_to_Func'>pg_attribute_noreturn</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static void </span><a href="pgarch.c.html#LN247"><span class='Ref_to_Func'>pgarch_exit</span></a><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static void </span><a href="pgarch.c.html#LN255"><span class='Ref_to_Func'>ArchSigHupHandler</span></a><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static void </span><a href="pgarch.c.html#LN268"><span class='Ref_to_Func'>ArchSigTermHandler</span></a><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static void </span><a href="pgarch.c.html#LN286"><span class='Ref_to_Func'>pgarch_waken</span></a><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static void </span><a href="pgarch.c.html#LN299"><span class='Ref_to_Func'>pgarch_waken_stop</span></a><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static void </span><a href="pgarch.c.html#LN316"><span class='Ref_to_Func'>pgarch_MainLoop</span></a><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static void </span><a href="pgarch.c.html#LN414"><span class='Ref_to_Func'>pgarch_ArchiverCopyLoop</span></a><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static bool </span><a href="pgarch.c.html#LN501"><span class='Ref_to_Func'>pgarch_archiveXlog</span></a><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span>xlog<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static bool </span><a href="pgarch.c.html#LN659"><span class='Ref_to_Func'>pgarch_readyXlog</span></a><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span>xlog<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><span class='Keyword'>static void </span><a href="pgarch.c.html#LN722"><span class='Ref_to_Func'>pgarch_archiveDone</span></a><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span>xlog<span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* ------------------------------------------------------------ 
+ * Public functions called from postmaster follow 
+ * ------------------------------------------------------------ 
+ */ 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * pgarch_start 
+ * 
+ *  Called from postmaster at startup or after an existing archiver 
+ *  died.  Attempt to fire up a fresh archiver process. 
+ * 
+ *  Returns PID of child process, or 0 if fail. 
+ * 
+ *  Note: if fail, we will be called again from the postmaster main loop. 
+ */ 
+</span><span class='Keyword'>int 
+</span><a href="../../include/postmaster/pgarch.h.html#LN32"><span class='Ref_to_Proto'>pgarch_start</span></a><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN119"></a>    time_t      <span class='Declare_Local'>curtime</span><span class='Delimiter'>; 
+</span><a name="LN120"></a>    <a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a>       <span class='Declare_Local'>pgArchPid</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Do nothing if no archiver needed 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/access/xlog.h.html#LN133"><span class='Ref_to_Macro'>XLogArchivingActive</span></a><span class='Parentheses'>())</span> 
+        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Do nothing if too soon since last archiver start.  This is a safety 
+     * valve to protect against continuous respawn attempts if the archiver is 
+     * dying immediately at launch. Note that since we will be re-called from 
+     * the postmaster main loop, we will get another chance later. 
+     */ 
+</span>    <a href="pgarch.c.html#LN119"><span class='Ref_To_Local'>curtime</span></a> <span class='Operator'>= </span>time<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>((</span><span class='Keyword'>unsigned int</span><span class='Parentheses'>) (</span><a href="pgarch.c.html#LN119"><span class='Ref_To_Local'>curtime</span></a> <span class='Operator'>- </span><a href="pgarch.c.html#LN69"><span class='Ref_to_Global_Var'>last_pgarch_start_time</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; 
+</span>        <span class='Parentheses'>(</span><span class='Keyword'>unsigned int</span><span class='Parentheses'>) </span><a href="pgarch.c.html#LN59"><span class='Ref_to_Const'>PGARCH_RESTART_INTERVAL</span></a><span class='Parentheses'>)</span> 
+        <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="pgarch.c.html#LN69"><span class='Ref_to_Global_Var'>last_pgarch_start_time</span></a> <span class='Operator'>= </span><a href="pgarch.c.html#LN119"><span class='Ref_To_Local'>curtime</span></a><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifdef</span> EXEC_BACKEND 
+    <span class='Control'>switch</span> <span class='Parentheses'>((</span><a href="pgarch.c.html#LN120"><span class='Ref_To_Local'>pgArchPid</span></a> <span class='Operator'>= </span><a href="pgarch.c.html#LN85"><span class='Ref_to_Proto'>pgarch_forkexec</span></a><span class='Parentheses'>()))</span> 
+<span class='Directive'>#else</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>((</span><a href="pgarch.c.html#LN120"><span class='Ref_To_Local'>pgArchPid</span></a> <span class='Operator'>= </span><a href="../../include/postmaster/fork_process.h.html#LN14"><span class='Ref_to_Proto'>fork_process</span></a><span class='Parentheses'>()))</span> 
+<span class='Directive'>#endif</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <span class='Operator'>-</span><span class='Number'>1</span><span class='Operator'>: 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not fork archiver: %m"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+<span class='Directive'>#ifndef</span> EXEC_BACKEND 
+        <span class='Control'>case</span> <span class='Number'>0</span><span class='Operator'>: 
+</span>            <span class='Comment_Multi_Line'>/* in postmaster child ... */ 
+</span>            <a href="../utils/init/miscinit.c.html#LN173"><span class='Ref_to_Func'>InitPostmasterChild</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Close the postmaster's sockets */ 
+</span>            <a href="../../include/postmaster/postmaster.h.html#LN49"><span class='Ref_to_Proto'>ClosePostmasterPorts</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* Drop our connection to postmaster's shared memory, as well */ 
+</span>            <a href="../../include/storage/dsm.h.html#LN29"><span class='Ref_to_Proto'>dsm_detach_all</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="../../include/storage/pg_shmem.h.html#LN69"><span class='Ref_to_Proto'>PGSharedMemoryDetach</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+            <a href="pgarch.c.html#LN88"><span class='Ref_to_Func'>PgArchiverMain</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Delimiter'>, </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+ 
+        <span class='Control'>default</span><span class='Operator'>: 
+</span>            <span class='Control'>return</span> <span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span><a href="pgarch.c.html#LN120"><span class='Ref_To_Local'>pgArchPid</span></a><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch (pgArchPid=fork_proce... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* shouldn't get here */ 
+</span>    <span class='Control'>return</span> <span class='Number'>0</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end PgArchiverMain &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* ------------------------------------------------------------ 
+ * Local functions called by archiver follow 
+ * ------------------------------------------------------------ 
+ */ 
+</span> 
+ 
+<span class='Directive'>#ifdef</span> EXEC_BACKEND 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * pgarch_forkexec() - 
+ * 
+ * Format up the arglist for, then fork and exec, archive process 
+ */ 
+</span><span class='Keyword'>static </span><a href="../../include/port/win32.h.html#LN255"><span class='Ref_to_Typedef'>pid_t</span></a> 
+<a name="LN189"></a><span class='Declare_Function'>pgarch_forkexec</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN191"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>av</span><span class='Delimiter'>[</span><span class='Number'>10</span><span class='Delimiter'>]; 
+</span><a name="LN192"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>ac</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <a href="pgarch.c.html#LN191"><span class='Ref_To_Local'>av</span></a><span class='Delimiter'>[</span><a href="pgarch.c.html#LN192"><span class='Ref_To_Local'>ac</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>"postgres"</span><span class='Delimiter'>; 
+</span> 
+    <a href="pgarch.c.html#LN191"><span class='Ref_To_Local'>av</span></a><span class='Delimiter'>[</span><a href="pgarch.c.html#LN192"><span class='Ref_To_Local'>ac</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>"--forkarch"</span><span class='Delimiter'>; 
+</span> 
+    <a href="pgarch.c.html#LN191"><span class='Ref_To_Local'>av</span></a><span class='Delimiter'>[</span><a href="pgarch.c.html#LN192"><span class='Ref_To_Local'>ac</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>;</span>            <span class='Comment_Single_Line'>/* filled in by postmaster_forkexec */ 
+</span> 
+    <a href="pgarch.c.html#LN191"><span class='Ref_To_Local'>av</span></a><span class='Delimiter'>[</span><a href="pgarch.c.html#LN192"><span class='Ref_To_Local'>ac</span></a><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='Null_Value'>NULL</span><span class='Delimiter'>; 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="pgarch.c.html#LN192"><span class='Ref_To_Local'>ac</span></a> <span class='Operator'>&LT; </span><a href="../../include/c.h.html#LN561"><span class='Ref_to_Macro'>lengthof</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN191"><span class='Ref_To_Local'>av</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="../../include/postmaster/postmaster.h.html#LN57"><span class='Ref_to_Proto'>postmaster_forkexec</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN192"><span class='Ref_To_Local'>ac</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN191"><span class='Ref_To_Local'>av</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span><span class='Directive'>#endif</span>   <span class='Comment_Single_Line'>/* EXEC_BACKEND */ 
+</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * PgArchiverMain 
+ * 
+ *  The argc/argv parameters are valid only in EXEC_BACKEND case.  However, 
+ *  since we don't use 'em, it hardly matters... 
+ */ 
+</span><a href="../../include/c.h.html#LN1118"><span class='Ref_to_Const'>NON_EXEC_STATIC</span></a> <span class='Keyword'>void 
+</span><a name="LN215"></a><span class='Declare_Function'>PgArchiverMain</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>argc</span><span class='Delimiter'>, </span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>argv</span><span class='Delimiter'>[]</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * Ignore all signals usually bound to some action in the postmaster, 
+     * except for SIGHUP, SIGTERM, SIGUSR1, SIGUSR2, and SIGQUIT. 
+     */ 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN187"><span class='Ref_to_Const'>SIGHUP</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN255"><span class='Ref_to_Func'>ArchSigHupHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGINT<span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span>SIGTERM<span class='Delimiter'>, </span><a href="pgarch.c.html#LN268"><span class='Ref_to_Func'>ArchSigTermHandler</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN188"><span class='Ref_to_Const'>SIGQUIT</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN247"><span class='Ref_to_Func'>pgarch_exit</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN193"><span class='Ref_to_Const'>SIGALRM</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN192"><span class='Ref_to_Const'>SIGPIPE</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN184"><span class='Ref_to_Const'>SIG_IGN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN201"><span class='Ref_to_Const'>SIGUSR1</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN286"><span class='Ref_to_Func'>pgarch_waken</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN202"><span class='Ref_to_Const'>SIGUSR2</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN299"><span class='Ref_to_Func'>pgarch_waken_stop</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN197"><span class='Ref_to_Const'>SIGCHLD</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN198"><span class='Ref_to_Const'>SIGTTIN</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN199"><span class='Ref_to_Const'>SIGTTOU</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN196"><span class='Ref_to_Const'>SIGCONT</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../port/pqsignal.c.html#LN38"><span class='Ref_to_Func'>pqsignal</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN200"><span class='Ref_to_Const'>SIGWINCH</span></a><span class='Delimiter'>, </span><a href="../../include/port/win32.h.html#LN182"><span class='Ref_to_Const'>SIG_DFL</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/libpq/pqsignal.h.html#LN18"><span class='Ref_to_Macro'>PG_SETMASK</span></a><span class='Parentheses'>(</span><span class='Operator'>&</span><a href="../libpq/pqsignal.c.html#LN21"><span class='Ref_to_Global_Var'>UnBlockSig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Identify myself via ps 
+     */ 
+</span>    <a href="../../include/utils/ps_status.h.html#LN18"><span class='Ref_to_Proto'>init_ps_display</span></a><span class='Parentheses'>(</span><span class='String'>"archiver process"</span><span class='Delimiter'>, </span><span class='String'>""</span><span class='Delimiter'>, </span><span class='String'>""</span><span class='Delimiter'>, </span><span class='String'>""</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="pgarch.c.html#LN316"><span class='Ref_to_Func'>pgarch_MainLoop</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../test/isolation/specscanner.l.html#LN91"><span class='Ref_to_Proto'>exit</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end PgArchiverMain &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* SIGQUIT signal handler for archiver process */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN248"></a><span class='Declare_Function'>pgarch_exit</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* SIGQUIT means curl up and die ... */ 
+</span>    <a href="../../test/isolation/specscanner.l.html#LN91"><span class='Ref_to_Proto'>exit</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGHUP signal handler for archiver process */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN256"></a><span class='Declare_Function'>ArchSigHupHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN258"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set flag to re-read config file at next convenient time */ 
+</span>    <a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="pgarch.c.html#LN258"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGTERM signal handler for archiver process */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN269"></a><span class='Declare_Function'>ArchSigTermHandler</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN271"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * The postmaster never sends us SIGTERM, so we assume that this means 
+     * that init is trying to shut down the whole system.  If we hang around 
+     * too long we'll get SIGKILL'd.  Set flag to prevent starting any more 
+     * archive commands. 
+     */ 
+</span>    <a href="pgarch.c.html#LN76"><span class='Ref_to_Global_Var'>got_SIGTERM</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="pgarch.c.html#LN271"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGUSR1 signal handler for archiver process */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN287"></a><span class='Declare_Function'>pgarch_waken</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN289"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set flag that there is work to be done */ 
+</span>    <a href="pgarch.c.html#LN77"><span class='Ref_to_Global_Var'>wakened</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="pgarch.c.html#LN289"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* SIGUSR2 signal handler for archiver process */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN300"></a><span class='Declare_Function'>pgarch_waken_stop</span><span class='Parentheses'>(</span><a href="../../include/c.h.html#LN1078"><span class='Ref_to_Const'>SIGNAL_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN302"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>save_errno</span> <span class='Operator'>= </span>errno<span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* set flag to do a final cycle and shut down afterwards */ 
+</span>    <a href="pgarch.c.html#LN78"><span class='Ref_to_Global_Var'>ready_to_stop</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>    <a href="../../include/storage/latch.h.html#LN151"><span class='Ref_to_Proto'>SetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    errno <span class='Operator'>= </span><a href="pgarch.c.html#LN302"><span class='Ref_To_Local'>save_errno</span></a><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * pgarch_MainLoop 
+ * 
+ * Main loop for archiver 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN317"></a><span class='Declare_Function'>pgarch_MainLoop</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN319"></a>    <a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a>   <span class='Declare_Local'>last_copy_time</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span><a name="LN320"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>time_to_stop</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * We run the copy loop immediately upon entry, in case there are 
+     * unarchived files left over from a previous database run (or maybe the 
+     * archiver died unexpectedly).  After that we wait for a signal or 
+     * timeout before doing more. 
+     */ 
+</span>    <a href="pgarch.c.html#LN77"><span class='Ref_to_Global_Var'>wakened</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * There shouldn't be anything for the archiver to do except to wait for a 
+     * signal ... however, the archiver exists to protect our data, so she 
+     * wakes up occasionally to allow herself to be proactive. 
+     */ 
+</span>    <span class='Control'>do</span> 
+    <span class='Delimiter'>{ 
+</span>        <a href="../../include/storage/latch.h.html#LN152"><span class='Ref_to_Proto'>ResetLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* When we get SIGUSR2, we do one more archive cycle, then exit */ 
+</span>        <a href="pgarch.c.html#LN320"><span class='Ref_To_Local'>time_to_stop</span></a> <span class='Operator'>= </span><a href="pgarch.c.html#LN78"><span class='Ref_to_Global_Var'>ready_to_stop</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Check for config update */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="../utils/misc/guc-file.l.html#LN107"><span class='Ref_to_Func'>ProcessConfigFile</span></a><span class='Parentheses'>(</span><a href="../../include/utils/guc.h.html#LN71"><span class='Ref_to_EnumConst'>PGC_SIGHUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * If we've gotten SIGTERM, we normally just sit and do nothing until 
+         * SIGUSR2 arrives.  However, that means a random SIGTERM would 
+         * disable archiving indefinitely, which doesn't seem like a good 
+         * idea.  If more than 60 seconds pass since SIGTERM, exit anyway, so 
+         * that the postmaster can start a new archiver if needed. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN76"><span class='Ref_to_Global_Var'>got_SIGTERM</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN358"></a>            time_t      <span class='Declare_Local'>curtime</span> <span class='Operator'>= </span>time<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN70"><span class='Ref_to_Global_Var'>last_sigterm_time</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <a href="pgarch.c.html#LN70"><span class='Ref_to_Global_Var'>last_sigterm_time</span></a> <span class='Operator'>= </span><a href="pgarch.c.html#LN358"><span class='Ref_To_Local'>curtime</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>((</span><span class='Keyword'>unsigned int</span><span class='Parentheses'>) (</span><a href="pgarch.c.html#LN358"><span class='Ref_To_Local'>curtime</span></a> <span class='Operator'>- </span><a href="pgarch.c.html#LN70"><span class='Ref_to_Global_Var'>last_sigterm_time</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT;= 
+</span>                     <span class='Parentheses'>(</span><span class='Keyword'>unsigned int</span><span class='Parentheses'>) </span><span class='Number'>60</span><span class='Parentheses'>)</span> 
+                <span class='Control'>break</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* Do what we're here for */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN77"><span class='Ref_to_Global_Var'>wakened</span></a> <span class='Operator'>|| </span><a href="pgarch.c.html#LN320"><span class='Ref_To_Local'>time_to_stop</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <a href="pgarch.c.html#LN77"><span class='Ref_to_Global_Var'>wakened</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>            <a href="pgarch.c.html#LN414"><span class='Ref_to_Func'>pgarch_ArchiverCopyLoop</span></a><span class='Parentheses'>()</span><span class='Delimiter'>; 
+</span>            <a href="pgarch.c.html#LN319"><span class='Ref_To_Local'>last_copy_time</span></a> <span class='Operator'>= </span>time<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <span class='Comment_Multi_Line'>/* 
+         * Sleep until a signal is received, or until a poll is forced by 
+         * PGARCH_AUTOWAKE_INTERVAL having passed since last_copy_time, or 
+         * until postmaster dies. 
+         */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="pgarch.c.html#LN320"><span class='Ref_To_Local'>time_to_stop</span></a><span class='Parentheses'>)</span>      <span class='Comment_Single_Line'>/* Don't wait during last iteration */ 
+</span>        <span class='Delimiter'>{ 
+</span><a name="LN382"></a>            <a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a>   <span class='Declare_Local'>curtime</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/pgtime.h.html#LN22"><span class='Ref_to_Typedef'>pg_time_t</span></a><span class='Parentheses'>) </span>time<span class='Parentheses'>(</span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN383"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>timeout</span><span class='Delimiter'>; 
+</span> 
+            <a href="pgarch.c.html#LN383"><span class='Ref_To_Local'>timeout</span></a> <span class='Operator'>= </span><a href="pgarch.c.html#LN56"><span class='Ref_to_Const'>PGARCH_AUTOWAKE_INTERVAL</span></a> <span class='Operator'>- </span><span class='Parentheses'>(</span><a href="pgarch.c.html#LN382"><span class='Ref_To_Local'>curtime</span></a> <span class='Operator'>- </span><a href="pgarch.c.html#LN319"><span class='Ref_To_Local'>last_copy_time</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN383"><span class='Ref_To_Local'>timeout</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span><a name="LN388"></a>                <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+                <a href="pgarch.c.html#LN388"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../include/storage/latch.h.html#LN163"><span class='Ref_to_Proto'>WaitLatch</span></a><span class='Parentheses'>(</span><a href="../utils/init/globals.c.html#LN51"><span class='Ref_to_Global_Var'>MyLatch</span></a><span class='Delimiter'>, 
+</span>                             <a href="../../include/storage/latch.h.html#LN123"><span class='Ref_to_Const'>WL_LATCH_SET</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a> <span class='Operator'>| </span><a href="../../include/storage/latch.h.html#LN127"><span class='Ref_to_Const'>WL_POSTMASTER_DEATH</span></a><span class='Delimiter'>, 
+</span>                               <a href="pgarch.c.html#LN383"><span class='Ref_To_Local'>timeout</span></a> <span class='Operator'>* </span><span class='Number'>1000L</span><span class='Delimiter'>, 
+</span>                               <a href="../../include/pgstat.h.html#LN756"><span class='Ref_to_EnumConst'>WAIT_EVENT_ARCHIVER_MAIN</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN388"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>& </span><a href="../../include/storage/latch.h.html#LN126"><span class='Ref_to_Const'>WL_TIMEOUT</span></a><span class='Parentheses'>) 
+</span>                    <a href="pgarch.c.html#LN77"><span class='Ref_to_Global_Var'>wakened</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+                <a href="pgarch.c.html#LN77"><span class='Ref_to_Global_Var'>wakened</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if !time_to_stop &raquo; </span> 
+ 
+        <span class='Comment_Multi_Line'>/* 
+         * The archiver quits either when the postmaster dies (not expected) 
+         * or after completing one more archiving cycle after receiving 
+         * SIGUSR2. 
+         */ 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end do &raquo; </span> <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="../../include/storage/pmsignal.h.html#LN53"><span class='Ref_to_Proto'>PostmasterIsAlive</span></a><span class='Parentheses'>() </span><span class='Operator'>&& !</span><a href="pgarch.c.html#LN320"><span class='Ref_To_Local'>time_to_stop</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgarch_MainLoop &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * pgarch_ArchiverCopyLoop 
+ * 
+ * Archives all outstanding xlogs then returns 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN415"></a><span class='Declare_Function'>pgarch_ArchiverCopyLoop</span><span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN417"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>xlog</span><span class='Delimiter'>[</span><a href="../../include/postmaster/pgarch.h.html#LN25"><span class='Ref_to_Const'>MAX_XFN_CHARS</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * loop through all xlogs with archive_status of .ready and archive 
+     * them...mostly we expect this to be a single file, though it is possible 
+     * some backend will add files onto the list of those that need archiving 
+     * while we are still copying earlier archives 
+     */ 
+</span>    <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN659"><span class='Ref_to_Func'>pgarch_readyXlog</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN417"><span class='Ref_To_Local'>xlog</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN427"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>failures</span> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>;;</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * Do not initiate any more archive commands after receiving 
+             * SIGTERM, nor after the postmaster has died unexpectedly. The 
+             * first condition is to try to keep from having init SIGKILL the 
+             * command, and the second is to avoid conflicts with another 
+             * archiver spawned by a newer postmaster. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN76"><span class='Ref_to_Global_Var'>got_SIGTERM</span></a> <span class='Operator'>|| !</span><a href="../../include/storage/pmsignal.h.html#LN53"><span class='Ref_to_Proto'>PostmasterIsAlive</span></a><span class='Parentheses'>())</span> 
+                <span class='Control'>return</span><span class='Delimiter'>; 
+</span> 
+            <span class='Comment_Multi_Line'>/* 
+             * Check for config update.  This is so that we'll adopt a new 
+             * setting for archive_command as soon as possible, even if there 
+             * is a backlog of files to be archived. 
+             */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="startup.c.html#LN40"><span class='Ref_to_Global_Var'>got_SIGHUP</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>                <a href="../utils/misc/guc-file.l.html#LN107"><span class='Ref_to_Func'>ProcessConfigFile</span></a><span class='Parentheses'>(</span><a href="../../include/utils/guc.h.html#LN71"><span class='Ref_to_EnumConst'>PGC_SIGHUP</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Comment_Multi_Line'>/* can't do anything if no command ... */ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../include/access/xlog.h.html#LN138"><span class='Ref_to_Macro'>XLogArchiveCommandSet</span></a><span class='Parentheses'>())</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>                        <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"archive_mode enabled, yet archive_command is not set"</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                <span class='Control'>return</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN501"><span class='Ref_to_Func'>pgarch_archiveXlog</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN417"><span class='Ref_To_Local'>xlog</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* successful */ 
+</span>                <a href="pgarch.c.html#LN722"><span class='Ref_to_Func'>pgarch_archiveDone</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN417"><span class='Ref_To_Local'>xlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Comment_Multi_Line'>/* 
+                 * Tell the collector about the WAL file that we successfully 
+                 * archived 
+                 */ 
+</span>                <a href="../../include/pgstat.h.html#LN1309"><span class='Ref_to_Proto'>pgstat_send_archiver</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN417"><span class='Ref_To_Local'>xlog</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>break</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* out of inner retry loop */ 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Comment_Multi_Line'>/* 
+                 * Tell the collector about the WAL file that we failed to 
+                 * archive 
+                 */ 
+</span>                <a href="../../include/pgstat.h.html#LN1309"><span class='Ref_to_Proto'>pgstat_send_archiver</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN417"><span class='Ref_To_Local'>xlog</span></a><span class='Delimiter'>, </span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+                <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>++</span><a href="pgarch.c.html#LN427"><span class='Ref_To_Local'>failures</span></a> <span class='Operator'>&GT;= </span><a href="pgarch.c.html#LN62"><span class='Ref_to_Const'>NUM_ARCHIVE_RETRIES</span></a><span class='Parentheses'>) 
+</span>                <span class='Delimiter'>{ 
+</span>                    <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Delimiter'>, 
+</span>                            <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"archiving write-ahead log file \"%s\" failed too many times, will try again later"</span><span class='Delimiter'>, 
+</span>                                    <a href="pgarch.c.html#LN417"><span class='Ref_To_Local'>xlog</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>return</span><span class='Delimiter'>;</span>     <span class='Comment_Single_Line'>/* give up archiving for now */ 
+</span>                <span class='Delimiter'>} 
+</span>                <a href="../../port/pgsleep.c.html#LN45"><span class='Ref_to_Func'>pg_usleep</span></a><span class='Parentheses'>(</span><span class='Number'>1000000L</span><span class='Parentheses'>)</span><span class='Delimiter'>;</span>    <span class='Comment_Single_Line'>/* wait a bit before retrying */ 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for ;; &raquo; </span> 
+    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while pgarch_readyXlog(xlog... &raquo; </span> 
+<span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end pgarch_ArchiverCopyLoop &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * pgarch_archiveXlog 
+ * 
+ * Invokes system(3) to copy one archive file to wherever it should go 
+ * 
+ * Returns true if successful 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN502"></a><span class='Declare_Function'>pgarch_archiveXlog</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN504"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>xlogarchcmd</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN505"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>pathname</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN506"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>activitymsg</span><span class='Delimiter'>[</span><a href="../../include/access/xlog_internal.h.html#LN137"><span class='Ref_to_Const'>MAXFNAMELEN</span></a> <span class='Operator'>+ </span><span class='Number'>16</span><span class='Delimiter'>]; 
+</span><a name="LN507"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>dp</span><span class='Delimiter'>; 
+</span><a name="LN508"></a>    <span class='Keyword'>char</span>       <span class='Operator'>*</span><span class='Declare_Local'>endp</span><span class='Delimiter'>; 
+</span><a name="LN509"></a>    <span class='Keyword'>const char </span><span class='Operator'>*</span><span class='Declare_Local'>sp</span><span class='Delimiter'>; 
+</span><a name="LN510"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>rc</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN505"><span class='Ref_To_Local'>pathname</span></a><span class='Delimiter'>, </span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>, </span><a href="../../include/access/xlog_internal.h.html#LN130"><span class='Ref_to_Const'>XLOGDIR</span></a> <span class='String'>"/%s"</span><span class='Delimiter'>, </span><a href="pgarch.c.html#LN502"><span class='Ref_to_Parameter'>xlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * construct the command to be executed 
+     */ 
+</span>    <a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>= </span><a href="pgarch.c.html#LN504"><span class='Ref_To_Local'>xlogarchcmd</span></a><span class='Delimiter'>; 
+</span>    <a href="pgarch.c.html#LN508"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>= </span><a href="pgarch.c.html#LN504"><span class='Ref_To_Local'>xlogarchcmd</span></a> <span class='Operator'>+ </span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="pgarch.c.html#LN508"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a> <span class='Operator'>= </span><a href="../access/transam/xlog.c.html#LN94"><span class='Ref_to_Global_Var'>XLogArchiveCommand</span></a><span class='Delimiter'>; </span><span class='Operator'>*</span><a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; </span><a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>*</span><a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a> <span class='Operator'>== </span><span class='String'>'%'</span><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>[</span><span class='Number'>1</span><span class='Delimiter'>]</span><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <span class='Control'>case</span> <span class='String'>'p'</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* %p: relative path of source file */ 
+</span>                    <a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                    <a href="../../port/strlcpy.c.html#LN43"><span class='Ref_to_Func'>strlcpy</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN505"><span class='Ref_To_Local'>pathname</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN508"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>- </span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="../../include/port.h.html#LN43"><span class='Ref_to_Proto'>make_native_path</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>+= </span>strlen<span class='Parentheses'>(</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>case</span> <span class='String'>'f'</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* %f: filename of source file */ 
+</span>                    <a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                    <a href="../../port/strlcpy.c.html#LN43"><span class='Ref_to_Func'>strlcpy</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN502"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN508"><span class='Ref_To_Local'>endp</span></a> <span class='Operator'>- </span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>+= </span>strlen<span class='Parentheses'>(</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>case</span> <span class='String'>'%'</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* convert %% to a single % */ 
+</span>                    <a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>&LT; </span><a href="pgarch.c.html#LN508"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>) 
+</span>                        <span class='Operator'>*</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Operator'>++ = *</span><a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>                <span class='Control'>default</span><span class='Operator'>: 
+</span>                    <span class='Comment_Multi_Line'>/* otherwise treat the % as not special */ 
+</span>                    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>&LT; </span><a href="pgarch.c.html#LN508"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>) 
+</span>                        <span class='Operator'>*</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Operator'>++ = *</span><a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; 
+</span>                    <span class='Control'>break</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch sp[1] &raquo; </span> 
+        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if *sp=='%' &raquo; </span> 
+        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>&LT; </span><a href="pgarch.c.html#LN508"><span class='Ref_To_Local'>endp</span></a><span class='Parentheses'>) 
+</span>                <span class='Operator'>*</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a><span class='Operator'>++ = *</span><a href="pgarch.c.html#LN509"><span class='Ref_To_Local'>sp</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for sp=XLogArchiveCommand... &raquo; </span> 
+    <span class='Operator'>*</span><a href="pgarch.c.html#LN507"><span class='Ref_To_Local'>dp</span></a> <span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN22"><span class='Ref_to_Const'>DEBUG3</span></a><span class='Delimiter'>, 
+</span>            <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN825"><span class='Ref_to_Func'>errmsg_internal</span></a><span class='Parentheses'>(</span><span class='String'>"executing archive command \"%s\""</span><span class='Delimiter'>, 
+</span>                             <a href="pgarch.c.html#LN504"><span class='Ref_To_Local'>xlogarchcmd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Report archive activity in PS display */ 
+</span>    <a href="../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN506"><span class='Ref_To_Local'>activitymsg</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="pgarch.c.html#LN506"><span class='Ref_To_Local'>activitymsg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"archiving %s"</span><span class='Delimiter'>, </span><a href="pgarch.c.html#LN502"><span class='Ref_to_Parameter'>xlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/ps_status.h.html#LN21"><span class='Ref_to_Proto'>set_ps_display</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN506"><span class='Ref_To_Local'>activitymsg</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>= </span><a href="../../include/port.h.html#LN312"><span class='Ref_to_Macro'>system</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN504"><span class='Ref_To_Local'>xlogarchcmd</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * If either the shell itself, or a called command, died on a signal, 
+         * abort the archiver.  We do this because system() ignores SIGINT and 
+         * SIGQUIT while waiting; so a signal is very likely something that 
+         * should have interrupted us too.  If we overreact it's no big deal, 
+         * the postmaster will just start the archiver again. 
+         * 
+         * Per the Single Unix Spec, shells report exit status &GT; 128 when a 
+         * called command died on a signal. 
+         */ 
+</span><a name="LN582"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>lev</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN172"><span class='Ref_to_Macro'>WIFSIGNALED</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>) </span><span class='Operator'>|| </span><a href="../../timezone/private.h.html#LN44"><span class='Ref_to_Macro'>WEXITSTATUS</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><span class='Number'>128</span><span class='Parentheses'>)</span> <span class='Operator'>? </span><a href="../../include/utils/elog.h.html#LN51"><span class='Ref_to_Const'>FATAL</span></a> <span class='Operator'>: </span><a href="../../include/utils/elog.h.html#LN25"><span class='Ref_to_Const'>LOG</span></a><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../timezone/private.h.html#LN41"><span class='Ref_to_Macro'>WIFEXITED</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN582"><span class='Ref_To_Local'>lev</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"archive command failed with exit code %d"</span><span class='Delimiter'>, 
+</span>                            <a href="../../timezone/private.h.html#LN44"><span class='Ref_to_Macro'>WEXITSTATUS</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>))</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The failed archive command was: %s"</span><span class='Delimiter'>, 
+</span>                               <a href="pgarch.c.html#LN504"><span class='Ref_To_Local'>xlogarchcmd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../include/port/win32.h.html#LN172"><span class='Ref_to_Macro'>WIFSIGNALED</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span><span class='Directive'>#if</span> defined<span class='Parentheses'>(</span><a href="../../include/c.h.html#LN61"><span class='Ref_to_Const'>WIN32</span></a><span class='Parentheses'>) 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN582"><span class='Ref_To_Local'>lev</span></a><span class='Delimiter'>, 
+</span>                  <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"archive command was terminated by exception 0x%X"</span><span class='Delimiter'>, 
+</span>                          <a href="../../include/port/win32.h.html#LN174"><span class='Ref_to_Macro'>WTERMSIG</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>))</span><span class='Delimiter'>, 
+</span>                   <a href="../utils/error/elog.c.html#LN985"><span class='Ref_to_Func'>errhint</span></a><span class='Parentheses'>(</span><span class='String'>"See C include file \"ntstatus.h\" for a description of the hexadecimal value."</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                   <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The failed archive command was: %s"</span><span class='Delimiter'>, 
+</span>                             <a href="pgarch.c.html#LN504"><span class='Ref_To_Local'>xlogarchcmd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span><span class='Directive'>#elif</span> defined<span class='Parentheses'>(</span>HAVE_DECL_SYS_SIGLIST<span class='Parentheses'>) </span><span class='Operator'>&& </span>HAVE_DECL_SYS_SIGLIST 
+            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN582"><span class='Ref_To_Local'>lev</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"archive command was terminated by signal %d: %s"</span><span class='Delimiter'>, 
+</span>                            <a href="../../include/port/win32.h.html#LN174"><span class='Ref_to_Macro'>WTERMSIG</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>              <a href="../../include/port/win32.h.html#LN174"><span class='Ref_to_Macro'>WTERMSIG</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span>NSIG <span class='Operator'>? </span>sys_siglist<span class='Delimiter'>[</span><a href="../../include/port/win32.h.html#LN174"><span class='Ref_to_Macro'>WTERMSIG</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>] </span><span class='Operator'>: </span><span class='String'>"(unknown)"</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The failed archive command was: %s"</span><span class='Delimiter'>, 
+</span>                               <a href="pgarch.c.html#LN504"><span class='Ref_To_Local'>xlogarchcmd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span><span class='Directive'>#else</span> 
+            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN582"><span class='Ref_To_Local'>lev</span></a><span class='Delimiter'>, 
+</span>                    <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"archive command was terminated by signal %d"</span><span class='Delimiter'>, 
+</span>                            <a href="../../include/port/win32.h.html#LN174"><span class='Ref_to_Macro'>WTERMSIG</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>))</span><span class='Delimiter'>, 
+</span>                     <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The failed archive command was: %s"</span><span class='Delimiter'>, 
+</span>                               <a href="pgarch.c.html#LN504"><span class='Ref_To_Local'>xlogarchcmd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span><span class='Directive'>#endif</span> 
+        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if WIFSIGNALED(rc) &raquo; </span> 
+        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN582"><span class='Ref_To_Local'>lev</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"archive command exited with unrecognized status %d"</span><span class='Delimiter'>, 
+</span>                        <a href="pgarch.c.html#LN510"><span class='Ref_To_Local'>rc</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN871"><span class='Ref_to_Func'>errdetail</span></a><span class='Parentheses'>(</span><span class='String'>"The failed archive command was: %s"</span><span class='Delimiter'>, 
+</span>                           <a href="pgarch.c.html#LN504"><span class='Ref_To_Local'>xlogarchcmd</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span> 
+        <a href="../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN506"><span class='Ref_To_Local'>activitymsg</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="pgarch.c.html#LN506"><span class='Ref_To_Local'>activitymsg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"failed on %s"</span><span class='Delimiter'>, </span><a href="pgarch.c.html#LN502"><span class='Ref_to_Parameter'>xlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <a href="../../include/utils/ps_status.h.html#LN21"><span class='Ref_to_Proto'>set_ps_display</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN506"><span class='Ref_To_Local'>activitymsg</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>return</span> <span class='Boolean'>false</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if rc!=0 &raquo; </span> 
+    <a href="../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN24"><span class='Ref_to_Const'>DEBUG1</span></a><span class='Delimiter'>, </span><span class='String'>"archived write-ahead log file \"%s\""</span><span class='Delimiter'>, </span><a href="pgarch.c.html#LN502"><span class='Ref_to_Parameter'>xlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN506"><span class='Ref_To_Local'>activitymsg</span></a><span class='Delimiter'>, </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="pgarch.c.html#LN506"><span class='Ref_To_Local'>activitymsg</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><span class='String'>"last was %s"</span><span class='Delimiter'>, </span><a href="pgarch.c.html#LN502"><span class='Ref_to_Parameter'>xlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/utils/ps_status.h.html#LN21"><span class='Ref_to_Proto'>set_ps_display</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN506"><span class='Ref_To_Local'>activitymsg</span></a><span class='Delimiter'>, </span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <span class='Boolean'>true</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgarch_archiveXlog &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * pgarch_readyXlog 
+ * 
+ * Return name of the oldest xlog file that has not yet been archived. 
+ * No notification is set that file archiving is now in progress, so 
+ * this would need to be extended if multiple concurrent archival 
+ * tasks were created. If a failure occurs, we will completely 
+ * re-copy the file at the next available opportunity. 
+ * 
+ * It is important that we return the oldest, so that we archive xlogs 
+ * in order that they were written, for two reasons: 
+ * 1) to maintain the sequential chain of xlogs required for recovery 
+ * 2) because the oldest ones will sooner become candidates for 
+ * recycling at time of checkpoint 
+ * 
+ * NOTE: the "oldest" comparison will presently consider all segments of 
+ * a timeline with a smaller ID to be older than all segments of a timeline 
+ * with a larger ID; the net result being that past timelines are given 
+ * higher priority for archiving.  This seems okay, or at least not 
+ * obviously worth changing. 
+ */ 
+</span><span class='Keyword'>static bool 
+</span><a name="LN660"></a><span class='Declare_Function'>pgarch_readyXlog</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span>    <span class='Comment_Multi_Line'>/* 
+     * open xlog status directory and read through list of xlogs that have the 
+     * .ready suffix, looking for earliest file. It is possible to optimise 
+     * this code, though only a single file is expected on the vast majority 
+     * of calls, so.... 
+     */ 
+</span><a name="LN668"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>XLogArchiveStatusDir</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN669"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>newxlog</span><span class='Delimiter'>[</span><a href="../../include/postmaster/pgarch.h.html#LN25"><span class='Ref_to_Const'>MAX_XFN_CHARS</span></a> <span class='Operator'>+ </span><span class='Number'>6</span> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>]; 
+</span><a name="LN670"></a>    <a href="../../port/dirent.c.html#LN24"><span class='Ref_to_Struct'>DIR</span></a>        <span class='Operator'>*</span><span class='Declare_Local'>rldir</span><span class='Delimiter'>; 
+</span><a name="LN671"></a>    <span class='Control'>struct</span> <a href="../../include/port/win32_msvc/dirent.h.html#LN8"><span class='Ref_to_Struct'>dirent</span></a> <span class='Operator'>*</span><span class='Declare_Local'>rlde</span><span class='Delimiter'>; 
+</span><a name="LN672"></a>    <span class='Keyword'>bool</span>        <span class='Declare_Local'>found</span> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../pl/plperl/plperl.h.html#LN60"><span class='Ref_to_Macro'>snprintf</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN668"><span class='Ref_To_Local'>XLogArchiveStatusDir</span></a><span class='Delimiter'>, </span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>, </span><a href="../../include/access/xlog_internal.h.html#LN130"><span class='Ref_to_Const'>XLOGDIR</span></a> <span class='String'>"/archive_status"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="pgarch.c.html#LN670"><span class='Ref_To_Local'>rldir</span></a> <span class='Operator'>= </span><a href="../../include/storage/fd.h.html#LN91"><span class='Ref_to_Proto'>AllocateDir</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN668"><span class='Ref_To_Local'>XLogArchiveStatusDir</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN670"><span class='Ref_To_Local'>rldir</span></a> <span class='Operator'>== </span><span class='Null_Value'>NULL</span><span class='Parentheses'>) 
+</span>        <a href="../../include/utils/elog.h.html#LN121"><span class='Ref_to_Macro'>ereport</span></a><span class='Parentheses'>(</span><a href="../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, 
+</span>                <span class='Parentheses'>(</span><a href="../../include/utils/elog.h.html#LN132"><span class='Ref_to_Proto'>errcode_for_file_access</span></a><span class='Parentheses'>()</span><span class='Delimiter'>, 
+</span>                 <a href="../utils/error/elog.c.html#LN795"><span class='Ref_to_Func'>errmsg</span></a><span class='Parentheses'>(</span><span class='String'>"could not open archive status directory \"%s\": %m"</span><span class='Delimiter'>, 
+</span>                        <a href="pgarch.c.html#LN668"><span class='Ref_To_Local'>XLogArchiveStatusDir</span></a><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>while</span> <span class='Parentheses'>((</span><a href="pgarch.c.html#LN671"><span class='Ref_To_Local'>rlde</span></a> <span class='Operator'>= </span><a href="../../include/storage/fd.h.html#LN92"><span class='Ref_to_Proto'>ReadDir</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN670"><span class='Ref_To_Local'>rldir</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN668"><span class='Ref_To_Local'>XLogArchiveStatusDir</span></a><span class='Parentheses'>))</span> <span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span><a name="LN684"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>basenamelen</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>int</span><span class='Parentheses'>) </span>strlen<span class='Parentheses'>(</span><a href="pgarch.c.html#LN671"><span class='Ref_To_Local'>rlde</span></a><span class='Operator'>-&GT;</span><a href="../../include/port/win32_msvc/dirent.h.html#LN13"><span class='Ref_to_Member'>d_name</span></a><span class='Parentheses'>) </span><span class='Operator'>- </span><span class='Number'>6</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN684"><span class='Ref_To_Local'>basenamelen</span></a> <span class='Operator'>&GT;= </span><a href="../../include/postmaster/pgarch.h.html#LN24"><span class='Ref_to_Const'>MIN_XFN_CHARS</span></a> <span class='Operator'>&& 
+</span>            <a href="pgarch.c.html#LN684"><span class='Ref_To_Local'>basenamelen</span></a> <span class='Operator'>&LT;= </span><a href="../../include/postmaster/pgarch.h.html#LN25"><span class='Ref_to_Const'>MAX_XFN_CHARS</span></a> <span class='Operator'>&& 
+</span>            strspn<span class='Parentheses'>(</span><a href="pgarch.c.html#LN671"><span class='Ref_To_Local'>rlde</span></a><span class='Operator'>-&GT;</span><a href="../../include/port/win32_msvc/dirent.h.html#LN13"><span class='Ref_to_Member'>d_name</span></a><span class='Delimiter'>, </span><a href="../../include/postmaster/pgarch.h.html#LN26"><span class='Ref_to_Const'>VALID_XFN_CHARS</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT;= </span><a href="pgarch.c.html#LN684"><span class='Ref_To_Local'>basenamelen</span></a> <span class='Operator'>&& 
+</span>            strcmp<span class='Parentheses'>(</span><a href="pgarch.c.html#LN671"><span class='Ref_To_Local'>rlde</span></a><span class='Operator'>-&GT;</span><a href="../../include/port/win32_msvc/dirent.h.html#LN13"><span class='Ref_to_Member'>d_name</span></a> <span class='Operator'>+ </span><a href="pgarch.c.html#LN684"><span class='Ref_To_Local'>basenamelen</span></a><span class='Delimiter'>, </span><span class='String'>".ready"</span><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="pgarch.c.html#LN672"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>            <span class='Delimiter'>{ 
+</span>                <a href="../../../contrib/cube/cubeparse.y.html#LN150"><span class='Ref_to_Proto'>strcpy</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN669"><span class='Ref_To_Local'>newxlog</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN671"><span class='Ref_To_Local'>rlde</span></a><span class='Operator'>-&GT;</span><a href="../../include/port/win32_msvc/dirent.h.html#LN13"><span class='Ref_to_Member'>d_name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="pgarch.c.html#LN672"><span class='Ref_To_Local'>found</span></a> <span class='Operator'>= </span><span class='Boolean'>true</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>else</span> 
+            <span class='Delimiter'>{ 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span>strcmp<span class='Parentheses'>(</span><a href="pgarch.c.html#LN671"><span class='Ref_To_Local'>rlde</span></a><span class='Operator'>-&GT;</span><a href="../../include/port/win32_msvc/dirent.h.html#LN13"><span class='Ref_to_Member'>d_name</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN669"><span class='Ref_To_Local'>newxlog</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+                    <a href="../../../contrib/cube/cubeparse.y.html#LN150"><span class='Ref_to_Proto'>strcpy</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN669"><span class='Ref_To_Local'>newxlog</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN671"><span class='Ref_To_Local'>rlde</span></a><span class='Operator'>-&GT;</span><a href="../../include/port/win32_msvc/dirent.h.html#LN13"><span class='Ref_to_Member'>d_name</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while (rlde=ReadDir(rldir,X... &raquo; </span> 
+    <a href="../../include/storage/fd.h.html#LN93"><span class='Ref_to_Proto'>FreeDir</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN670"><span class='Ref_To_Local'>rldir</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="pgarch.c.html#LN672"><span class='Ref_To_Local'>found</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* truncate off the .ready */ 
+</span>        <a href="pgarch.c.html#LN669"><span class='Ref_To_Local'>newxlog</span></a><span class='Delimiter'>[</span>strlen<span class='Parentheses'>(</span><a href="pgarch.c.html#LN669"><span class='Ref_To_Local'>newxlog</span></a><span class='Parentheses'>) </span><span class='Operator'>- </span><span class='Number'>6</span><span class='Delimiter'>] </span><span class='Operator'>= </span><span class='String'>'\0'</span><span class='Delimiter'>; 
+</span>        <a href="../../../contrib/cube/cubeparse.y.html#LN150"><span class='Ref_to_Proto'>strcpy</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN660"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN669"><span class='Ref_To_Local'>newxlog</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>return</span> <a href="pgarch.c.html#LN672"><span class='Ref_To_Local'>found</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end pgarch_readyXlog &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * pgarch_archiveDone 
+ * 
+ * Emit notification that an xlog file has been successfully archived. 
+ * We do this by renaming the status file from NNN.ready to NNN.done. 
+ * Eventually, a checkpoint process will notice this and delete both the 
+ * NNN.done file and the xlog file itself. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN723"></a><span class='Declare_Function'>pgarch_archiveDone</span><span class='Parentheses'>(</span><span class='Keyword'>char </span><span class='Operator'>*</span><span class='Declare_Parameter'>xlog</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN725"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>rlogready</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span><a name="LN726"></a>    <span class='Keyword'>char</span>        <span class='Declare_Local'>rlogdone</span><span class='Delimiter'>[</span><a href="../../include/pg_config_manual.h.html#LN88"><span class='Ref_to_Const'>MAXPGPATH</span></a><span class='Delimiter'>]; 
+</span> 
+    <a href="../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN725"><span class='Ref_To_Local'>rlogready</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN723"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".ready"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../include/access/xlog_internal.h.html#LN188"><span class='Ref_to_Macro'>StatusFilePath</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN726"><span class='Ref_To_Local'>rlogdone</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN723"><span class='Ref_to_Parameter'>xlog</span></a><span class='Delimiter'>, </span><span class='String'>".done"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Parentheses'>(</span><span class='Keyword'>void</span><span class='Parentheses'>) </span><a href="../../include/common/file_utils.h.html#LN22"><span class='Ref_to_Proto'>durable_rename</span></a><span class='Parentheses'>(</span><a href="pgarch.c.html#LN725"><span class='Ref_To_Local'>rlogready</span></a><span class='Delimiter'>, </span><a href="pgarch.c.html#LN726"><span class='Ref_To_Local'>rlogdone</span></a><span class='Delimiter'>, </span><a href="../../include/utils/elog.h.html#LN39"><span class='Ref_to_Const'>WARNING</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

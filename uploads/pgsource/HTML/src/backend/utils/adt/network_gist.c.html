@@ -1,0 +1,844 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<meta name="generator" content="Source Insight Version 4.00.0084 Built on 2017-02-26">
+<meta charset='UTF-8' />
+<style type='text/css'><!--
+TD {background-color: #C0C0C0; font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.blurb {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 70%; }
+.filename {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 120%; font-weight: bold; }
+.dirname {font-family: 'Verdana', 'Arial', 'Helvetica', Sans-Serif; font-size: 100%; font-weight: bold; margin-top: 2.5em;}
+--></style>
+<title>src\backend\utils\adt\network_gist.c</title>
+<LINK REL=StyleSheet HREF="../../../../C_Cpp_Source_File.css" TYPE='text/css' MEDIA=screen>
+</head>
+<body bgcolor=#ffffff>
+<table bgcolor='#c0c0c0' width='100%'>
+<tr><td><p class='filename'><b>src\backend\utils\adt\network_gist.c</b></p></td>
+<td align='right'>
+Wed Jun 14 08:25:52 2017
+</td></tr>
+<tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table>
+<pre>
+</span><span class='Comment_Multi_Line'>/*------------------------------------------------------------------------- 
+ * 
+ * network_gist.c 
+ *    GiST support for network types. 
+ * 
+ * The key thing to understand about this code is the definition of the 
+ * "union" of a set of INET/CIDR values.  It works like this: 
+ * 1. If the values are not all of the same IP address family, the "union" 
+ * is a dummy value with family number zero, minbits zero, commonbits zero, 
+ * address all zeroes.  Otherwise: 
+ * 2. The union has the common IP address family number. 
+ * 3. The union's minbits value is the smallest netmask length ("ip_bits") 
+ * of all the input values. 
+ * 4. Let C be the number of leading address bits that are in common among 
+ * all the input values (C ranges from 0 to ip_maxbits for the family). 
+ * 5. The union's commonbits value is C. 
+ * 6. The union's address value is the same as the common prefix for its 
+ * first C bits, and is zeroes to the right of that.  The physical width 
+ * of the address value is ip_maxbits for the address family. 
+ * 
+ * In a leaf index entry (representing a single key), commonbits is equal to 
+ * ip_maxbits for the address family, minbits is the same as the represented 
+ * value's ip_bits, and the address is equal to the represented address. 
+ * Although it may appear that we're wasting a byte by storing the union 
+ * format and not just the represented INET/CIDR value in leaf keys, the 
+ * extra byte is actually "free" because of alignment considerations. 
+ * 
+ * Note that this design tracks minbits and commonbits independently; in any 
+ * given union value, either might be smaller than the other.  This does not 
+ * help us much when descending the tree, because of the way inet comparison 
+ * is defined: at non-leaf nodes we can't compare more than minbits bits 
+ * even if we know them.  However, it greatly improves the quality of split 
+ * decisions.  Preliminary testing suggests that searches are as much as 
+ * twice as fast as for a simpler design in which a single field doubles as 
+ * the common prefix length and the minimum ip_bits value. 
+ * 
+ * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group 
+ * Portions Copyright (c) 1994, Regents of the University of California 
+ * 
+ * 
+ * IDENTIFICATION 
+ *    src/backend/utils/adt/network_gist.c 
+ * 
+ *------------------------------------------------------------------------- 
+ */ 
+</span><span class='Keyword'>#include </span><span class='String'>"postgres.h"</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>&LT;sys/socket.h&GT;</span> 
+ 
+<span class='Keyword'>#include </span><span class='String'>"access/gist.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"access/stratnum.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/builtins.h"</span> 
+<span class='Keyword'>#include </span><span class='String'>"utils/inet.h"</span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Operator strategy numbers used in the GiST inet_ops opclass 
+ */ 
+</span><a name="LN57"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_OVERLAPS</span>      <a href="../../../include/access/stratnum.h.html#LN45"><span class='Ref_to_Const'>RTOverlapStrategyNumber</span></a> 
+<a name="LN58"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_EQ</span>            <a href="../../../include/access/stratnum.h.html#LN60"><span class='Ref_to_Const'>RTEqualStrategyNumber</span></a> 
+<a name="LN59"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_NE</span>            <a href="../../../include/access/stratnum.h.html#LN61"><span class='Ref_to_Const'>RTNotEqualStrategyNumber</span></a> 
+<a name="LN60"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_LT</span>            <a href="../../../include/access/stratnum.h.html#LN62"><span class='Ref_to_Const'>RTLessStrategyNumber</span></a> 
+<a name="LN61"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_LE</span>            <a href="../../../include/access/stratnum.h.html#LN63"><span class='Ref_to_Const'>RTLessEqualStrategyNumber</span></a> 
+<a name="LN62"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_GT</span>            <a href="../../../include/access/stratnum.h.html#LN64"><span class='Ref_to_Const'>RTGreaterStrategyNumber</span></a> 
+<a name="LN63"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_GE</span>            <a href="../../../include/access/stratnum.h.html#LN65"><span class='Ref_to_Const'>RTGreaterEqualStrategyNumber</span></a> 
+<a name="LN64"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_SUB</span>           <a href="../../../include/access/stratnum.h.html#LN66"><span class='Ref_to_Const'>RTSubStrategyNumber</span></a> 
+<a name="LN65"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_SUBEQ</span>         <a href="../../../include/access/stratnum.h.html#LN67"><span class='Ref_to_Const'>RTSubEqualStrategyNumber</span></a> 
+<a name="LN66"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_SUP</span>           <a href="../../../include/access/stratnum.h.html#LN68"><span class='Ref_to_Const'>RTSuperStrategyNumber</span></a> 
+<a name="LN67"></a><span class='Keyword'>#define </span><span class='Declare_Constant'>INETSTRAT_SUPEQ</span>         <a href="../../../include/access/stratnum.h.html#LN69"><span class='Ref_to_Const'>RTSuperEqualStrategyNumber</span></a> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Representation of a GiST INET/CIDR index key.  This is not identical to 
+ * INET/CIDR because we need to keep track of the length of the common address 
+ * prefix as well as the minimum netmask length.  However, as long as it 
+ * follows varlena header rules, the core GiST code won't know the difference. 
+ * For simplicity we always use 1-byte-header varlena format. 
+ */ 
+</span><a name="LN77"></a><span class='Control'>typedef</span> <span class='Control'>struct</span> <span class='Declare_Struct'>GistInetKey</span> 
+<span class='Delimiter'>{ 
+</span><a name="LN79"></a>    <a href="../../../include/c.h.html#LN265"><span class='Ref_to_Typedef'>uint8</span></a>       <span class='Declare_Member'>va_header</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* varlena header --- don't touch directly */ 
+</span><a name="LN80"></a>    <span class='Keyword'>unsigned char </span><span class='Declare_Member'>family</span><span class='Delimiter'>;</span>       <span class='Comment_Single_Line'>/* PGSQL_AF_INET, PGSQL_AF_INET6, or zero */ 
+</span><a name="LN81"></a>    <span class='Keyword'>unsigned char </span><span class='Declare_Member'>minbits</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* minimum number of bits in netmask */ 
+</span><a name="LN82"></a>    <span class='Keyword'>unsigned char </span><span class='Declare_Member'>commonbits</span><span class='Delimiter'>;</span>   <span class='Comment_Single_Line'>/* number of common prefix bits in addresses */ 
+</span><a name="LN83"></a>    <span class='Keyword'>unsigned char </span><span class='Declare_Member'>ipaddr</span><span class='Delimiter'>[</span><span class='Number'>16</span><span class='Delimiter'>];</span>   <span class='Comment_Single_Line'>/* up to 128 bits of common address */ 
+</span><a name="LN84"></a><span class='Delimiter'>} </span><span class='Declare_Typedef'>GistInetKey</span><span class='Delimiter'>; 
+</span> 
+<a name="LN86"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>DatumGetInetKeyP</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>X</span><span class='Parentheses'>) ((</span><a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/postgres.h.html#LN554"><span class='Ref_to_Macro'>DatumGetPointer</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN86"><span class='Ref_to_Parameter'>X</span></a><span class='Parentheses'>))</span> 
+<a name="LN87"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>InetKeyPGetDatum</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>X</span><span class='Parentheses'>) </span><a href="../../../include/postgres.h.html#LN561"><span class='Ref_to_Macro'>PointerGetDatum</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN87"><span class='Ref_to_Parameter'>X</span></a><span class='Parentheses'>) 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * Access macros; not really exciting, but we use these for notational 
+ * consistency with access to INET/CIDR values.  Note that family-zero values 
+ * are stored with 4 bytes of address, not 16. 
+ */ 
+</span><a name="LN94"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>gk_ip_family</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>gkptr</span><span class='Parentheses'>)</span>     <span class='Parentheses'>((</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Parameter'>gkptr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>family<span class='Parentheses'>)</span> 
+<a name="LN95"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>gk_ip_minbits</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>gkptr</span><span class='Parentheses'>)</span>    <span class='Parentheses'>((</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Parameter'>gkptr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>minbits<span class='Parentheses'>)</span> 
+<a name="LN96"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>gk_ip_commonbits</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>gkptr</span><span class='Parentheses'>) ((</span><a href="network_gist.c.html#LN96"><span class='Ref_to_Parameter'>gkptr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>commonbits<span class='Parentheses'>)</span> 
+<a name="LN97"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>gk_ip_addr</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>gkptr</span><span class='Parentheses'>)</span>       <span class='Parentheses'>((</span><a href="network_gist.c.html#LN97"><span class='Ref_to_Parameter'>gkptr</span></a><span class='Parentheses'>)</span><span class='Operator'>-&GT;</span>ipaddr<span class='Parentheses'>)</span> 
+<a name="LN98"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>ip_family_maxbits</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>fam</span><span class='Parentheses'>)</span>  <span class='Parentheses'>((</span><a href="network_gist.c.html#LN98"><span class='Ref_to_Parameter'>fam</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="../../../include/utils/inet.h.html#LN39"><span class='Ref_to_Const'>PGSQL_AF_INET6</span></a> <span class='Operator'>? </span><span class='Number'>128</span> <span class='Operator'>: </span><span class='Number'>32</span><span class='Parentheses'>)</span> 
+ 
+<span class='Comment_Multi_Line'>/* These require that the family field has been set: */ 
+</span><a name="LN101"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>gk_ip_addrsize</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>gkptr</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <span class='Parentheses'>(</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN101"><span class='Ref_to_Parameter'>gkptr</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="../../../include/utils/inet.h.html#LN39"><span class='Ref_to_Const'>PGSQL_AF_INET6</span></a> <span class='Operator'>? </span><span class='Number'>16</span> <span class='Operator'>: </span><span class='Number'>4</span><span class='Parentheses'>)</span> 
+<a name="LN103"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>gk_ip_maxbits</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>gkptr</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <a href="network_gist.c.html#LN98"><span class='Ref_to_Macro'>ip_family_maxbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN103"><span class='Ref_to_Parameter'>gkptr</span></a><span class='Parentheses'>))</span> 
+<a name="LN105"></a><span class='Keyword'>#define </span><span class='Declare_Macro'>SET_GK_VARSIZE</span><span class='Parentheses'>(</span><span class='Declare_Parameter'>dst</span><span class='Parentheses'>) </span><span class='Operator'>\ 
+</span>    <a href="../../../include/postgres.h.html#LN328"><span class='Ref_to_Macro'>SET_VARSIZE_SHORT</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN105"><span class='Ref_to_Parameter'>dst</span></a><span class='Delimiter'>, </span><a href="../../../include/c.h.html#LN554"><span class='Ref_to_Macro'>offsetof</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a><span class='Delimiter'>, </span>ipaddr<span class='Parentheses'>) </span><span class='Operator'>+ </span><a href="network_gist.c.html#LN101"><span class='Ref_to_Macro'>gk_ip_addrsize</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN105"><span class='Ref_to_Parameter'>dst</span></a><span class='Parentheses'>))</span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The GiST query consistency check 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN113"></a><span class='Declare_Function'>inet_gist_consistent</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN115"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>ent</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN116"></a>    <a href="../../../include/utils/inet.h.html#LN51"><span class='Ref_to_Typedef'>inet</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>query</span> <span class='Operator'>= </span><a href="../../../include/utils/inet.h.html#LN123"><span class='Ref_to_Macro'>PG_GETARG_INET_PP</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN117"></a>    <a href="../../../include/access/stratnum.h.html#LN21"><span class='Ref_to_Typedef'>StrategyNumber</span></a> <span class='Declare_Local'>strategy</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/stratnum.h.html#LN21"><span class='Ref_to_Typedef'>StrategyNumber</span></a><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN236"><span class='Ref_to_Macro'>PG_GETARG_UINT16</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Oid      subtype = PG_GETARG_OID(3); */ 
+</span><a name="LN120"></a>    <span class='Keyword'>bool</span>       <span class='Operator'>*</span><span class='Declare_Local'>recheck</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>4</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN121"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>key</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN115"><span class='Ref_To_Local'>ent</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN122"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>minbits</span><span class='Delimiter'>, 
+</span><a name="LN123"></a>                <span class='Declare_Local'>order</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* All operators served by this function are exact. */ 
+</span>    <span class='Operator'>*</span><a href="network_gist.c.html#LN120"><span class='Ref_To_Local'>recheck</span></a> <span class='Operator'>= </span><span class='Boolean'>false</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check 0: different families 
+     * 
+     * If key represents multiple address families, its children could match 
+     * anything.  This can only happen on an inner index page. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Debug'>Assert</span><span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/gist.h.html#LN132"><span class='Ref_to_Macro'>GIST_LEAF</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN115"><span class='Ref_To_Local'>ent</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check 1: different families 
+     * 
+     * Matching families do not help any of the strategies. 
+     */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../../include/utils/inet.h.html#LN70"><span class='Ref_to_Macro'>ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN117"><span class='Ref_To_Local'>strategy</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Control'>case</span> <a href="network_gist.c.html#LN60"><span class='Ref_to_Const'>INETSTRAT_LT</span></a><span class='Operator'>: 
+</span>            <span class='Control'>case</span> <a href="network_gist.c.html#LN61"><span class='Ref_to_Const'>INETSTRAT_LE</span></a><span class='Operator'>: 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="../../../include/utils/inet.h.html#LN70"><span class='Ref_to_Macro'>ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                    <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>case</span> <a href="network_gist.c.html#LN63"><span class='Ref_to_Const'>INETSTRAT_GE</span></a><span class='Operator'>: 
+</span>            <span class='Control'>case</span> <a href="network_gist.c.html#LN62"><span class='Ref_to_Const'>INETSTRAT_GT</span></a><span class='Operator'>: 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><a href="../../../include/utils/inet.h.html#LN70"><span class='Ref_to_Macro'>ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                    <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>case</span> <a href="network_gist.c.html#LN59"><span class='Ref_to_Const'>INETSTRAT_NE</span></a><span class='Operator'>: 
+</span>                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Comment_Multi_Line'>/* For all other cases, we can be sure there is no match */ 
+</span>        <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if gk_ip_family(key)!=ip... &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Check 2: network bit count 
+     * 
+     * Network bit count (ip_bits) helps to check leaves for sub network and 
+     * sup network operators.  At non-leaf nodes, we know every child value 
+     * has ip_bits &GT;= gk_ip_minbits(key), so we can avoid descending in some 
+     * cases too. 
+     */ 
+</span>    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN117"><span class='Ref_To_Local'>strategy</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN64"><span class='Ref_to_Const'>INETSTRAT_SUB</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN132"><span class='Ref_to_Macro'>GIST_LEAF</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN115"><span class='Ref_To_Local'>ent</span></a><span class='Parentheses'>) </span><span class='Operator'>&& </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT;= </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN65"><span class='Ref_to_Const'>INETSTRAT_SUBEQ</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN132"><span class='Ref_to_Macro'>GIST_LEAF</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN115"><span class='Ref_To_Local'>ent</span></a><span class='Parentheses'>) </span><span class='Operator'>&& </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN67"><span class='Ref_to_Const'>INETSTRAT_SUPEQ</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN58"><span class='Ref_to_Const'>INETSTRAT_EQ</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN66"><span class='Ref_to_Const'>INETSTRAT_SUP</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT;= </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch strategy &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Check 3: common network bits 
+     * 
+     * Compare available common prefix bits to the query, but not beyond 
+     * either the query's netmask or the minimum netmask among the represented 
+     * values.  If these bits don't match the query, we have our answer (and 
+     * may or may not need to descend, depending on the operator).  If they do 
+     * match, and we are not at a leaf, we descend in all cases. 
+     * 
+     * Note this is the final check for operators that only consider the 
+     * network part of the address. 
+     */ 
+</span>    <a href="network_gist.c.html#LN122"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>= </span><a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN122"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>= </span><a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN122"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>= </span><a href="../../../include/utils/inet.h.html#LN145"><span class='Ref_to_Proto'>bitncmp</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../../include/utils/inet.h.html#LN76"><span class='Ref_to_Macro'>ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN122"><span class='Ref_To_Local'>minbits</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN117"><span class='Ref_To_Local'>strategy</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN64"><span class='Ref_to_Const'>INETSTRAT_SUB</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN65"><span class='Ref_to_Const'>INETSTRAT_SUBEQ</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN57"><span class='Ref_to_Const'>INETSTRAT_OVERLAPS</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN67"><span class='Ref_to_Const'>INETSTRAT_SUPEQ</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN66"><span class='Ref_to_Const'>INETSTRAT_SUP</span></a><span class='Operator'>: 
+</span>            <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN60"><span class='Ref_to_Const'>INETSTRAT_LT</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN61"><span class='Ref_to_Const'>INETSTRAT_LE</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span> <span class='Operator'>|| !</span><a href="../../../include/access/gist.h.html#LN132"><span class='Ref_to_Macro'>GIST_LEAF</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN115"><span class='Ref_To_Local'>ent</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN58"><span class='Ref_to_Const'>INETSTRAT_EQ</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><span class='Operator'>!</span><a href="../../../include/access/gist.h.html#LN132"><span class='Ref_to_Macro'>GIST_LEAF</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN115"><span class='Ref_To_Local'>ent</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN63"><span class='Ref_to_Const'>INETSTRAT_GE</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN62"><span class='Ref_to_Const'>INETSTRAT_GT</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>|| !</span><a href="../../../include/access/gist.h.html#LN132"><span class='Ref_to_Macro'>GIST_LEAF</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN115"><span class='Ref_To_Local'>ent</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN59"><span class='Ref_to_Const'>INETSTRAT_NE</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>!= </span><span class='Number'>0</span> <span class='Operator'>|| !</span><a href="../../../include/access/gist.h.html#LN132"><span class='Ref_to_Macro'>GIST_LEAF</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN115"><span class='Ref_To_Local'>ent</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch strategy &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Remaining checks are only for leaves and basic comparison strategies. 
+     * See network_cmp_internal() in network.c for the implementation we need 
+     * to match.  Note that in a leaf key, commonbits should equal the address 
+     * length, so we compared the whole network parts above. 
+     */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN132"><span class='Ref_to_Macro'>GIST_LEAF</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN115"><span class='Ref_To_Local'>ent</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* 
+     * Check 4: network bit count 
+     * 
+     * Next step is to compare netmask widths. 
+     */ 
+</span>    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN117"><span class='Ref_To_Local'>strategy</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN60"><span class='Ref_to_Const'>INETSTRAT_LT</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN61"><span class='Ref_to_Const'>INETSTRAT_LE</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN58"><span class='Ref_to_Const'>INETSTRAT_EQ</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN63"><span class='Ref_to_Const'>INETSTRAT_GE</span></a><span class='Operator'>: 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN62"><span class='Ref_to_Const'>INETSTRAT_GT</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&GT; </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT; </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN59"><span class='Ref_to_Const'>INETSTRAT_NE</span></a><span class='Operator'>: 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>))</span> 
+                <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>true</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>break</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch strategy &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Check 5: whole address 
+     * 
+     * Netmask bit counts are the same, so check all the address bits. 
+     */ 
+</span>    <a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>= </span><a href="../../../include/utils/inet.h.html#LN145"><span class='Ref_to_Proto'>bitncmp</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../../include/utils/inet.h.html#LN76"><span class='Ref_to_Macro'>ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN116"><span class='Ref_To_Local'>query</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN103"><span class='Ref_to_Macro'>gk_ip_maxbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN121"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>switch</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN117"><span class='Ref_To_Local'>strategy</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Control'>case</span> <a href="network_gist.c.html#LN60"><span class='Ref_to_Const'>INETSTRAT_LT</span></a><span class='Operator'>: 
+</span>            <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>&LT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN61"><span class='Ref_to_Const'>INETSTRAT_LE</span></a><span class='Operator'>: 
+</span>            <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>&LT;= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN58"><span class='Ref_to_Const'>INETSTRAT_EQ</span></a><span class='Operator'>: 
+</span>            <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN63"><span class='Ref_to_Const'>INETSTRAT_GE</span></a><span class='Operator'>: 
+</span>            <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>&GT;= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN62"><span class='Ref_to_Const'>INETSTRAT_GT</span></a><span class='Operator'>: 
+</span>            <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>case</span> <a href="network_gist.c.html#LN59"><span class='Ref_to_Const'>INETSTRAT_NE</span></a><span class='Operator'>: 
+</span>            <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN123"><span class='Ref_To_Local'>order</span></a> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end switch strategy &raquo; </span> 
+ 
+    <a href="../../bootstrap/bootscanner.l.html#LN129"><span class='Ref_to_Proto'>elog</span></a><span class='Parentheses'>(</span><a href="../../../include/port/win32/sys/socket.h.html#LN22"><span class='Ref_to_Const'>ERROR</span></a><span class='Delimiter'>, </span><span class='String'>"unknown strategy for inet GiST"</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/fmgr.h.html#LN318"><span class='Ref_to_Macro'>PG_RETURN_BOOL</span></a><span class='Parentheses'>(</span><span class='Boolean'>false</span><span class='Parentheses'>)</span><span class='Delimiter'>;</span>      <span class='Comment_Single_Line'>/* keep compiler quiet */ 
+</span><span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end inet_gist_consistent &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Calculate parameters of the union of some GistInetKeys. 
+ * 
+ * Examine the keys in elements m..n inclusive of the GISTENTRY array, 
+ * and compute these output parameters: 
+ * *minfamily_p = minimum IP address family number 
+ * *maxfamily_p = maximum IP address family number 
+ * *minbits_p = minimum netmask width 
+ * *commonbits_p = number of leading bits in common among the addresses 
+ * 
+ * minbits and commonbits are forced to zero if there's more than one 
+ * address family. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN343"></a><span class='Declare_Function'>calc_inet_union_params</span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ent</span><span class='Delimiter'>, 
+</span><a name="LN344"></a>                       <span class='Keyword'>int </span><span class='Declare_Parameter'>m</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>n</span><span class='Delimiter'>, 
+</span><a name="LN345"></a>                       <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>minfamily_p</span><span class='Delimiter'>, 
+</span><a name="LN346"></a>                       <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>maxfamily_p</span><span class='Delimiter'>, 
+</span><a name="LN347"></a>                       <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>minbits_p</span><span class='Delimiter'>, 
+</span><a name="LN348"></a>                       <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>commonbits_p</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN350"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>minfamily</span><span class='Delimiter'>, 
+</span><a name="LN351"></a>                <span class='Declare_Local'>maxfamily</span><span class='Delimiter'>, 
+</span><a name="LN352"></a>                <span class='Declare_Local'>minbits</span><span class='Delimiter'>, 
+</span><a name="LN353"></a>                <span class='Declare_Local'>commonbits</span><span class='Delimiter'>; 
+</span><a name="LN354"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span><a name="LN355"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tmp</span><span class='Delimiter'>; 
+</span><a name="LN356"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Must be at least one key. */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN344"><span class='Ref_to_Parameter'>m</span></a> <span class='Operator'>&LT;= </span><a href="network_gist.c.html#LN344"><span class='Ref_to_Parameter'>n</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize variables using the first key. */ 
+</span>    <a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN343"><span class='Ref_to_Parameter'>ent</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN344"><span class='Ref_to_Parameter'>m</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN350"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN351"><span class='Ref_To_Local'>maxfamily</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN352"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN353"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN354"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Scan remaining keys. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN356"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN344"><span class='Ref_to_Parameter'>m</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="network_gist.c.html#LN356"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="network_gist.c.html#LN344"><span class='Ref_to_Parameter'>n</span></a><span class='Delimiter'>; </span><a href="network_gist.c.html#LN356"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN343"><span class='Ref_to_Parameter'>ent</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN356"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Determine range of family numbers */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN350"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>&GT; </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>))</span> 
+            <a href="network_gist.c.html#LN350"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN351"><span class='Ref_To_Local'>maxfamily</span></a> <span class='Operator'>&LT; </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>))</span> 
+            <a href="network_gist.c.html#LN351"><span class='Ref_To_Local'>maxfamily</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Find minimum minbits */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN352"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>&GT; </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>))</span> 
+            <a href="network_gist.c.html#LN352"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Find minimum number of bits in common */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN353"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>&GT; </span><a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>))</span> 
+            <a href="network_gist.c.html#LN353"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN353"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="network_gist.c.html#LN353"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>= </span><a href="../../../include/utils/inet.h.html#LN146"><span class='Ref_to_Proto'>bitncommon</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN354"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN355"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN353"><span class='Ref_To_Local'>commonbits</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=m+1;i&LT;=n;i++ &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Force minbits/commonbits to zero if more than one family. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN350"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>!= </span><a href="network_gist.c.html#LN351"><span class='Ref_To_Local'>maxfamily</span></a><span class='Parentheses'>) 
+</span>        <a href="network_gist.c.html#LN352"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN353"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="network_gist.c.html#LN345"><span class='Ref_to_Parameter'>minfamily_p</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN350"><span class='Ref_To_Local'>minfamily</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="network_gist.c.html#LN346"><span class='Ref_to_Parameter'>maxfamily_p</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN351"><span class='Ref_To_Local'>maxfamily</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="network_gist.c.html#LN347"><span class='Ref_to_Parameter'>minbits_p</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN352"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="network_gist.c.html#LN348"><span class='Ref_to_Parameter'>commonbits_p</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN353"><span class='Ref_To_Local'>commonbits</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end calc_inet_union_params &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Same as above, but the GISTENTRY elements to examine are those with 
+ * indices listed in the offsets[] array. 
+ */ 
+</span><span class='Keyword'>static void 
+</span><a name="LN405"></a><span class='Declare_Function'>calc_inet_union_params_indexed</span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>ent</span><span class='Delimiter'>, 
+</span><a name="LN406"></a>                               <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Operator'>*</span><span class='Declare_Parameter'>offsets</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>noffsets</span><span class='Delimiter'>, 
+</span><a name="LN407"></a>                               <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>minfamily_p</span><span class='Delimiter'>, 
+</span><a name="LN408"></a>                               <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>maxfamily_p</span><span class='Delimiter'>, 
+</span><a name="LN409"></a>                               <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>minbits_p</span><span class='Delimiter'>, 
+</span><a name="LN410"></a>                               <span class='Keyword'>int </span><span class='Operator'>*</span><span class='Declare_Parameter'>commonbits_p</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN412"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>minfamily</span><span class='Delimiter'>, 
+</span><a name="LN413"></a>                <span class='Declare_Local'>maxfamily</span><span class='Delimiter'>, 
+</span><a name="LN414"></a>                <span class='Declare_Local'>minbits</span><span class='Delimiter'>, 
+</span><a name="LN415"></a>                <span class='Declare_Local'>commonbits</span><span class='Delimiter'>; 
+</span><a name="LN416"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span><a name="LN417"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tmp</span><span class='Delimiter'>; 
+</span><a name="LN418"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>i</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Must be at least one key. */ 
+</span>    <span class='Debug'>Assert</span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN406"><span class='Ref_to_Parameter'>noffsets</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize variables using the first key. */ 
+</span>    <a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN405"><span class='Ref_to_Parameter'>ent</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN406"><span class='Ref_to_Parameter'>offsets</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]]</span><span class='Operator'>.</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN412"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN413"><span class='Ref_To_Local'>maxfamily</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN414"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN415"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN416"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Scan remaining keys. */ 
+</span>    <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN418"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Delimiter'>; </span><a href="network_gist.c.html#LN418"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT; </span><a href="network_gist.c.html#LN406"><span class='Ref_to_Parameter'>noffsets</span></a><span class='Delimiter'>; </span><a href="network_gist.c.html#LN418"><span class='Ref_To_Local'>i</span></a><span class='Operator'>++</span><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN405"><span class='Ref_to_Parameter'>ent</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN406"><span class='Ref_to_Parameter'>offsets</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN418"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]]</span><span class='Operator'>.</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Determine range of family numbers */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN412"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>&GT; </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>))</span> 
+            <a href="network_gist.c.html#LN412"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN413"><span class='Ref_To_Local'>maxfamily</span></a> <span class='Operator'>&LT; </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>))</span> 
+            <a href="network_gist.c.html#LN413"><span class='Ref_To_Local'>maxfamily</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Find minimum minbits */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN414"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>&GT; </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>))</span> 
+            <a href="network_gist.c.html#LN414"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Comment_Multi_Line'>/* Find minimum number of bits in common */ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN415"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>&GT; </span><a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>))</span> 
+            <a href="network_gist.c.html#LN415"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN415"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>            <a href="network_gist.c.html#LN415"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>= </span><a href="../../../include/utils/inet.h.html#LN146"><span class='Ref_to_Proto'>bitncommon</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN416"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN417"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN415"><span class='Ref_To_Local'>commonbits</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end for i=1;i&LT;noffsets;i++ &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* Force minbits/commonbits to zero if more than one family. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN412"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>!= </span><a href="network_gist.c.html#LN413"><span class='Ref_To_Local'>maxfamily</span></a><span class='Parentheses'>) 
+</span>        <a href="network_gist.c.html#LN414"><span class='Ref_To_Local'>minbits</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN415"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="network_gist.c.html#LN407"><span class='Ref_to_Parameter'>minfamily_p</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN412"><span class='Ref_To_Local'>minfamily</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="network_gist.c.html#LN408"><span class='Ref_to_Parameter'>maxfamily_p</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN413"><span class='Ref_To_Local'>maxfamily</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="network_gist.c.html#LN409"><span class='Ref_to_Parameter'>minbits_p</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN414"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>; 
+</span>    <span class='Operator'>*</span><a href="network_gist.c.html#LN410"><span class='Ref_to_Parameter'>commonbits_p</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN415"><span class='Ref_To_Local'>commonbits</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end calc_inet_union_params_indexed &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * Construct a GistInetKey representing a union value. 
+ * 
+ * Inputs are the family/minbits/commonbits values to use, plus a pointer to 
+ * the address field of one of the union inputs.  (Since we're going to copy 
+ * just the bits-in-common, it doesn't matter which one.) 
+ */ 
+</span><span class='Keyword'>static </span><a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>* 
+</span><a name="LN470"></a><span class='Declare_Function'>build_inet_union_key</span><span class='Parentheses'>(</span><span class='Keyword'>int </span><span class='Declare_Parameter'>family</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>minbits</span><span class='Delimiter'>, </span><span class='Keyword'>int </span><span class='Declare_Parameter'>commonbits</span><span class='Delimiter'>, 
+</span><a name="LN471"></a>                     <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Parameter'>addr</span><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN473"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Make sure any unused bits are zeroed. */ 
+</span>    <a href="network_gist.c.html#LN473"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN473"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="network_gist.c.html#LN470"><span class='Ref_to_Parameter'>family</span></a><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN473"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="network_gist.c.html#LN470"><span class='Ref_to_Parameter'>minbits</span></a><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN473"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="network_gist.c.html#LN470"><span class='Ref_to_Parameter'>commonbits</span></a><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Clone appropriate bytes of the address. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN470"><span class='Ref_to_Parameter'>commonbits</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        memcpy<span class='Parentheses'>(</span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN473"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN471"><span class='Ref_to_Parameter'>addr</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN470"><span class='Ref_to_Parameter'>commonbits</span></a> <span class='Operator'>+ </span><span class='Number'>7</span><span class='Parentheses'>) </span><span class='Operator'>/ </span><span class='Number'>8</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Clean any unwanted bits in the last partial byte. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN470"><span class='Ref_to_Parameter'>commonbits</span></a> <span class='Operator'>% </span><span class='Number'>8</span> <span class='Operator'>!= </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>        <a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN473"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>[</span><a href="network_gist.c.html#LN470"><span class='Ref_to_Parameter'>commonbits</span></a> <span class='Operator'>/ </span><span class='Number'>8</span><span class='Delimiter'>] </span><span class='Operator'>&= ~</span><span class='Parentheses'>(</span><span class='Number'>0xFF</span> <span class='Operator'>&GT;&GT; </span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN470"><span class='Ref_to_Parameter'>commonbits</span></a> <span class='Operator'>% </span><span class='Number'>8</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Set varlena header correctly. */ 
+</span>    <a href="network_gist.c.html#LN105"><span class='Ref_to_Macro'>SET_GK_VARSIZE</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN473"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>return</span> <a href="network_gist.c.html#LN473"><span class='Ref_To_Local'>result</span></a><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end build_inet_union_key &raquo; </span> 
+ 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The GiST union function 
+ * 
+ * See comments at head of file for the definition of the union. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN503"></a><span class='Declare_Function'>inet_gist_union</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN505"></a>    <a href="../../../include/access/gist.h.html#LN157"><span class='Ref_to_Typedef'>GistEntryVector</span></a> <span class='Operator'>*</span><span class='Declare_Local'>entryvec</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN157"><span class='Ref_to_Typedef'>GistEntryVector</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN506"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>ent</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN505"><span class='Ref_To_Local'>entryvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN160"><span class='Ref_to_Member'>vector</span></a><span class='Delimiter'>; 
+</span><a name="LN507"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>minfamily</span><span class='Delimiter'>, 
+</span><a name="LN508"></a>                <span class='Declare_Local'>maxfamily</span><span class='Delimiter'>, 
+</span><a name="LN509"></a>                <span class='Declare_Local'>minbits</span><span class='Delimiter'>, 
+</span><a name="LN510"></a>                <span class='Declare_Local'>commonbits</span><span class='Delimiter'>; 
+</span><a name="LN511"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span><a name="LN512"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tmp</span><span class='Delimiter'>, 
+</span><a name="LN513"></a>               <span class='Operator'>*</span><span class='Declare_Local'>result</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Determine parameters of the union. */ 
+</span>    <a href="network_gist.c.html#LN342"><span class='Ref_to_Func'>calc_inet_union_params</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN506"><span class='Ref_To_Local'>ent</span></a><span class='Delimiter'>, </span><span class='Number'>0</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN505"><span class='Ref_To_Local'>entryvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN159"><span class='Ref_to_Member'>n</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>, 
+</span>                           <span class='Operator'>&</span><a href="network_gist.c.html#LN507"><span class='Ref_To_Local'>minfamily</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="network_gist.c.html#LN508"><span class='Ref_To_Local'>maxfamily</span></a><span class='Delimiter'>, 
+</span>                           <span class='Operator'>&</span><a href="network_gist.c.html#LN509"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="network_gist.c.html#LN510"><span class='Ref_To_Local'>commonbits</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* If more than one family, emit family number zero. */ 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN507"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>!= </span><a href="network_gist.c.html#LN508"><span class='Ref_To_Local'>maxfamily</span></a><span class='Parentheses'>) 
+</span>        <a href="network_gist.c.html#LN507"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Initialize address using the first key. */ 
+</span>    <a href="network_gist.c.html#LN512"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN506"><span class='Ref_To_Local'>ent</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN511"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN512"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Construct the union value. */ 
+</span>    <a href="network_gist.c.html#LN513"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN469"><span class='Ref_to_Func'>build_inet_union_key</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN507"><span class='Ref_To_Local'>minfamily</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN509"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN510"><span class='Ref_To_Local'>commonbits</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN511"><span class='Ref_To_Local'>addr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN513"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end inet_gist_union &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The GiST compress function 
+ * 
+ * Convert an inet value to GistInetKey. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN540"></a><span class='Declare_Function'>inet_gist_compress</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN542"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>entry</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN543"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>retval</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN126"><span class='Ref_to_Member'>leafkey</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <a href="network_gist.c.html#LN543"><span class='Ref_To_Local'>retval</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN554"><span class='Ref_to_Macro'>DatumGetPointer</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><span class='Null_Value'>NULL</span><span class='Parentheses'>)</span> 
+        <span class='Delimiter'>{ 
+</span><a name="LN550"></a>            <a href="../../../include/utils/inet.h.html#LN51"><span class='Ref_to_Typedef'>inet</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>in</span> <span class='Operator'>= </span><a href="../../../include/utils/inet.h.html#LN121"><span class='Ref_to_Macro'>DatumGetInetPP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN551"></a>            <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>r</span><span class='Delimiter'>; 
+</span> 
+            <a href="network_gist.c.html#LN551"><span class='Ref_To_Local'>r</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+            <a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN551"><span class='Ref_To_Local'>r</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="../../../include/utils/inet.h.html#LN70"><span class='Ref_to_Macro'>ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN550"><span class='Ref_To_Local'>in</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN551"><span class='Ref_To_Local'>r</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN550"><span class='Ref_To_Local'>in</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN551"><span class='Ref_To_Local'>r</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="network_gist.c.html#LN103"><span class='Ref_to_Macro'>gk_ip_maxbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN551"><span class='Ref_To_Local'>r</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            memcpy<span class='Parentheses'>(</span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN551"><span class='Ref_To_Local'>r</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../../include/utils/inet.h.html#LN76"><span class='Ref_to_Macro'>ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN550"><span class='Ref_To_Local'>in</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN101"><span class='Ref_to_Macro'>gk_ip_addrsize</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN551"><span class='Ref_To_Local'>r</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>            <a href="network_gist.c.html#LN105"><span class='Ref_to_Macro'>SET_GK_VARSIZE</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN551"><span class='Ref_To_Local'>r</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="../../../include/access/gist.h.html#LN168"><span class='Ref_to_Macro'>gistentryinit</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="network_gist.c.html#LN543"><span class='Ref_To_Local'>retval</span></a><span class='Delimiter'>, </span><a href="../../../include/postgres.h.html#LN561"><span class='Ref_to_Macro'>PointerGetDatum</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN551"><span class='Ref_To_Local'>r</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                          <a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN123"><span class='Ref_to_Member'>rel</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN124"><span class='Ref_to_Member'>page</span></a><span class='Delimiter'>, 
+</span>                          <a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN125"><span class='Ref_to_Member'>offset</span></a><span class='Delimiter'>, </span><span class='Boolean'>FALSE</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="../../../include/access/gist.h.html#LN168"><span class='Ref_to_Macro'>gistentryinit</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="network_gist.c.html#LN543"><span class='Ref_To_Local'>retval</span></a><span class='Delimiter'>, </span><span class='Parentheses'>(</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a><span class='Parentheses'>) </span><span class='Number'>0</span><span class='Delimiter'>, 
+</span>                          <a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN123"><span class='Ref_to_Member'>rel</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN124"><span class='Ref_to_Member'>page</span></a><span class='Delimiter'>, 
+</span>                          <a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN125"><span class='Ref_to_Member'>offset</span></a><span class='Delimiter'>, </span><span class='Boolean'>FALSE</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end if entry-&GT;leafkey &raquo; </span> 
+    <span class='Control'>else</span> 
+        <a href="network_gist.c.html#LN543"><span class='Ref_To_Local'>retval</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN542"><span class='Ref_To_Local'>entry</span></a><span class='Delimiter'>; 
+</span>    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN543"><span class='Ref_To_Local'>retval</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end inet_gist_compress &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The GiST decompress function 
+ * 
+ * do not do anything --- we just use the stored GistInetKey as-is. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN583"></a><span class='Declare_Function'>inet_gist_decompress</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN585"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>entry</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN585"><span class='Ref_To_Local'>entry</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span> 
+<span class='Comment_Multi_Line'>/* 
+ * The GiST fetch function 
+ * 
+ * Reconstruct the original inet datum from a GistInetKey. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN596"></a><span class='Declare_Function'>inet_gist_fetch</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN598"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>entry</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN599"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>key</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN598"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN600"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>retval</span><span class='Delimiter'>; 
+</span><a name="LN601"></a>    <a href="../../../include/utils/inet.h.html#LN51"><span class='Ref_to_Typedef'>inet</span></a>       <span class='Operator'>*</span><span class='Declare_Local'>dst</span><span class='Delimiter'>; 
+</span> 
+    <a href="network_gist.c.html#LN601"><span class='Ref_To_Local'>dst</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/utils/inet.h.html#LN51"><span class='Ref_to_Typedef'>inet</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN34"><span class='Ref_to_Proto'>palloc0</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/utils/inet.h.html#LN51"><span class='Ref_to_Typedef'>inet</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/utils/inet.h.html#LN70"><span class='Ref_to_Macro'>ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN601"><span class='Ref_To_Local'>dst</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN599"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/inet.h.html#LN73"><span class='Ref_to_Macro'>ip_bits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN601"><span class='Ref_To_Local'>dst</span></a><span class='Parentheses'>) </span><span class='Operator'>= </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN599"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    memcpy<span class='Parentheses'>(</span><a href="../../../include/utils/inet.h.html#LN76"><span class='Ref_to_Macro'>ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN601"><span class='Ref_To_Local'>dst</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN599"><span class='Ref_To_Local'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="../../../include/utils/inet.h.html#LN79"><span class='Ref_to_Macro'>ip_addrsize</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN601"><span class='Ref_To_Local'>dst</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/utils/inet.h.html#LN85"><span class='Ref_to_Macro'>SET_INET_VARSIZE</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN601"><span class='Ref_To_Local'>dst</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="network_gist.c.html#LN600"><span class='Ref_To_Local'>retval</span></a> <span class='Operator'>= </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span>    <a href="../../../include/access/gist.h.html#LN168"><span class='Ref_to_Macro'>gistentryinit</span></a><span class='Parentheses'>(</span><span class='Operator'>*</span><a href="network_gist.c.html#LN600"><span class='Ref_To_Local'>retval</span></a><span class='Delimiter'>, </span><a href="../../../include/utils/inet.h.html#LN122"><span class='Ref_to_Macro'>InetPGetDatum</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN601"><span class='Ref_To_Local'>dst</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN598"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN123"><span class='Ref_to_Member'>rel</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN598"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN124"><span class='Ref_to_Member'>page</span></a><span class='Delimiter'>, 
+</span>                  <a href="network_gist.c.html#LN598"><span class='Ref_To_Local'>entry</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN125"><span class='Ref_to_Member'>offset</span></a><span class='Delimiter'>, </span><span class='Boolean'>FALSE</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN600"><span class='Ref_To_Local'>retval</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end inet_gist_fetch &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The GiST page split penalty function 
+ * 
+ * Charge a large penalty if address family doesn't match, or a somewhat 
+ * smaller one if the new value would degrade the union's minbits 
+ * (minimum netmask width).  Otherwise, penalty is inverse of the 
+ * new number of common address bits. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN626"></a><span class='Declare_Function'>inet_gist_penalty</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN628"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>origent</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN629"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>newent</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN630"></a>    <span class='Keyword'>float</span>      <span class='Operator'>*</span><span class='Declare_Local'>penalty</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>float </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN631"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>orig</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN628"><span class='Ref_To_Local'>origent</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span><a name="LN632"></a>               <span class='Operator'>*</span><span class='Declare_Local'>new</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN629"><span class='Ref_To_Local'>newent</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN633"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>commonbits</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN631"><span class='Ref_To_Local'>orig</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><span class='Control'>new</span><span class='Parentheses'>))</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN631"><span class='Ref_To_Local'>orig</span></a><span class='Parentheses'>) </span><span class='Operator'>&LT;= </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><span class='Control'>new</span><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <a href="network_gist.c.html#LN633"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>= </span><a href="../../../include/utils/inet.h.html#LN146"><span class='Ref_to_Proto'>bitncommon</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN631"><span class='Ref_To_Local'>orig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><span class='Control'>new</span><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                    <a href="../../../interfaces/ecpg/pgtypeslib/numeric.c.html#LN11"><span class='Ref_to_Macro'>Min</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN631"><span class='Ref_To_Local'>orig</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                                        <a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><span class='Control'>new</span><span class='Parentheses'>)))</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN633"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Operator'>*</span><a href="network_gist.c.html#LN630"><span class='Ref_To_Local'>penalty</span></a> <span class='Operator'>= </span><span class='Number'>1</span><span class='Operator'>.</span><span class='Number'>0f</span> <span class='Operator'>/ </span><a href="network_gist.c.html#LN633"><span class='Ref_To_Local'>commonbits</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <span class='Operator'>*</span><a href="network_gist.c.html#LN630"><span class='Ref_To_Local'>penalty</span></a> <span class='Operator'>= </span><span class='Number'>2</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>        <span class='Control'>else</span> 
+            <span class='Operator'>*</span><a href="network_gist.c.html#LN630"><span class='Ref_To_Local'>penalty</span></a> <span class='Operator'>= </span><span class='Number'>3</span><span class='Delimiter'>; 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+        <span class='Operator'>*</span><a href="network_gist.c.html#LN630"><span class='Ref_To_Local'>penalty</span></a> <span class='Operator'>= </span><span class='Number'>4</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN630"><span class='Ref_To_Local'>penalty</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end inet_gist_penalty &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The GiST PickSplit method 
+ * 
+ * There are two ways to split. First one is to split by address families, 
+ * if there are multiple families appearing in the input. 
+ * 
+ * The second and more common way is to split by addresses. To achieve this, 
+ * determine the number of leading bits shared by all the keys, then split on 
+ * the next bit.  (We don't currently consider the netmask widths while doing 
+ * this; should we?)  If we fail to get a nontrivial split that way, split 
+ * 50-50. 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN669"></a><span class='Declare_Function'>inet_gist_picksplit</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN671"></a>    <a href="../../../include/access/gist.h.html#LN157"><span class='Ref_to_Typedef'>GistEntryVector</span></a> <span class='Operator'>*</span><span class='Declare_Local'>entryvec</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN157"><span class='Ref_to_Typedef'>GistEntryVector</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN672"></a>    <a href="../../../include/access/gist.h.html#LN102"><span class='Ref_to_Struct'>GIST_SPLITVEC</span></a> <span class='Operator'>*</span><span class='Declare_Local'>splitvec</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/access/gist.h.html#LN102"><span class='Ref_to_Struct'>GIST_SPLITVEC</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span><a name="LN673"></a>    <a href="../../../include/access/gist.h.html#LN120"><span class='Ref_to_Struct'>GISTENTRY</span></a>  <span class='Operator'>*</span><span class='Declare_Local'>ent</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN671"><span class='Ref_To_Local'>entryvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN160"><span class='Ref_to_Member'>vector</span></a><span class='Delimiter'>; 
+</span><a name="LN674"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>minfamily</span><span class='Delimiter'>, 
+</span><a name="LN675"></a>                <span class='Declare_Local'>maxfamily</span><span class='Delimiter'>, 
+</span><a name="LN676"></a>                <span class='Declare_Local'>minbits</span><span class='Delimiter'>, 
+</span><a name="LN677"></a>                <span class='Declare_Local'>commonbits</span><span class='Delimiter'>; 
+</span><a name="LN678"></a>    <span class='Keyword'>unsigned char </span><span class='Operator'>*</span><span class='Declare_Local'>addr</span><span class='Delimiter'>; 
+</span><a name="LN679"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>tmp</span><span class='Delimiter'>, 
+</span><a name="LN680"></a>               <span class='Operator'>*</span><span class='Declare_Local'>left_union</span><span class='Delimiter'>, 
+</span><a name="LN681"></a>               <span class='Operator'>*</span><span class='Declare_Local'>right_union</span><span class='Delimiter'>; 
+</span><a name="LN682"></a>    <span class='Keyword'>int</span>         <span class='Declare_Local'>maxoff</span><span class='Delimiter'>, 
+</span><a name="LN683"></a>                <span class='Declare_Local'>nbytes</span><span class='Delimiter'>; 
+</span><a name="LN684"></a>    <a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Declare_Local'>i</span><span class='Delimiter'>, 
+</span><a name="LN685"></a>               <span class='Operator'>*</span><span class='Declare_Local'>left</span><span class='Delimiter'>, 
+</span><a name="LN686"></a>               <span class='Operator'>*</span><span class='Declare_Local'>right</span><span class='Delimiter'>; 
+</span> 
+    <a href="network_gist.c.html#LN682"><span class='Ref_To_Local'>maxoff</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN671"><span class='Ref_To_Local'>entryvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN159"><span class='Ref_to_Member'>n</span></a> <span class='Operator'>- </span><span class='Number'>1</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN683"><span class='Ref_To_Local'>nbytes</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN682"><span class='Ref_To_Local'>maxoff</span></a> <span class='Operator'>+ </span><span class='Number'>1</span><span class='Parentheses'>) </span><span class='Operator'>* </span><span class='Keyword'>sizeof</span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="network_gist.c.html#LN685"><span class='Ref_To_Local'>left</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN683"><span class='Ref_To_Local'>nbytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN686"><span class='Ref_To_Local'>right</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="../../../include/storage/off.h.html#LN23"><span class='Ref_to_Typedef'>OffsetNumber</span></a> <span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/common/fe_memutils.h.html#LN33"><span class='Ref_to_Proto'>palloc</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN683"><span class='Ref_To_Local'>nbytes</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN104"><span class='Ref_to_Member'>spl_left</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN685"><span class='Ref_To_Local'>left</span></a><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN109"><span class='Ref_to_Member'>spl_right</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN686"><span class='Ref_To_Local'>right</span></a><span class='Delimiter'>; 
+</span> 
+    <a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN105"><span class='Ref_to_Member'>spl_nleft</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN110"><span class='Ref_to_Member'>spl_nright</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+    <span class='Comment_Multi_Line'>/* Determine parameters of the union of all the inputs. */ 
+</span>    <a href="network_gist.c.html#LN342"><span class='Ref_to_Func'>calc_inet_union_params</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN673"><span class='Ref_To_Local'>ent</span></a><span class='Delimiter'>, </span><a href="../../../include/storage/off.h.html#LN26"><span class='Ref_to_Const'>FirstOffsetNumber</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN682"><span class='Ref_To_Local'>maxoff</span></a><span class='Delimiter'>, 
+</span>                           <span class='Operator'>&</span><a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="network_gist.c.html#LN675"><span class='Ref_To_Local'>maxfamily</span></a><span class='Delimiter'>, 
+</span>                           <span class='Operator'>&</span><a href="network_gist.c.html#LN676"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>!= </span><a href="network_gist.c.html#LN675"><span class='Ref_To_Local'>maxfamily</span></a><span class='Parentheses'>) 
+</span>    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* Multiple families, so split by family. */ 
+</span>        <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN26"><span class='Ref_to_Const'>FirstOffsetNumber</span></a><span class='Delimiter'>; </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="network_gist.c.html#LN682"><span class='Ref_To_Local'>maxoff</span></a><span class='Delimiter'>; </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN52"><span class='Ref_to_Macro'>OffsetNumberNext</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span> 
+        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* 
+             * If there's more than 2 families, all but maxfamily go into the 
+             * left union.  This could only happen if the inputs include some 
+             * IPv4, some IPv6, and some already-multiple-family unions. 
+             */ 
+</span>            <a href="network_gist.c.html#LN679"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN673"><span class='Ref_To_Local'>ent</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN679"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>) </span><span class='Operator'>!= </span><a href="network_gist.c.html#LN675"><span class='Ref_To_Local'>maxfamily</span></a><span class='Parentheses'>)</span> 
+                <a href="network_gist.c.html#LN685"><span class='Ref_To_Local'>left</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN105"><span class='Ref_to_Member'>spl_nleft</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <span class='Control'>else</span> 
+                <a href="network_gist.c.html#LN686"><span class='Ref_To_Local'>right</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN110"><span class='Ref_to_Member'>spl_nright</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>} 
+</span>    <span class='Control'>else</span> 
+    <span class='Delimiter'>{ 
+</span>        <span class='Comment_Multi_Line'>/* 
+         * Split on the next bit after the common bits.  If that yields a 
+         * trivial split, try the next bit position to the right.  Repeat till 
+         * success; or if we run out of bits, do an arbitrary 50-50 split. 
+         */ 
+</span><a name="LN729"></a>        <span class='Keyword'>int</span>         <span class='Declare_Local'>maxbits</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN98"><span class='Ref_to_Macro'>ip_family_maxbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+        <span class='Control'>while</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>&LT; </span><a href="network_gist.c.html#LN729"><span class='Ref_To_Local'>maxbits</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Split using the commonbits'th bit position. */ 
+</span><a name="LN734"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>bitbyte</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>/ </span><span class='Number'>8</span><span class='Delimiter'>; 
+</span><a name="LN735"></a>            <span class='Keyword'>int</span>         <span class='Declare_Local'>bitmask</span> <span class='Operator'>= </span><span class='Number'>0x80</span> <span class='Operator'>&GT;&GT; </span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>% </span><span class='Number'>8</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+            <a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN105"><span class='Ref_to_Member'>spl_nleft</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN110"><span class='Ref_to_Member'>spl_nright</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN26"><span class='Ref_to_Const'>FirstOffsetNumber</span></a><span class='Delimiter'>; </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="network_gist.c.html#LN682"><span class='Ref_To_Local'>maxoff</span></a><span class='Delimiter'>; </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN52"><span class='Ref_to_Macro'>OffsetNumberNext</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="network_gist.c.html#LN679"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN673"><span class='Ref_To_Local'>ent</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>]</span><span class='Operator'>.</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <a href="network_gist.c.html#LN678"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN679"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>                <span class='Control'>if</span> <span class='Parentheses'>((</span><a href="network_gist.c.html#LN678"><span class='Ref_To_Local'>addr</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN734"><span class='Ref_To_Local'>bitbyte</span></a><span class='Delimiter'>] </span><span class='Operator'>& </span><a href="network_gist.c.html#LN735"><span class='Ref_To_Local'>bitmask</span></a><span class='Parentheses'>) </span><span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span> 
+                    <a href="network_gist.c.html#LN685"><span class='Ref_To_Local'>left</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN105"><span class='Ref_to_Member'>spl_nleft</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>                <span class='Control'>else</span> 
+                    <a href="network_gist.c.html#LN686"><span class='Ref_To_Local'>right</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN110"><span class='Ref_to_Member'>spl_nright</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span> 
+            <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN105"><span class='Ref_to_Member'>spl_nleft</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span> <span class='Operator'>&& </span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN110"><span class='Ref_to_Member'>spl_nright</span></a> <span class='Operator'>&GT; </span><span class='Number'>0</span><span class='Parentheses'>) 
+</span>                <span class='Control'>break</span><span class='Delimiter'>;</span>          <span class='Comment_Single_Line'>/* success */ 
+</span>            <a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a><span class='Operator'>++</span><span class='Delimiter'>; 
+</span>        <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end while commonbits&LT;maxbits &raquo; </span> 
+ 
+        <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a> <span class='Operator'>&GT;= </span><a href="network_gist.c.html#LN729"><span class='Ref_To_Local'>maxbits</span></a><span class='Parentheses'>) 
+</span>        <span class='Delimiter'>{ 
+</span>            <span class='Comment_Multi_Line'>/* Failed ... do a 50-50 split. */ 
+</span>            <a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN105"><span class='Ref_to_Member'>spl_nleft</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN110"><span class='Ref_to_Member'>spl_nright</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span> 
+            <span class='Control'>for</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN26"><span class='Ref_to_Const'>FirstOffsetNumber</span></a><span class='Delimiter'>; </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="network_gist.c.html#LN682"><span class='Ref_To_Local'>maxoff</span></a> <span class='Operator'>/ </span><span class='Number'>2</span><span class='Delimiter'>; </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN52"><span class='Ref_to_Macro'>OffsetNumberNext</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="network_gist.c.html#LN685"><span class='Ref_To_Local'>left</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN105"><span class='Ref_to_Member'>spl_nleft</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>            <span class='Control'>for</span> <span class='Parentheses'>(</span><span class='Delimiter'>; </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>&LT;= </span><a href="network_gist.c.html#LN682"><span class='Ref_To_Local'>maxoff</span></a><span class='Delimiter'>; </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a> <span class='Operator'>= </span><a href="../../../include/storage/off.h.html#LN52"><span class='Ref_to_Macro'>OffsetNumberNext</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Parentheses'>))</span> 
+            <span class='Delimiter'>{ 
+</span>                <a href="network_gist.c.html#LN686"><span class='Ref_To_Local'>right</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN110"><span class='Ref_to_Member'>spl_nright</span></a><span class='Operator'>++</span><span class='Delimiter'>] </span><span class='Operator'>= </span><a href="network_gist.c.html#LN684"><span class='Ref_To_Local'>i</span></a><span class='Delimiter'>; 
+</span>            <span class='Delimiter'>} 
+</span>        <span class='Delimiter'>} 
+</span>    <span class='Delimiter'>}</span><span class='Auto_Annotations'> &laquo; end else &raquo; </span> 
+ 
+    <span class='Comment_Multi_Line'>/* 
+     * Compute the union value for each side from scratch.  In most cases we 
+     * could approximate the union values with what we already know, but this 
+     * ensures that each side has minbits and commonbits set as high as 
+     * possible. 
+     */ 
+</span>    <a href="network_gist.c.html#LN404"><span class='Ref_to_Func'>calc_inet_union_params_indexed</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN673"><span class='Ref_To_Local'>ent</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN685"><span class='Ref_To_Local'>left</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN105"><span class='Ref_to_Member'>spl_nleft</span></a><span class='Delimiter'>, 
+</span>                                   <span class='Operator'>&</span><a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="network_gist.c.html#LN675"><span class='Ref_To_Local'>maxfamily</span></a><span class='Delimiter'>, 
+</span>                                   <span class='Operator'>&</span><a href="network_gist.c.html#LN676"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>!= </span><a href="network_gist.c.html#LN675"><span class='Ref_To_Local'>maxfamily</span></a><span class='Parentheses'>) 
+</span>        <a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN679"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN673"><span class='Ref_To_Local'>ent</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN685"><span class='Ref_To_Local'>left</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]]</span><span class='Operator'>.</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN678"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN679"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN680"><span class='Ref_To_Local'>left_union</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN469"><span class='Ref_to_Func'>build_inet_union_key</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN676"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN678"><span class='Ref_To_Local'>addr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN106"><span class='Ref_to_Member'>spl_ldatum</span></a> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN561"><span class='Ref_to_Macro'>PointerGetDatum</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN680"><span class='Ref_To_Local'>left_union</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="network_gist.c.html#LN404"><span class='Ref_to_Func'>calc_inet_union_params_indexed</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN673"><span class='Ref_To_Local'>ent</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN686"><span class='Ref_To_Local'>right</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN110"><span class='Ref_to_Member'>spl_nright</span></a><span class='Delimiter'>, 
+</span>                                   <span class='Operator'>&</span><a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="network_gist.c.html#LN675"><span class='Ref_To_Local'>maxfamily</span></a><span class='Delimiter'>, 
+</span>                                   <span class='Operator'>&</span><a href="network_gist.c.html#LN676"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>, </span><span class='Operator'>&</span><a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <span class='Control'>if</span> <span class='Parentheses'>(</span><a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>!= </span><a href="network_gist.c.html#LN675"><span class='Ref_To_Local'>maxfamily</span></a><span class='Parentheses'>) 
+</span>        <a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a> <span class='Operator'>= </span><span class='Number'>0</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN679"><span class='Ref_To_Local'>tmp</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN673"><span class='Ref_To_Local'>ent</span></a><span class='Delimiter'>[</span><a href="network_gist.c.html#LN686"><span class='Ref_To_Local'>right</span></a><span class='Delimiter'>[</span><span class='Number'>0</span><span class='Delimiter'>]]</span><span class='Operator'>.</span><a href="../../../include/access/gist.h.html#LN122"><span class='Ref_to_Member'>key</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN678"><span class='Ref_To_Local'>addr</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN679"><span class='Ref_To_Local'>tmp</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN681"><span class='Ref_To_Local'>right_union</span></a> <span class='Operator'>= </span><a href="network_gist.c.html#LN469"><span class='Ref_to_Func'>build_inet_union_key</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN674"><span class='Ref_To_Local'>minfamily</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN676"><span class='Ref_To_Local'>minbits</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN677"><span class='Ref_To_Local'>commonbits</span></a><span class='Delimiter'>, </span><a href="network_gist.c.html#LN678"><span class='Ref_To_Local'>addr</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span>    <a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Operator'>-&GT;</span><a href="../../../include/access/gist.h.html#LN111"><span class='Ref_to_Member'>spl_rdatum</span></a> <span class='Operator'>= </span><a href="../../../include/postgres.h.html#LN561"><span class='Ref_to_Macro'>PointerGetDatum</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN681"><span class='Ref_To_Local'>right_union</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN672"><span class='Ref_To_Local'>splitvec</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+}</span><span class='Auto_Annotations'> &laquo; end inet_gist_picksplit &raquo; </span> 
+ 
+<span class='Comment_Multi_Line'>/* 
+ * The GiST equality function 
+ */ 
+</span><a href="../../../include/postgres.h.html#LN371"><span class='Ref_to_Typedef'>Datum</span></a> 
+<a name="LN803"></a><span class='Declare_Function'>inet_gist_same</span><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN157"><span class='Ref_to_Const'>PG_FUNCTION_ARGS</span></a><span class='Parentheses'>) 
+</span><span class='Delimiter'>{ 
+</span><a name="LN805"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>left</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN232"><span class='Ref_to_Macro'>PG_GETARG_DATUM</span></a><span class='Parentheses'>(</span><span class='Number'>0</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span><a name="LN806"></a>    <a href="network_gist.c.html#LN77"><span class='Ref_to_Struct'>GistInetKey</span></a> <span class='Operator'>*</span><span class='Declare_Local'>right</span> <span class='Operator'>= </span><a href="network_gist.c.html#LN86"><span class='Ref_to_Macro'>DatumGetInetKeyP</span></a><span class='Parentheses'>(</span><a href="../../../include/fmgr.h.html#LN232"><span class='Ref_to_Macro'>PG_GETARG_DATUM</span></a><span class='Parentheses'>(</span><span class='Number'>1</span><span class='Parentheses'>))</span><span class='Delimiter'>; 
+</span><a name="LN807"></a>    <span class='Keyword'>bool</span>       <span class='Operator'>*</span><span class='Declare_Local'>result</span> <span class='Operator'>= </span><span class='Parentheses'>(</span><span class='Keyword'>bool </span><span class='Operator'>*</span><span class='Parentheses'>) </span><a href="../../../include/fmgr.h.html#LN240"><span class='Ref_to_Macro'>PG_GETARG_POINTER</span></a><span class='Parentheses'>(</span><span class='Number'>2</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <span class='Operator'>*</span><a href="network_gist.c.html#LN807"><span class='Ref_To_Local'>result</span></a> <span class='Operator'>= </span><span class='Parentheses'>(</span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN805"><span class='Ref_To_Local'>left</span></a><span class='Parentheses'>)</span> <span class='Operator'>== </span><a href="network_gist.c.html#LN94"><span class='Ref_to_Macro'>gk_ip_family</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN806"><span class='Ref_To_Local'>right</span></a><span class='Parentheses'>)</span> <span class='Operator'>&& 
+</span>               <a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN805"><span class='Ref_To_Local'>left</span></a><span class='Parentheses'>)</span> <span class='Operator'>== </span><a href="network_gist.c.html#LN95"><span class='Ref_to_Macro'>gk_ip_minbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN806"><span class='Ref_To_Local'>right</span></a><span class='Parentheses'>)</span> <span class='Operator'>&& 
+</span>               <a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN805"><span class='Ref_To_Local'>left</span></a><span class='Parentheses'>)</span> <span class='Operator'>== </span><a href="network_gist.c.html#LN96"><span class='Ref_to_Macro'>gk_ip_commonbits</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN806"><span class='Ref_To_Local'>right</span></a><span class='Parentheses'>)</span> <span class='Operator'>&& 
+</span>               memcmp<span class='Parentheses'>(</span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN805"><span class='Ref_To_Local'>left</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, </span><a href="network_gist.c.html#LN97"><span class='Ref_to_Macro'>gk_ip_addr</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN806"><span class='Ref_To_Local'>right</span></a><span class='Parentheses'>)</span><span class='Delimiter'>, 
+</span>                      <a href="network_gist.c.html#LN101"><span class='Ref_to_Macro'>gk_ip_addrsize</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN805"><span class='Ref_To_Local'>left</span></a><span class='Parentheses'>))</span> <span class='Operator'>== </span><span class='Number'>0</span><span class='Parentheses'>)</span><span class='Delimiter'>; 
+</span> 
+    <a href="../../../include/fmgr.h.html#LN320"><span class='Ref_to_Macro'>PG_RETURN_POINTER</span></a><span class='Parentheses'>(</span><a href="network_gist.c.html#LN807"><span class='Ref_To_Local'>result</span></a><span class='Parentheses'>)</span><span class='Delimiter'>; 
+} 
+</span></pre>
+<table bgcolor='#c0c0c0' width='100%'><tr><td><a href='../../../../Contents.html'>Contents</a></td></tr>
+</table><hr><p class='blurb' align='center'><a href='http://www.sourceinsight.com'>HTML Created by Source Insight Version 4.00.0084 Built on 2017-02-26</a></p>
+</body></html>

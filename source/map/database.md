@@ -41,6 +41,18 @@ tags:
         - [case compatible]
         - [rownum]
         - [dual table]
+- [Postgres-XC](/tags/pgxc/)
+    - [Postgres-XC使用]
+        - [运维]
+        - [调优]
+    - [Postgres-XC内核]
+        - [架构]
+        - [语言层]
+        - [优化层]
+        - [执行层]
+        - [存取层]
+        - [存储层]
+	- [新特性开发]
 - [Greenplum](/tags/Greenplum/)
     - [Greenplum使用](/tags/Greenplum/)
         - [运维]

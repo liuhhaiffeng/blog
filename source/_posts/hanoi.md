@@ -125,6 +125,6 @@ int main(int argc, char *argv[])
 }
 
 ```
-
+  [1]: http://static.zybuluo.com/shenyuflying/w6uja40t1dn3swbnfg6am8ou/hanoi.gif
 
 如果还想看到更多此类文章，请移步到[小宇的博客](http://shenyu.wiki)。

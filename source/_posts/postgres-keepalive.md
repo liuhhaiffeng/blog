@@ -28,16 +28,19 @@ categories: 技术分享
 配置方法
 ------------
 在服务器的配置文件中加入三行：
+
 ```
 tcp_keepalives_idle = 180
 tcp_keepalives_interval = 30
 tcp_keepalives_count = 3
 ```   
+
 在上例中，服务器先等待180秒后会每隔30秒发送一个探测包，若三个探测包均无确认，服务器会在总计240秒后断开连接。
 
 **注意**：以上配置需要重启服务器。
 
-接下来登陆山
+接下来登陆
+
 ```
 $ ./isql -USYSTEM -WMANAGER -h192.168.2.121 -p61123 TEST
 TEST=# show tcp_keepalives_idle;
@@ -65,6 +68,7 @@ TEST=# show tcp_keepalives_interval;
 keepalive是通过`pq_setkeepalive`函数来设置的，该函数的调用关系如下图。
 ![image_1bniabaj2bp1ms11ni33pc43s9.png-26.2kB][1]
 可以看到是在连接ConnCreate的时候来设置的。具体的看`pg_setkeepalivesidle`可以看到：
+
 ```c
 int
 pq_setkeepalivesidle(int idle, Port *port)
@@ -85,7 +89,9 @@ pq_setkeepalivesidle(int idle, Port *port)
 	port->keepalives_idle = idle;
 	return STATUS_OK;
 }
+
 ```
+
 1. 首先会判断是不是空端口（比如本地fork出来的进程），和是不是本地的端口（IS_AF_UNIX）。如果是这两种情况就不会设。
 2. 如果已经设上那么直接返回。
 3. 接下来用`setsockopt`来设置。

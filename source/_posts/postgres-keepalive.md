@@ -33,7 +33,7 @@ categories: 技术分享
 tcp_keepalives_idle = 180
 tcp_keepalives_interval = 30
 tcp_keepalives_count = 3
-```   
+```
 
 在上例中，服务器先等待180秒后会每隔30秒发送一个探测包，若三个探测包均无确认，服务器会在总计240秒后断开连接。
 

@@ -9,14 +9,12 @@ comments: false
 
 欢迎来我的博客。
 
+<center> ![me](http://static.zybuluo.com/shenyuflying/r0zt7gogesjj2k9khf90r2p2/image_1b5pg6c8rv8ia70e8n1n906f19.png) </center>
 
 ## 工作经历
 - 2015-至今　人大金仓信息技术股份有限公司　数据库内核研发工程师
-<center> ![kingbase work](http://static.zybuluo.com/shenyuflying/dtkk9t9fut3kgjgyogdh2yq0/image_1bgvjpt8a113916j81onrrnocp69.png) </center>
-
 ## 学习经历
 - 2012-2015　大连理工大学(985\211重点大学)　攻读硕士学位
-<center> ![me](http://static.zybuluo.com/shenyuflying/r0zt7gogesjj2k9khf90r2p2/image_1b5pg6c8rv8ia70e8n1n906f19.png) </center>
 - 2008-2012　郑州大学(211重点大学)　　　　　攻读学士学位
 
 ## 参与项目

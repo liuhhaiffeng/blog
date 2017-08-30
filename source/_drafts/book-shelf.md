@@ -5,6 +5,7 @@ tags: book
 
 books to read
 ------------------
+The Zen of Assembly Language
 The Pragmatic Programmer
 Introduction to Algorithms
 Clean Code

@@ -20,7 +20,7 @@ tags:
 - [ODBC programming](/uploads/odbc-programming.html)
 - [PostgreSQL查询优化引擎](/2016/11/21/%E6%B7%B1%E5%85%A5%E7%90%86%E8%A7%A3PostgreSQL%E6%9F%A5%E8%AF%A2%E4%BC%98%E5%8C%96%E5%BC%95%E6%93%8E/)
 - [PostgreSQL ODBC Driver internal](/2016/11/09/PostgreSQL-ODBC-driver-internal/)
-- [Where does bug come from](http://static.zybuluo.com/shenyuflying/178ausamam7ijmmscft0voa7/bug%20fix%20sharing.pdf)
+- Where does bug come from [VIDEO](http://shenyu.wiki/2017/09/04/where-does-bug-come-from-1/) [PPT](http://static.zybuluo.com/shenyuflying/178ausamam7ijmmscft0voa7/bug%20fix%20sharing.pdf)
 
 <i class="icon-github"></i> 开源社区
 -----------

@@ -12,13 +12,14 @@ comments: false
 <center> ![me](http://static.zybuluo.com/shenyuflying/r0zt7gogesjj2k9khf90r2p2/image_1b5pg6c8rv8ia70e8n1n906f19.png) </center>
 
 ## 工作经历
-- 2015-至今　人大金仓信息技术股份有限公司　数据库内核研发工程师
+- 2015-2017　人大金仓信息技术股份有限公司　数据库内核研发工程师
+- 2017-至今　华为数字技术有限公司        　数据库内核研发工程师
 ## 学习经历
 - 2012-2015　大连理工大学(985\211重点大学)　攻读硕士学位
 - 2008-2012　郑州大学(211重点大学)　　　　　攻读学士学位
 
 ## 参与项目
-### 国产数据库Kingbase ES V6\7\8研发
+### 国产数据库Kingbase ES V6\7\8研发(2015-2017)
 - 责数据库产品内核和工具的需求分析、系统设计、编码、单元测试、bug修复等研发工作
   - 熟悉数据库实现技术：查询编译和执行、事务与并发控制、存储引擎、故障恢复
   - 熟悉数据库进程/线程结构、IPC、Lock、MemoryContext、socket网络通信
@@ -49,7 +50,7 @@ comments: false
   - 熟悉基于编程接口的dblink、同步工具、备份还原工具的实现
 - 负责为技术支持人员提供答疑和研发级的技术支持
   - 负责线上项目有关数据库内核、备份还原、同步工具、驱动的研发支持
-  - 解决100+线上问题（非法内存访问、内存泄漏、并发、死锁、性能）
+  - 解决200+线上问题（非法内存访问、内存泄漏、并发、死锁、性能）
 - 负责进行竞品（Oracle、MySQL、PostgreSQL等）的功能、实现分析
   - 输出：《竞品功能矩阵》
 - 负责技术分享和培养新员工
@@ -61,7 +62,7 @@ comments: false
  - 输出：《ODBC编程》、《ODBC实现》
  - 输出：《小宇带你学PostgreSQL内核》视频1-6集
 
-## 超大规模无线温度监测系统——硕士课题
+## 超大规模无线温度监测系统——硕士课题(2012-2015)
 - 负责无线温度传感器硬件设计
   - 使用CC2530芯片设计无线传感模块硬件
   - 使用Zigbee协议实现无线传感节点组网
@@ -143,8 +144,7 @@ Help to check your code against C coding standered and to correct your code in a
 
 ## 联系方式
 Email: shenyufly@163.com
-QQ   : 316472763
 
 ![link](/uploads/link.png)
 
-[pdf版本](/uploads/申宇的简历database.pdf)
+<!--[pdf版本](/uploads/申宇的简历database.pdf)-->
